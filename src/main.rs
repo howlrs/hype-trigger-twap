@@ -20,7 +20,9 @@ use hype_trigger_twap::client::{HlClient, HlConfig, Network, Role, ValidatedMark
 use hype_trigger_twap::errors::HlError;
 use hype_trigger_twap::format::human;
 use hype_trigger_twap::signer::{Eip712AgentSigner, Signer};
-use hype_trigger_twap::trigger::{wait_for_trigger, TriggerConfig, TriggerReason, TriggerWhen};
+use hype_trigger_twap::trigger::{
+    wait_for_trigger, TriggerConfig, TriggerOutcome, TriggerReason, TriggerWhen,
+};
 use hype_trigger_twap::twap::{
     compute_sizing, fetch_fresh_book, run_twap, usd_to_coin, TwapPlan, MIN_NOTIONAL_USD,
     READ_ONLY_BANNER,
@@ -180,6 +182,16 @@ struct Cli {
     /// network blips instead of exiting after a handful of failed polls.
     #[arg(long, value_parser = parse_duration, default_value = "30m")]
     wait_network_grace: Duration,
+
+    /// Terminate the wait, placing NOTHING, if no trigger condition fires
+    /// within this duration (Issue #8). Not a fallback start like
+    /// `--start-after` — an unmet expiry means the run ends without ever
+    /// starting the TWAP. Unspecified = wait indefinitely (unchanged
+    /// default). If a trigger condition and the expiry are both satisfied
+    /// on the same evaluated tick, the trigger wins. Exits with code 3 and
+    /// prints `EXPIRED: no trigger fired within <dur>` on expiry.
+    #[arg(long, value_parser = parse_duration)]
+    expire_after: Option<Duration>,
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -228,6 +240,23 @@ impl Cli {
         if self.wait_network_grace.is_zero() {
             return Err("--wait-network-grace must be > 0".into());
         }
+        if let Some(expire_after) = self.expire_after {
+            if expire_after.is_zero() {
+                return Err("--expire-after must be > 0".into());
+            }
+            if let Some(start_after) = self.start_after {
+                if expire_after <= start_after {
+                    return Err(
+                        "--expire-after must be greater than --start-after (start would always fire first, making expiry unreachable)".into(),
+                    );
+                }
+            }
+            if self.trigger_price.is_none() && self.start_after.is_none() {
+                return Err(
+                    "--expire-after requires a trigger (--trigger-price or --start-after); it is meaningless with immediate start".into(),
+                );
+            }
+        }
         Ok(())
     }
 
@@ -241,6 +270,7 @@ impl Cli {
             poll_interval: Duration::from_secs(self.trigger_poll_secs),
             max_book_age_ms: self.max_book_age_ms,
             wait_network_grace: self.wait_network_grace,
+            expire_after: self.expire_after,
         }
     }
 }
@@ -403,9 +433,21 @@ async fn run() -> Result<ExitCode, String> {
     }
 
     // §4 step 6a: wait.
-    let reason = wait_for_trigger(&client, &symbol, &trigger_cfg)
+    let outcome = wait_for_trigger(&client, &symbol, &trigger_cfg)
         .await
         .map_err(|e| format!("trigger wait: {e}"))?;
+    let reason = match outcome {
+        TriggerOutcome::Fired(reason) => reason,
+        TriggerOutcome::Expired(dur) => {
+            // Issue #8: nothing was placed, no TwapReport — just the EXPIRED
+            // line and exit code 3.
+            println!(
+                "EXPIRED: no trigger fired within {}",
+                humantime::format_duration(dur)
+            );
+            return Ok(ExitCode::from(3));
+        }
+    };
     println!("Triggered: {reason}");
 
     // §8 pre-flight, F2: size against a mid that passed the SAME freshness gate
@@ -857,5 +899,144 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         assert!(r.is_err(), "there must be no PK flag");
+    }
+
+    // === Issue #8: --expire-after ===
+
+    #[test]
+    fn zero_expire_after_is_rejected() {
+        let cli = Cli::try_parse_from(
+            base_args()
+                .into_iter()
+                .chain([
+                    "--trigger-price",
+                    "40",
+                    "--trigger-when",
+                    "above",
+                    "--expire-after",
+                    "0s",
+                ])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(cli.validate().unwrap_err().contains("--expire-after"));
+    }
+
+    #[test]
+    fn expire_after_equal_to_start_after_is_rejected() {
+        let cli = Cli::try_parse_from(
+            base_args()
+                .into_iter()
+                .chain(["--start-after", "10m", "--expire-after", "10m"])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let err = cli.validate().unwrap_err();
+        assert!(err.contains("--expire-after"), "{err}");
+        assert!(err.contains("--start-after"), "{err}");
+    }
+
+    #[test]
+    fn expire_after_less_than_start_after_is_rejected() {
+        let cli = Cli::try_parse_from(
+            base_args()
+                .into_iter()
+                .chain(["--start-after", "10m", "--expire-after", "5m"])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let err = cli.validate().unwrap_err();
+        assert!(err.contains("--expire-after"), "{err}");
+        assert!(err.contains("--start-after"), "{err}");
+    }
+
+    #[test]
+    fn expire_after_with_no_trigger_at_all_is_rejected() {
+        let cli = Cli::try_parse_from(
+            base_args()
+                .into_iter()
+                .chain(["--expire-after", "1h"])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let err = cli.validate().unwrap_err();
+        assert!(err.contains("--expire-after"), "{err}");
+    }
+
+    #[test]
+    fn expire_after_with_price_trigger_is_accepted() {
+        let cli = Cli::try_parse_from(
+            base_args()
+                .into_iter()
+                .chain([
+                    "--trigger-price",
+                    "40",
+                    "--trigger-when",
+                    "above",
+                    "--expire-after",
+                    "1h",
+                ])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        cli.validate().unwrap();
+        assert_eq!(
+            cli.trigger_config().expire_after,
+            Some(Duration::from_secs(3600))
+        );
+    }
+
+    #[test]
+    fn expire_after_greater_than_start_after_is_accepted() {
+        let cli = Cli::try_parse_from(
+            base_args()
+                .into_iter()
+                .chain(["--start-after", "5m", "--expire-after", "10m"])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        cli.validate().unwrap();
+        assert_eq!(
+            cli.trigger_config().expire_after,
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(
+            cli.trigger_config().start_after,
+            Some(Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn expire_after_unset_defaults_to_none_and_does_not_change_immediate_or_time_only() {
+        let cli = Cli::try_parse_from(base_args()).unwrap();
+        cli.validate().unwrap();
+        assert_eq!(cli.trigger_config().expire_after, None);
+        assert!(cli.trigger_config().is_immediate());
+    }
+
+    #[test]
+    fn describe_includes_expiry_wording_when_flag_is_set() {
+        let cli = Cli::try_parse_from(
+            base_args()
+                .into_iter()
+                .chain([
+                    "--trigger-price",
+                    "40",
+                    "--trigger-when",
+                    "above",
+                    "--start-after",
+                    "2h",
+                    "--expire-after",
+                    "4h",
+                ])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        cli.validate().unwrap();
+        let d = cli.trigger_config().describe();
+        assert_eq!(
+            d,
+            "Trigger: price above 40 OR after 2h (whichever comes first); EXPIRES after 4h (no order if not fired)"
+        );
     }
 }

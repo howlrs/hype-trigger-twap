@@ -62,6 +62,15 @@ pub struct TriggerConfig {
     /// from the first failure in the streak, not a retry count. Resets on
     /// any single successful poll. Must be non-zero (validated in `main.rs`).
     pub wait_network_grace: Duration,
+    /// Issue #8: if no trigger condition fires within this period (measured
+    /// from the same `wait_start` monotonic instant as `start_after`), the
+    /// wait terminates as `TriggerOutcome::Expired` — nothing is placed. Each
+    /// iteration evaluates the time and price trigger conditions BEFORE this
+    /// expiry check, so a trigger that fires on the same tick expiry would
+    /// have elapsed always wins (see `wait_for_trigger`). Must be non-zero
+    /// and, when `start_after` is also set, strictly greater than it
+    /// (validated in `main.rs`).
+    pub expire_after: Option<Duration>,
 }
 
 impl TriggerConfig {
@@ -78,7 +87,7 @@ impl TriggerConfig {
 
     /// Human-readable description for the startup log (§4 step 5).
     pub fn describe(&self) -> String {
-        match (self.price, self.start_after) {
+        let base = match (self.price, self.start_after) {
             (Some((when, px)), Some(d)) => format!(
                 "Trigger: price {when} {} OR after {} (whichever comes first)",
                 human(px),
@@ -87,6 +96,13 @@ impl TriggerConfig {
             (Some((when, px)), None) => format!("Trigger: price {when} {}", human(px)),
             (None, Some(d)) => format!("Trigger: after {}", humantime::format_duration(d)),
             (None, None) => "Trigger: immediate".to_string(),
+        };
+        match self.expire_after {
+            Some(d) => format!(
+                "{base}; EXPIRES after {} (no order if not fired)",
+                humantime::format_duration(d)
+            ),
+            None => base,
         }
     }
 }
@@ -136,6 +152,19 @@ impl std::fmt::Display for TriggerReason {
     }
 }
 
+/// Result of waiting for the trigger (Issue #8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TriggerOutcome {
+    /// A trigger condition fired; carries why.
+    Fired(TriggerReason),
+    /// `--expire-after` elapsed before any trigger condition fired. Nothing
+    /// was placed; the caller must terminate without starting the TWAP.
+    /// Carries the configured `expire_after` duration so callers can render
+    /// the `EXPIRED: no trigger fired within <dur>` message without needing
+    /// to separately track the original `Duration` value.
+    Expired(Duration),
+}
+
 /// Pure predicate: does `mid` satisfy the price condition?
 pub fn price_condition_met(when: TriggerWhen, threshold: Decimal, mid: Decimal) -> bool {
     match when {
@@ -161,7 +190,8 @@ pub fn heartbeat_due(since_last: Duration, interval: Duration) -> bool {
     since_last >= interval
 }
 
-/// Block until the trigger fires (§7).
+/// Block until the trigger fires, or `--expire-after` elapses first (§7,
+/// Issue #8).
 ///
 /// Takes the `HlApi` seam (not a concrete client) so it can be driven by
 /// `ScriptedApi` under virtual time in tests exactly like the slice loop
@@ -180,13 +210,14 @@ pub async fn wait_for_trigger(
     client: &dyn HlApi,
     symbol: &Symbol,
     cfg: &TriggerConfig,
-) -> Result<TriggerReason, HlError> {
+) -> Result<TriggerOutcome, HlError> {
     if cfg.is_immediate() {
-        return Ok(TriggerReason::Immediate);
+        return Ok(TriggerOutcome::Fired(TriggerReason::Immediate));
     }
 
     let wait_start = tokio::time::Instant::now();
     let deadline = cfg.start_after.map(|d| wait_start + d);
+    let expire_deadline = cfg.expire_after.map(|d| wait_start + d);
     // Instant of the FIRST failure in the current consecutive streak; `None`
     // when the streak is clear (Issue #9: time-budgeted, not count-based).
     let mut streak_since: Option<tokio::time::Instant> = None;
@@ -201,7 +232,7 @@ pub async fn wait_for_trigger(
         // without needing a successful poll.
         if let (Some(dl), Some(after)) = (deadline, cfg.start_after) {
             if tokio::time::Instant::now() >= dl {
-                return Ok(TriggerReason::Elapsed { after });
+                return Ok(TriggerOutcome::Fired(TriggerReason::Elapsed { after }));
             }
         }
 
@@ -232,12 +263,12 @@ pub async fn wait_for_trigger(
                         "trigger poll"
                     );
                     if price_condition_met(when, threshold, mid) {
-                        return Ok(TriggerReason::Price {
+                        return Ok(TriggerOutcome::Fired(TriggerReason::Price {
                             when,
                             threshold,
                             mid,
                             snapshot,
-                        });
+                        }));
                     }
                 }
                 Err(e) => {
@@ -267,6 +298,18 @@ pub async fn wait_for_trigger(
                         humantime::format_duration(cfg.wait_network_grace),
                     )));
                 }
+            }
+        }
+
+        // Expiry (Issue #8): evaluated AFTER the time and price trigger
+        // checks above, so a trigger that also fires on this exact tick
+        // always wins — expiry only terminates the wait when NEITHER
+        // trigger condition fired this iteration. Pure local-clock
+        // comparison, no network — must hold even when the price condition
+        // is currently blind (mid-failure-streak).
+        if let (Some(edl), Some(expire_after)) = (expire_deadline, cfg.expire_after) {
+            if tokio::time::Instant::now() >= edl {
+                return Ok(TriggerOutcome::Expired(expire_after));
             }
         }
 
@@ -322,10 +365,18 @@ pub async fn wait_for_trigger(
             }
         }
 
-        // Sleep until the next poll, but never past the time deadline.
+        // Sleep until the next poll, but never past the time deadline or the
+        // expiry deadline — either would otherwise cause the loop to oversleep
+        // past the moment it should have fired/expired.
         let mut sleep_for = cfg.poll_interval;
         if let Some(dl) = deadline {
             let remaining = dl.saturating_duration_since(tokio::time::Instant::now());
+            if remaining < sleep_for {
+                sleep_for = remaining;
+            }
+        }
+        if let Some(edl) = expire_deadline {
+            let remaining = edl.saturating_duration_since(tokio::time::Instant::now());
             if remaining < sleep_for {
                 sleep_for = remaining;
             }
@@ -347,6 +398,7 @@ mod tests {
             poll_interval: Duration::from_secs(2),
             max_book_age_ms: 3000,
             wait_network_grace: Duration::from_secs(30 * 60),
+            expire_after: None,
         }
     }
 
@@ -474,6 +526,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn describe_includes_expiry_when_set() {
+        let c = TriggerConfig {
+            expire_after: Some(Duration::from_secs(4 * 3600)),
+            ..cfg(
+                Some((TriggerWhen::Above, dec!(40))),
+                Some(Duration::from_secs(2 * 3600)),
+            )
+        };
+        assert_eq!(
+            c.describe(),
+            "Trigger: price above 40 OR after 2h (whichever comes first); EXPIRES after 4h (no order if not fired)"
+        );
+    }
+
     // === wait loop (deterministic virtual time) ===
 
     #[tokio::test(start_paused = true)]
@@ -488,7 +555,7 @@ mod tests {
         let reason = wait_for_trigger(&client, &Symbol::new("HYPE"), &cfg(None, None))
             .await
             .unwrap();
-        assert_eq!(reason, TriggerReason::Immediate);
+        assert_eq!(reason, TriggerOutcome::Fired(TriggerReason::Immediate));
     }
 
     #[tokio::test(start_paused = true)]
@@ -510,9 +577,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             reason,
-            TriggerReason::Elapsed {
+            TriggerOutcome::Fired(TriggerReason::Elapsed {
                 after: Duration::from_secs(300)
-            }
+            })
         );
         // Virtual clock advanced by the full deadline, no more.
         assert_eq!(start.elapsed(), Duration::from_secs(300));
@@ -533,7 +600,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(reason, TriggerReason::Elapsed { .. }));
+        assert!(matches!(
+            reason,
+            TriggerOutcome::Fired(TriggerReason::Elapsed { .. })
+        ));
     }
 
     // === virtual-time tests on the `HlApi` seam (Issue #6) ===
@@ -584,7 +654,7 @@ mod tests {
         .unwrap();
 
         match reason {
-            TriggerReason::Price { mid, snapshot, .. } => {
+            TriggerOutcome::Fired(TriggerReason::Price { mid, snapshot, .. }) => {
                 assert_eq!(mid, dec!(41.0));
                 assert_eq!(snapshot.mid, dec!(41.0));
             }
@@ -697,9 +767,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             reason,
-            TriggerReason::Elapsed {
+            TriggerOutcome::Fired(TriggerReason::Elapsed {
                 after: Duration::from_secs(120)
-            }
+            })
         );
         assert_eq!(api.calls().len(), 0);
     }
@@ -732,7 +802,10 @@ mod tests {
         .expect("must not time out — grace was never exceeded")
         .unwrap();
 
-        assert!(matches!(reason, TriggerReason::Price { .. }), "{reason:?}");
+        assert!(
+            matches!(reason, TriggerOutcome::Fired(TriggerReason::Price { .. })),
+            "{reason:?}"
+        );
         assert_eq!(api.calls().len(), 4);
     }
 
@@ -803,7 +876,10 @@ mod tests {
         let reason = wait_for_trigger(&api, &Symbol::new("HYPE"), &cfg)
             .await
             .unwrap();
-        assert!(matches!(reason, TriggerReason::Elapsed { .. }));
+        assert!(matches!(
+            reason,
+            TriggerOutcome::Fired(TriggerReason::Elapsed { .. })
+        ));
 
         // 12 minutes / 60s poll interval = 12 polls; one call per poll, none
         // extra for the heartbeat (it reuses the poll's `last_mid`).
@@ -826,10 +902,140 @@ mod tests {
             .unwrap();
         assert_eq!(
             reason,
-            TriggerReason::Elapsed {
+            TriggerOutcome::Fired(TriggerReason::Elapsed {
                 after: Duration::from_secs(17 * 60)
-            }
+            })
         );
         assert_eq!(api.calls().len(), 0);
+    }
+
+    // === Issue #8: --expire-after ===
+
+    /// `start_after` < `expire_after`: the start-after fallback fires first,
+    /// well before expiry, in the pure time-only (no price trigger) case —
+    /// zero HlApi calls throughout.
+    #[tokio::test(start_paused = true)]
+    async fn start_after_fires_before_expire_after_with_zero_network_calls() {
+        let api = crate::api::ScriptedApi::new();
+        let cfg = TriggerConfig {
+            expire_after: Some(Duration::from_secs(20 * 60)),
+            ..cfg(None, Some(Duration::from_secs(10 * 60)))
+        };
+        let outcome = wait_for_trigger(&api, &Symbol::new("HYPE"), &cfg)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            TriggerOutcome::Fired(TriggerReason::Elapsed {
+                after: Duration::from_secs(10 * 60)
+            })
+        );
+        assert_eq!(api.calls().len(), 0);
+        assert_eq!(api.place_count(), 0);
+    }
+
+    /// Price-only trigger that never crosses, with `expire_after` set: the
+    /// wait must terminate with `Expired` once virtual time passes the
+    /// expiry deadline, having polled the network (for the price condition)
+    /// but placed zero orders.
+    #[tokio::test(start_paused = true)]
+    async fn price_only_trigger_expires_when_never_crossing() {
+        let now = chrono::Utc::now().timestamp_millis();
+        // Never crosses "above 1_000_000".
+        let api = crate::api::ScriptedApi::new().with_default_book(book(
+            "HYPE",
+            dec!(39.98),
+            dec!(40.0),
+            now,
+        ));
+        let cfg = TriggerConfig {
+            poll_interval: Duration::from_secs(60),
+            expire_after: Some(Duration::from_secs(10 * 60)),
+            ..cfg(Some((TriggerWhen::Above, dec!(1_000_000))), None)
+        };
+        let outcome = wait_for_trigger(&api, &Symbol::new("HYPE"), &cfg)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            TriggerOutcome::Expired(Duration::from_secs(10 * 60))
+        );
+        // Polls at t=0,60s,...,600s inclusive = 11 polls (the poll AT the
+        // expire deadline still runs — price is checked before expiry each
+        // iteration — and only then does the expiry check fire), zero of
+        // them placements (wait_for_trigger structurally never calls
+        // place_order_once).
+        assert_eq!(api.calls().len(), 11);
+        assert_eq!(api.place_count(), 0);
+    }
+
+    /// Time-only wait (`start_after` unset, no price trigger) with only
+    /// `expire_after` set: expiry must still be detectable with ZERO HlApi
+    /// calls, exactly like the existing `start_after`-only zero-network
+    /// invariant.
+    #[tokio::test(start_paused = true)]
+    async fn expire_after_alone_with_price_trigger_absent_and_no_start_after_makes_zero_calls() {
+        // Note: expire_after with NEITHER price nor start_after configured is
+        // rejected by `Cli::validate()` (immediate + expire is meaningless),
+        // but `TriggerConfig`/`wait_for_trigger` themselves place no such
+        // restriction — is_immediate() only looks at price/start_after, so
+        // this exercises the wait loop's own zero-network guarantee when
+        // start_after is set alongside expire_after and price is absent.
+        let api = crate::api::ScriptedApi::new();
+        let cfg = TriggerConfig {
+            expire_after: Some(Duration::from_secs(30 * 60)),
+            ..cfg(None, Some(Duration::from_secs(5 * 60)))
+        };
+        let outcome = wait_for_trigger(&api, &Symbol::new("HYPE"), &cfg)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            TriggerOutcome::Fired(TriggerReason::Elapsed {
+                after: Duration::from_secs(5 * 60)
+            })
+        );
+        assert_eq!(api.calls().len(), 0);
+    }
+
+    /// Same-tick priority: when the price condition is satisfied on the same
+    /// evaluated tick the expiry deadline has already passed, the trigger
+    /// must win (Fired), not Expired. Constructed by scripting a
+    /// non-crossing book for the polls that advance virtual time past
+    /// `expire_after`, then a crossing book on the poll that lands exactly
+    /// at (or past) the expiry instant — the price check runs BEFORE the
+    /// expiry check each iteration, so it must fire.
+    #[tokio::test(start_paused = true)]
+    async fn same_tick_trigger_wins_over_expiry() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let non_crossing = book("HYPE", dec!(38.99), dec!(39.01), now);
+        let crossing = book("HYPE", dec!(40.99), dec!(41.01), now);
+        // poll_interval = 5m, expire_after = 10m: polls at t=0 (non-crossing),
+        // t=5m (non-crossing), t=10m (crossing, exactly at expire_deadline).
+        // Since the price check runs before the expiry check on the t=10m
+        // iteration, the trigger must fire instead of expiring.
+        let api = crate::api::ScriptedApi::new()
+            .push_book(Ok(non_crossing.clone()))
+            .push_book(Ok(non_crossing))
+            .push_book(Ok(crossing));
+
+        let cfg = TriggerConfig {
+            poll_interval: Duration::from_secs(5 * 60),
+            expire_after: Some(Duration::from_secs(10 * 60)),
+            ..cfg(Some((TriggerWhen::Above, dec!(40))), None)
+        };
+
+        let outcome = wait_for_trigger(&api, &Symbol::new("HYPE"), &cfg)
+            .await
+            .unwrap();
+
+        match outcome {
+            TriggerOutcome::Fired(TriggerReason::Price { mid, .. }) => {
+                assert_eq!(mid, dec!(41.0));
+            }
+            other => panic!("expected trigger to win on the same tick, got {other:?}"),
+        }
+        assert_eq!(api.calls().len(), 3);
+        assert_eq!(api.place_count(), 0);
     }
 }

@@ -69,6 +69,7 @@ hype-twap --symbol ETH --side short --usd 5000 --duration 2h --slices 20 \
 | `--slippage-bps` | decimal | `20` | Cushion on the IOC limit price. |
 | `--max-book-age-ms` | u64 | `3000` | Reject a book snapshot older than this. `0` disables ONLY the max-age check — every book (trigger polls, pre-flight, each slice) still has to pass semantic validation (matching symbol, positive prices/sizes, uncrossed and correctly-ordered levels) and a fixed 2s future-timestamp tolerance, unconditionally. |
 | `--trigger-poll-secs` | u64 | `2` | Poll interval while waiting for the trigger. |
+| `--expire-after` | humantime | none | Terminate the wait, placing **nothing**, if no trigger condition fires within this duration. See "Trigger semantics" below. |
 
 ## Environment variables
 
@@ -126,6 +127,40 @@ logged every 5 minutes so `RUST_LOG=info` (the default) never goes silent for
 days; for a price wait it includes the current mid and deviation from the
 threshold, and for a time-only wait (`--start-after` with no price condition)
 it reports only elapsed/remaining time and never touches the network.
+
+### `--expire-after`: bounded waits that give up without ordering
+
+`--expire-after <duration>` adds an upper bound on the *wait* phase itself,
+distinct from `--start-after`. `--start-after` is a fallback **start** — when
+it elapses, the run begins anyway, price or no price. `--expire-after` is the
+opposite: if the period elapses with no trigger condition having fired, the
+process terminates having placed **nothing** — no TWAP ever starts. This is
+useful for "only enter if the breakout actually happens, don't sit there
+forever" setups where an unmet trigger should mean "abandon the plan," not
+"do it anyway."
+
+- Unspecified (the default): waits indefinitely, exactly as before —
+  behavior is unchanged.
+- On expiry: stdout prints exactly `EXPIRED: no trigger fired within <dur>`
+  and the process exits with **code 3** (`0` = completed, `1` = aborted,
+  `2` = usage error, `3` = expired). No `TwapReport` is printed, because the
+  TWAP never started.
+- **Same-tick priority: the trigger always wins.** Each iteration of the wait
+  loop evaluates the time and price trigger conditions FIRST, then checks
+  expiry. If the expiry deadline has been reached on the same tick a trigger
+  condition is also satisfied, the trigger fires normally — expiry only ever
+  terminates the wait when neither trigger condition fired that iteration.
+- Clock basis: the same monotonic clock as `--start-after`, measured from the
+  same instant the wait began. Does not advance while the process is
+  suspended.
+- Validation (fail-fast at startup, before any network call):
+  - `--expire-after 0s` is rejected.
+  - Combined with `--start-after`, `--expire-after` must be strictly greater
+    than `--start-after` — otherwise `--start-after` would always fire first
+    and the expiry could never be reached.
+  - `--expire-after` with **no** trigger configured at all (neither
+    `--trigger-price` nor `--start-after` — i.e. immediate start) is
+    rejected: expiry is meaningless when the run starts immediately.
 
 ## Sizing, rounding, and the `--usd` caveat
 
