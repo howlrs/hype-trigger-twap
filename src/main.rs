@@ -172,6 +172,14 @@ struct Cli {
     /// Seconds between l2Book polls while waiting for the trigger.
     #[arg(long, default_value_t = 2)]
     trigger_poll_secs: u64,
+
+    /// How long a consecutive trigger-poll failure streak (network error or
+    /// empty book) may run before the wait hard-stops. Timed from the first
+    /// failure, not a retry count; resets on any single successful poll. The
+    /// wait phase holds no position, so it can afford to ride out ordinary
+    /// network blips instead of exiting after a handful of failed polls.
+    #[arg(long, value_parser = parse_duration, default_value = "30m")]
+    wait_network_grace: Duration,
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -217,6 +225,9 @@ impl Cli {
         if self.trigger_poll_secs == 0 {
             return Err("--trigger-poll-secs must be > 0".into());
         }
+        if self.wait_network_grace.is_zero() {
+            return Err("--wait-network-grace must be > 0".into());
+        }
         Ok(())
     }
 
@@ -229,6 +240,7 @@ impl Cli {
             start_after: self.start_after,
             poll_interval: Duration::from_secs(self.trigger_poll_secs),
             max_book_age_ms: self.max_book_age_ms,
+            wait_network_grace: self.wait_network_grace,
         }
     }
 }
@@ -587,6 +599,7 @@ mod tests {
         assert_eq!(cli.slippage_bps, Decimal::from(20));
         assert_eq!(cli.max_book_age_ms, 3000);
         assert_eq!(cli.trigger_poll_secs, 2);
+        assert_eq!(cli.wait_network_grace, Duration::from_secs(30 * 60));
     }
 
     #[test]
@@ -781,6 +794,35 @@ mod tests {
         )
         .unwrap();
         assert!(cli.validate().unwrap_err().contains("--trigger-poll-secs"));
+    }
+
+    #[test]
+    fn zero_wait_network_grace_is_rejected() {
+        let cli = Cli::try_parse_from(
+            base_args()
+                .into_iter()
+                .chain(["--wait-network-grace", "0s"])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(cli.validate().unwrap_err().contains("--wait-network-grace"));
+    }
+
+    #[test]
+    fn wait_network_grace_parses_and_wires_into_trigger_config() {
+        let cli = Cli::try_parse_from(
+            base_args()
+                .into_iter()
+                .chain(["--wait-network-grace", "45m"])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        cli.validate().unwrap();
+        assert_eq!(cli.wait_network_grace, Duration::from_secs(45 * 60));
+        assert_eq!(
+            cli.trigger_config().wait_network_grace,
+            Duration::from_secs(45 * 60)
+        );
     }
 
     #[test]

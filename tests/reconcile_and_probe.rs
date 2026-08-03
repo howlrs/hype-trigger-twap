@@ -11,9 +11,7 @@ use std::time::Duration;
 use hype_trigger_twap::client::{HlClient, HlConfig, Network, PlaceOutcome, Role};
 use hype_trigger_twap::errors::HlError;
 use hype_trigger_twap::signer::Eip712AgentSigner;
-use hype_trigger_twap::trigger::{
-    wait_for_trigger, TriggerConfig, TriggerReason, TriggerWhen, MAX_CONSECUTIVE_POLL_FAILURES,
-};
+use hype_trigger_twap::trigger::{wait_for_trigger, TriggerConfig, TriggerReason, TriggerWhen};
 use hype_trigger_twap::twap::fetch_fresh_book;
 use hype_trigger_twap::types::{Address, Cloid, OrderId, OrderIntent, Side, Symbol, Tif};
 use rust_decimal::Decimal;
@@ -400,6 +398,10 @@ fn trigger_cfg(
         // Short so the test finishes in real time without being flaky.
         poll_interval: Duration::from_millis(20),
         max_book_age_ms: 3000,
+        // Real (unpaused) clock in this file — keep short so a persistent
+        // failure test finishes quickly instead of waiting out 30m of real
+        // time.
+        wait_network_grace: Duration::from_millis(200),
     }
 }
 
@@ -558,16 +560,20 @@ async fn f4_time_wins_when_the_price_never_crosses() {
 }
 
 #[tokio::test]
-async fn f4_five_consecutive_poll_failures_hard_stop_the_wait() {
-    // A persistently blind trigger must not sit silent forever.
+async fn f4_persistent_poll_failures_hard_stop_the_wait_once_grace_is_exceeded() {
+    // A persistently blind trigger must not sit silent forever (Issue #9:
+    // time-budgeted, not count-based). `trigger_cfg`'s grace is 200ms with a
+    // 20ms poll interval, so several 400s in a row exceed it.
     let mut server = mockito::Server::new_async().await;
     // Each poll is a 400 (fatal, not retried inside the client), so one
-    // response == one consecutive failure.
+    // response == one consecutive failure. `.expect(N)` here is a MINIMUM,
+    // not exact — the grace is time-based, so the exact poll count needed to
+    // exceed it depends on real scheduling jitter around the 20ms interval.
     let m = server
         .mock("POST", "/info")
         .with_status(400)
         .with_body("bad request")
-        .expect(MAX_CONSECUTIVE_POLL_FAILURES as usize)
+        .expect_at_least(5)
         .create_async()
         .await;
 
@@ -585,22 +591,27 @@ async fn f4_five_consecutive_poll_failures_hard_stop_the_wait() {
     .unwrap_err();
 
     match err {
-        HlError::Network(msg) => assert!(msg.contains("consecutively"), "{msg}"),
+        HlError::Network(msg) => {
+            assert!(msg.contains("blind for"), "{msg}");
+            assert!(msg.contains("grace"), "{msg}");
+            assert!(msg.contains("last error"), "{msg}");
+            assert!(msg.contains("aborting"), "{msg}");
+        }
         other => panic!("expected Network, got {other:?}"),
     }
     m.assert_async().await;
 }
 
 #[tokio::test]
-async fn f4_a_recovered_poll_resets_the_failure_counter() {
-    // Failures must be CONSECUTIVE. Four failures, one success, then a fire —
-    // the counter resets on the success rather than accumulating to a false
-    // hard stop.
+async fn f4_a_recovered_poll_resets_the_failure_streak() {
+    // Failures must be CONSECUTIVE. A couple of failures, one success, then a
+    // fire — the streak resets on the success rather than accumulating to a
+    // false hard stop.
     let mut server = mockito::Server::new_async().await;
     let _fail = server
         .mock("POST", "/info")
         .with_status(400)
-        .expect(4)
+        .expect(2)
         .create_async()
         .await;
     let _ok = server
