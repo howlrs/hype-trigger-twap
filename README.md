@@ -10,6 +10,10 @@ under-fills.
 **Read-only is the default.** You must pass `--read-only false` before a single
 order can be sent.
 
+> 日本語のドキュメントは [`docs/`](docs/README.md) にあります
+> ([使い方](docs/USAGE.md) / [仕組み](docs/DESIGN.md) /
+> [運用ガイド](docs/OPERATIONS.md) / [開発](docs/DEVELOPMENT.md))。
+
 ## Install
 
 ```bash
