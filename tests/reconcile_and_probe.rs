@@ -338,7 +338,10 @@ async fn f2_stale_pre_flight_book_is_retried_then_hard_stops() {
     .unwrap_err();
 
     match err {
-        HlError::InvalidResponse(msg) => assert!(msg.contains("still stale"), "{msg}"),
+        HlError::InvalidResponse(msg) => {
+            assert!(msg.contains("still invalid"), "{msg}");
+            assert!(msg.contains("stale"), "{msg}");
+        }
         other => panic!("expected InvalidResponse, got {other:?}"),
     }
     m.assert_async().await;
@@ -359,7 +362,7 @@ async fn f2_fresh_pre_flight_book_passes_the_gate_on_the_first_try() {
     let book = fetch_fresh_book(&client, &Symbol::new("HYPE"), 3000)
         .await
         .unwrap();
-    assert_eq!(book.mid(), Some(dec!(50.0)));
+    assert_eq!(book.mid, dec!(50.0));
     m.assert_async().await;
 }
 
@@ -381,7 +384,7 @@ async fn f2_stale_book_is_accepted_when_the_gate_is_disabled() {
     let book = fetch_fresh_book(&client, &Symbol::new("HYPE"), 0)
         .await
         .unwrap();
-    assert_eq!(book.mid(), Some(dec!(50.0)));
+    assert_eq!(book.mid, dec!(50.0));
     m.assert_async().await;
 }
 
@@ -396,6 +399,7 @@ fn trigger_cfg(
         start_after,
         // Short so the test finishes in real time without being flaky.
         poll_interval: Duration::from_millis(20),
+        max_book_age_ms: 3000,
     }
 }
 
@@ -435,11 +439,16 @@ async fn f4_above_trigger_fires_once_the_polled_mid_crosses_up() {
             when,
             threshold,
             mid,
+            snapshot,
         } => {
             assert_eq!(when, TriggerWhen::Above);
             assert_eq!(threshold, dec!(40));
             assert_eq!(mid, dec!(40.20));
             assert!(mid >= threshold);
+            // The trigger-firing snapshot IS the mid that satisfied the
+            // condition — this is the single "trigger-time mid" a caller
+            // (main.rs's --usd sizing) reuses without re-fetching (Issue #6).
+            assert_eq!(snapshot.mid, mid);
         }
         other => panic!("expected a price trigger, got {other:?}"),
     }

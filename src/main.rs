@@ -16,11 +16,11 @@ use clap::{Parser, ValueEnum};
 use rust_decimal::Decimal;
 use secrecy::SecretString;
 
-use hype_trigger_twap::client::{HlClient, HlConfig, Network, Role};
+use hype_trigger_twap::client::{HlClient, HlConfig, Network, Role, ValidatedMarketSnapshot};
 use hype_trigger_twap::errors::HlError;
 use hype_trigger_twap::format::human;
 use hype_trigger_twap::signer::{Eip712AgentSigner, Signer};
-use hype_trigger_twap::trigger::{wait_for_trigger, TriggerConfig, TriggerWhen};
+use hype_trigger_twap::trigger::{wait_for_trigger, TriggerConfig, TriggerReason, TriggerWhen};
 use hype_trigger_twap::twap::{
     compute_sizing, fetch_fresh_book, run_twap, usd_to_coin, TwapPlan, MIN_NOTIONAL_USD,
     READ_ONLY_BANNER,
@@ -228,6 +228,7 @@ impl Cli {
             },
             start_after: self.start_after,
             poll_interval: Duration::from_secs(self.trigger_poll_secs),
+            max_book_age_ms: self.max_book_age_ms,
         }
     }
 }
@@ -367,19 +368,27 @@ async fn run() -> Result<ExitCode, String> {
         }
     };
 
-    // §4 step 4: initial mid, for the startup log.
-    let book = client
-        .fetch_l2_book(&symbol)
-        .await
-        .map_err(|e| format!("initial l2Book: {e}"))?;
-    let mid0 = book
-        .mid()
-        .ok_or_else(|| format!("l2Book for {symbol} has an empty side; cannot compute mid"))?;
-    tracing::info!(symbol = %symbol, mid = %human(mid0), "initial mid");
-
-    // §4 step 5.
+    // §4 step 5 (moved ahead of step 4: the gate below needs to know whether
+    // this run is time-only before it may touch l2Book at all).
     let trigger_cfg = cli.trigger_config();
     println!("{}", trigger_cfg.describe());
+
+    // §4 step 4: initial mid, for the startup log.
+    //
+    // A time-only trigger (`--start-after` with no `--trigger-price`) must
+    // NEVER call l2Book before its deadline (Issue #6) — there is nothing to
+    // log a price for yet, and the pinned test
+    // `time_only_trigger_fires_after_deadline_without_network` in
+    // `trigger.rs` enforces the same contract on the wait loop itself.
+    if !trigger_cfg.is_time_only() {
+        let book = client
+            .fetch_l2_book(&symbol)
+            .await
+            .map_err(|e| format!("initial l2Book: {e}"))?;
+        let snapshot = ValidatedMarketSnapshot::validate(&book, &symbol, 0)
+            .map_err(|e| format!("initial l2Book: {e}"))?;
+        tracing::info!(symbol = %symbol, mid = %human(snapshot.mid), "initial mid");
+    }
 
     // §4 step 6a: wait.
     let reason = wait_for_trigger(&client, &symbol, &trigger_cfg)
@@ -392,12 +401,21 @@ async fn run() -> Result<ExitCode, String> {
     // run (and, with --usd, the notional too), so it is the single most
     // consequential price the tool reads — it must not be allowed to be the one
     // price that skips the staleness check.
-    let book = fetch_fresh_book(&client, &symbol, cli.max_book_age_ms)
-        .await
-        .map_err(|e| format!("pre-flight l2Book: {e}"))?;
-    let mid = book
-        .mid()
-        .ok_or_else(|| format!("pre-flight l2Book for {symbol} has an empty side"))?;
+    //
+    // If the trigger fired on a price condition, the ALREADY-VALIDATED
+    // snapshot that satisfied it is reused as-is rather than re-fetched: that
+    // is the one and only meaning of "trigger-time mid" (Issue #6). Re-fetching
+    // here would let a fresh, no-longer-crossing snapshot silently size an
+    // order the trigger snapshot never actually justified.
+    let snapshot = match &reason {
+        TriggerReason::Price { snapshot, .. } => snapshot.clone(),
+        TriggerReason::Immediate | TriggerReason::Elapsed { .. } => {
+            fetch_fresh_book(&client, &symbol, cli.max_book_age_ms)
+                .await
+                .map_err(|e| format!("pre-flight l2Book: {e}"))?
+        }
+    };
+    let mid = snapshot.mid;
 
     let (total_coin, requested_desc) = match (cli.size, cli.usd) {
         (Some(sz), _) => (sz, format!("{} {symbol}", human(sz))),

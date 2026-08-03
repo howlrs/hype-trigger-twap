@@ -187,6 +187,9 @@ pub struct BookLevel {
 /// Top-of-book snapshot. `bids` descending, `asks` ascending.
 #[derive(Debug, Clone, Default)]
 pub struct OrderBook {
+    /// The `coin` field HL echoed back in the response — carried through so a
+    /// caller can check it against the symbol it requested (Issue #6).
+    pub coin: String,
     pub bids: Vec<BookLevel>,
     pub asks: Vec<BookLevel>,
     /// HL server timestamp of the snapshot (ms epoch).
@@ -254,6 +257,7 @@ mod tests {
     #[test]
     fn book_mid_is_average_of_touch() {
         let book = OrderBook {
+            coin: "HYPE".to_string(),
             bids: vec![BookLevel {
                 px: dec!(99),
                 sz: dec!(1),
@@ -274,6 +278,7 @@ mod tests {
     #[test]
     fn book_mid_none_when_one_side_empty() {
         let book = OrderBook {
+            coin: "HYPE".to_string(),
             bids: vec![BookLevel {
                 px: dec!(99),
                 sz: dec!(1),
