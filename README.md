@@ -112,9 +112,20 @@ The price and time triggers are **OR'd, first one wins**:
 
 The fired condition is logged so it's unambiguous which one won.
 
-While polling, a transport error is retried inside the client and then tolerated
-— the loop simply tries again on the next poll. Five *consecutive* failures is a
-hard stop, so a persistently blind trigger never sits silent forever.
+While polling, a transport error (or an empty book — mid unavailable) is retried
+inside the client and then tolerated — the loop simply tries again on the next
+poll. Consecutive failures are tracked by TIME, not count: `--wait-network-grace`
+(default 30m) is how long a failure streak may run, timed from the first
+failure, before the wait hard-stops with a message naming how long it was blind
+and the last error. The streak resets on a single successful poll. The wait
+phase holds no position and no open order, so it can afford to ride out an
+ordinary network blip instead of exiting after a handful of failed polls — a
+persistently blind trigger still never sits silent forever, it just gets a
+generous, configurable budget first. While waiting, an info-level heartbeat is
+logged every 5 minutes so `RUST_LOG=info` (the default) never goes silent for
+days; for a price wait it includes the current mid and deviation from the
+threshold, and for a time-only wait (`--start-after` with no price condition)
+it reports only elapsed/remaining time and never touches the network.
 
 ## Sizing, rounding, and the `--usd` caveat
 
