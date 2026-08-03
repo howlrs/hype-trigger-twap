@@ -11,7 +11,9 @@ use std::time::Duration;
 use hype_trigger_twap::client::{HlClient, HlConfig, Network, PlaceOutcome, Role};
 use hype_trigger_twap::errors::HlError;
 use hype_trigger_twap::signer::Eip712AgentSigner;
-use hype_trigger_twap::trigger::{wait_for_trigger, TriggerConfig, TriggerReason, TriggerWhen};
+use hype_trigger_twap::trigger::{
+    wait_for_trigger, TriggerConfig, TriggerOutcome, TriggerReason, TriggerWhen,
+};
 use hype_trigger_twap::twap::fetch_fresh_book;
 use hype_trigger_twap::types::{Address, Cloid, OrderId, OrderIntent, Side, Symbol, Tif};
 use rust_decimal::Decimal;
@@ -402,6 +404,7 @@ fn trigger_cfg(
         // failure test finishes quickly instead of waiting out 30m of real
         // time.
         wait_network_grace: Duration::from_millis(200),
+        expire_after: None,
     }
 }
 
@@ -437,12 +440,12 @@ async fn f4_above_trigger_fires_once_the_polled_mid_crosses_up() {
     .unwrap();
 
     match reason {
-        TriggerReason::Price {
+        TriggerOutcome::Fired(TriggerReason::Price {
             when,
             threshold,
             mid,
             snapshot,
-        } => {
+        }) => {
             assert_eq!(when, TriggerWhen::Above);
             assert_eq!(threshold, dec!(40));
             assert_eq!(mid, dec!(40.20));
@@ -487,7 +490,7 @@ async fn f4_below_trigger_fires_once_the_polled_mid_crosses_down() {
     .unwrap();
 
     match reason {
-        TriggerReason::Price { when, mid, .. } => {
+        TriggerOutcome::Fired(TriggerReason::Price { when, mid, .. }) => {
             assert_eq!(when, TriggerWhen::Below);
             assert_eq!(mid, dec!(30.00));
         }
@@ -525,7 +528,7 @@ async fn f4_price_wins_when_it_crosses_before_the_time_deadline() {
     .unwrap();
 
     assert!(
-        matches!(reason, TriggerReason::Price { .. }),
+        matches!(reason, TriggerOutcome::Fired(TriggerReason::Price { .. })),
         "price must win, got {reason:?}"
     );
 }
@@ -556,7 +559,10 @@ async fn f4_time_wins_when_the_price_never_crosses() {
     .expect("trigger wait timed out")
     .unwrap();
 
-    assert_eq!(reason, TriggerReason::Elapsed { after });
+    assert_eq!(
+        reason,
+        TriggerOutcome::Fired(TriggerReason::Elapsed { after })
+    );
 }
 
 #[tokio::test]
@@ -634,5 +640,8 @@ async fn f4_a_recovered_poll_resets_the_failure_streak() {
     .expect("trigger wait timed out")
     .unwrap();
 
-    assert!(matches!(reason, TriggerReason::Price { .. }), "{reason:?}");
+    assert!(
+        matches!(reason, TriggerOutcome::Fired(TriggerReason::Price { .. })),
+        "{reason:?}"
+    );
 }
