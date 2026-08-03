@@ -1,0 +1,2048 @@
+//! TWAP slice loop (§8).
+//!
+//! Slice arithmetic is factored into pure functions (`per_slice_size`,
+//! `slice_order_size`, `SliceDecision`) so the catch-up / remainder /
+//! min-notional behaviour is unit-testable without any I/O.
+//!
+//! Key invariants (§8):
+//! - `target_at_slice(i) = per_slice * i`, except the final slice which uses
+//!   `total_adjusted` so rounding remainder is absorbed exactly once.
+//! - `order_sz = round_down(target_at_slice - filled_so_far)` — a partially
+//!   filled earlier slice is caught up, never double-ordered.
+//! - A slice whose notional is under `MIN_NOTIONAL_USD` is SKIPPED and its
+//!   quantity carries into the next slice (the target is cumulative, so the
+//!   carry is automatic). On the final slice this is a warning, not an error:
+//!   the residual is simply unexecutable.
+
+use std::time::Duration;
+
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+
+use crate::api::HlApi;
+use crate::client::{is_book_fresh, OrderStatusFill, PlaceOutcome};
+use crate::errors::{HlError, RejectionKind};
+use crate::format::{human, round_size, taker_limit_price};
+use crate::types::{Address, CancelIntent, Cloid, OrderBook, OrderIntent, Side, Symbol, Tif};
+
+/// HL's practical minimum order notional in USD (§8).
+pub const MIN_NOTIONAL_USD: Decimal = dec!(10);
+
+/// Safety margin applied to the min-notional gate (T1).
+///
+/// The gate is evaluated on the price we are about to sign, but HL evaluates
+/// the rejection on its own book at receipt time. A notional sitting exactly on
+/// $10.00 is one tick of adverse movement away from `MinTradeNtl`, which is a
+/// FATAL rejection that stops the whole run. Requiring 1% of headroom converts
+/// that hard stop into a cheap skip-and-carry.
+const MIN_NOTIONAL_MARGIN: Decimal = dec!(1.01);
+
+/// The notional a slice must clear to be sent (T1).
+pub fn min_notional_gate() -> Decimal {
+    MIN_NOTIONAL_USD * MIN_NOTIONAL_MARGIN
+}
+
+/// Stale-book retries before hard-stopping a slice (§8).
+const STALE_BOOK_RETRIES: u32 = 3;
+const STALE_BOOK_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Retries when recovering a resting order's fill via `orderStatus` (§8).
+const ORDER_STATUS_RETRIES: u32 = 3;
+const ORDER_STATUS_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+
+pub const READ_ONLY_BANNER: &str = "=== READ-ONLY MODE: NO ORDERS ARE SENT ===";
+
+/// Everything the loop needs, resolved before the first slice.
+pub struct TwapPlan {
+    pub symbol: Symbol,
+    pub side: Side,
+    pub asset_index: u32,
+    pub sz_decimals: u32,
+    /// Rounded size of every non-final slice.
+    pub per_slice: Decimal,
+    /// `per_slice * slices` — the size the run actually targets.
+    pub total_adjusted: Decimal,
+    /// The size originally requested (pre-rounding), for the report.
+    pub total_requested: Decimal,
+    pub slices: u32,
+    pub duration: Duration,
+    pub slippage_bps: Decimal,
+    pub max_book_age_ms: u64,
+    pub read_only: bool,
+    /// Agent (API wallet) address — the key that signs. `None` in read-only.
+    pub agent: Option<Address>,
+    /// MASTER account address, resolved by the `userRole` probe at startup
+    /// (F1). This is the `user` for every `orderStatus` query: HL books an
+    /// agent's orders under its master, so querying with the agent address
+    /// returns `unknownOid` for orders that really exist. `None` in read-only,
+    /// where no order is ever placed and nothing needs recovering.
+    pub master: Option<Address>,
+}
+
+impl TwapPlan {
+    /// The address `orderStatus` must be queried as (F1): the MASTER.
+    fn status_user(&self) -> Result<&Address, HlError> {
+        self.master.as_ref().ok_or_else(|| {
+            HlError::InvalidConfig(
+                "orderStatus requires the master address (userRole probe did not run)".into(),
+            )
+        })
+    }
+}
+
+/// Pre-flight sizing errors (§8).
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PreflightError {
+    #[error("per-slice size rounds to zero at szDecimals={sz_decimals} (total {total} / {slices} slices); increase --usd/--size or reduce --slices")]
+    PerSliceZero {
+        total: Decimal,
+        slices: u32,
+        sz_decimals: u32,
+    },
+    #[error("per-slice notional ${notional} is below the ${min} minimum; increase --usd/--size or reduce --slices")]
+    PerSliceBelowMinNotional { notional: Decimal, min: Decimal },
+    #[error("total size must be > 0, got {0}")]
+    NonPositiveTotal(Decimal),
+}
+
+/// Result of pre-flight sizing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sizing {
+    pub per_slice: Decimal,
+    pub total_adjusted: Decimal,
+}
+
+/// Compute per-slice size and the adjusted total (§8 pre-flight).
+///
+/// `total_coin` is the requested quantity in coin units; `mid` is the
+/// reference price used for the min-notional gate.
+pub fn compute_sizing(
+    total_coin: Decimal,
+    slices: u32,
+    sz_decimals: u32,
+    mid: Decimal,
+) -> Result<Sizing, PreflightError> {
+    if total_coin <= Decimal::ZERO {
+        return Err(PreflightError::NonPositiveTotal(total_coin));
+    }
+    let per_slice = round_size(total_coin / Decimal::from(slices), sz_decimals);
+    if per_slice <= Decimal::ZERO {
+        return Err(PreflightError::PerSliceZero {
+            total: total_coin,
+            slices,
+            sz_decimals,
+        });
+    }
+    let notional = per_slice * mid;
+    if notional < MIN_NOTIONAL_USD {
+        return Err(PreflightError::PerSliceBelowMinNotional {
+            notional,
+            min: MIN_NOTIONAL_USD,
+        });
+    }
+    Ok(Sizing {
+        per_slice,
+        total_adjusted: per_slice * Decimal::from(slices),
+    })
+}
+
+/// Convert a USD notional into a coin quantity at `mid` (§3 `--usd`).
+pub fn usd_to_coin(usd: Decimal, mid: Decimal) -> Result<Decimal, PreflightError> {
+    if mid <= Decimal::ZERO {
+        return Err(PreflightError::NonPositiveTotal(mid));
+    }
+    Ok(usd / mid)
+}
+
+/// Cumulative target quantity after slice `i` (1-based).
+///
+/// The final slice targets `total_adjusted` exactly so the rounding remainder
+/// is absorbed there and nowhere else.
+pub fn target_at_slice(
+    slice_idx: u32,
+    slices: u32,
+    per_slice: Decimal,
+    total_adjusted: Decimal,
+) -> Decimal {
+    if slice_idx >= slices {
+        total_adjusted
+    } else {
+        per_slice * Decimal::from(slice_idx)
+    }
+}
+
+/// The size to order on slice `i`, after catching up for prior under-fills.
+pub fn slice_order_size(
+    slice_idx: u32,
+    slices: u32,
+    per_slice: Decimal,
+    total_adjusted: Decimal,
+    filled_so_far: Decimal,
+    sz_decimals: u32,
+) -> Decimal {
+    let target = target_at_slice(slice_idx, slices, per_slice, total_adjusted);
+    let raw = target - filled_so_far;
+    if raw <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    round_size(raw, sz_decimals)
+}
+
+/// What the loop should do with one slice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SliceDecision {
+    /// Send an order of this size.
+    Place(Decimal),
+    /// Nothing due (already at or past target) — wait for the next deadline.
+    SkipAhead,
+    /// Below the min notional; carry into the next slice.
+    SkipBelowMinNotional { sz: Decimal, notional: Decimal },
+}
+
+/// Decide a slice, combining catch-up sizing with the min-notional gate (§8).
+///
+/// T1: the gate is evaluated at `order_px` — the taker limit price we are about
+/// to sign — NOT at the mid. For a SHORT the limit sits *below* the mid, so a
+/// mid-based gate passes sizes whose real notional is under HL's floor; the
+/// order then comes back `MinTradeNtl`, which is fatal and stops the run. The
+/// price used for the gate must be the price that reaches the exchange.
+pub fn decide_slice(
+    slice_idx: u32,
+    slices: u32,
+    per_slice: Decimal,
+    total_adjusted: Decimal,
+    filled_so_far: Decimal,
+    sz_decimals: u32,
+    order_px: Decimal,
+) -> SliceDecision {
+    let sz = slice_order_size(
+        slice_idx,
+        slices,
+        per_slice,
+        total_adjusted,
+        filled_so_far,
+        sz_decimals,
+    );
+    if sz <= Decimal::ZERO {
+        return SliceDecision::SkipAhead;
+    }
+    let notional = sz * order_px;
+    if notional < min_notional_gate() {
+        return SliceDecision::SkipBelowMinNotional { sz, notional };
+    }
+    SliceDecision::Place(sz)
+}
+
+/// Deadline for slice `i`: `start + duration * i / slices`.
+///
+/// Computed from the absolute start so per-slice scheduling error cannot
+/// accumulate into drift.
+pub fn slice_deadline(
+    start: tokio::time::Instant,
+    duration: Duration,
+    slice_idx: u32,
+    slices: u32,
+) -> tokio::time::Instant {
+    let total_nanos = duration.as_nanos();
+    let share = total_nanos * u128::from(slice_idx) / u128::from(slices);
+    start + Duration::from_nanos(share.min(u128::from(u64::MAX)) as u64)
+}
+
+/// Final execution report (§8).
+#[derive(Debug, Clone)]
+pub struct TwapReport {
+    pub symbol: Symbol,
+    pub side: Side,
+    pub total_requested: Decimal,
+    pub total_adjusted: Decimal,
+    pub filled: Decimal,
+    /// Size-weighted average fill price. `None` if nothing filled.
+    pub avg_px: Option<Decimal>,
+    pub slices_executed: u32,
+    pub slices_skipped: u32,
+    pub elapsed: Duration,
+    pub abort_reason: Option<String>,
+    pub read_only: bool,
+}
+
+impl TwapReport {
+    /// Exit code: 1 only on an abort. A partial fill that ran to completion
+    /// exits 0 with a warning (§8).
+    pub fn exit_code(&self) -> i32 {
+        if self.abort_reason.is_some() {
+            1
+        } else {
+            0
+        }
+    }
+
+    pub fn is_partial(&self) -> bool {
+        self.filled < self.total_adjusted
+    }
+
+    /// Quantity the pre-flight rounding dropped before the run even started
+    /// (T4): `total_requested - total_adjusted`.
+    ///
+    /// At `szDecimals=0` a requested 10.5 over 3 slices adjusts to 9 — filling
+    /// all 9 is "complete" against the adjusted target while 14% of what the
+    /// operator asked for was never in play. That gap is invisible unless the
+    /// report states it, so `render` always does.
+    pub fn rounding_dropped(&self) -> Option<Decimal> {
+        let diff = self.total_requested - self.total_adjusted;
+        if diff > Decimal::ZERO {
+            Some(diff)
+        } else {
+            None
+        }
+    }
+
+    /// Multi-line human-readable summary.
+    pub fn render(&self) -> String {
+        let mut s = String::new();
+        s.push_str("=== TWAP report ===\n");
+        if self.read_only {
+            s.push_str("mode:            READ-ONLY (no orders were sent)\n");
+        }
+        s.push_str(&format!("symbol/side:     {} {}\n", self.symbol, self.side));
+        s.push_str(&format!(
+            "target:          requested {} / adjusted {}\n",
+            human(self.total_requested),
+            human(self.total_adjusted)
+        ));
+        s.push_str(&format!("filled:          {}\n", human(self.filled)));
+        s.push_str(&format!(
+            "avg price:       {}\n",
+            self.avg_px.map(human).unwrap_or_else(|| "-".into())
+        ));
+        s.push_str(&format!(
+            "slices:          {} executed / {} skipped\n",
+            self.slices_executed, self.slices_skipped
+        ));
+        s.push_str(&format!(
+            "elapsed:         {}\n",
+            humantime::format_duration(Duration::from_secs(self.elapsed.as_secs()))
+        ));
+        match &self.abort_reason {
+            Some(r) => s.push_str(&format!("ABORTED:         {r}\n")),
+            None if self.is_partial() => s.push_str(&format!(
+                "WARNING:         partial fill — {} of {} unexecuted\n",
+                human(self.total_adjusted - self.filled),
+                human(self.total_adjusted)
+            )),
+            // T4: "complete" is only ever true against the ADJUSTED target, so
+            // it never stands alone when rounding shrank that target.
+            None if self.rounding_dropped().is_some() => {
+                s.push_str("status:          complete (against the adjusted target)\n")
+            }
+            None => s.push_str("status:          complete\n"),
+        }
+        // T4: printed on every outcome — an abort or a partial fill does not
+        // make the pre-flight shortfall any less real.
+        if let Some(dropped) = self.rounding_dropped() {
+            s.push_str(&format!(
+                "NOTE:            rounding dropped {} of requested {} at pre-flight\n",
+                human(dropped),
+                human(self.total_requested)
+            ));
+        }
+        s.push_str(&format!("exit code:       {}\n", self.exit_code()));
+        s
+    }
+}
+
+/// Accumulator for fill statistics.
+#[derive(Debug, Default, Clone)]
+struct FillStats {
+    filled: Decimal,
+    /// Σ(px * sz), for the size-weighted average.
+    notional: Decimal,
+}
+
+impl FillStats {
+    fn add(&mut self, sz: Decimal, px: Decimal) {
+        self.filled += sz;
+        self.notional += sz * px;
+    }
+
+    fn avg_px(&self) -> Option<Decimal> {
+        if self.filled > Decimal::ZERO {
+            Some(self.notional / self.filled)
+        } else {
+            None
+        }
+    }
+}
+
+/// Fetch a book that passes the freshness gate, retrying a stale one (§8).
+///
+/// F2: this is the ONLY way a book should enter a sizing decision — pre-flight
+/// included. Sizing off an unchecked snapshot can fix the whole run's quantity
+/// against a price that is minutes old.
+pub async fn fetch_fresh_book(
+    client: &dyn HlApi,
+    symbol: &Symbol,
+    max_age_ms: u64,
+) -> Result<OrderBook, HlError> {
+    let mut last_age_ms = 0i64;
+    for attempt in 0..=STALE_BOOK_RETRIES {
+        let book = client.fetch_l2_book(symbol).await?;
+        if is_book_fresh(&book, max_age_ms) {
+            return Ok(book);
+        }
+        last_age_ms = chrono::Utc::now().timestamp_millis() - book.time_ms;
+        tracing::warn!(
+            symbol = %symbol,
+            age_ms = last_age_ms,
+            max_age_ms,
+            attempt = attempt + 1,
+            "stale book; refetching"
+        );
+        if attempt < STALE_BOOK_RETRIES {
+            tokio::time::sleep(STALE_BOOK_RETRY_INTERVAL).await;
+        }
+    }
+    Err(HlError::InvalidResponse(format!(
+        "book still stale after {} retries (age {last_age_ms}ms > {max_age_ms}ms)",
+        STALE_BOOK_RETRIES
+    )))
+}
+
+/// Ask HL for an order's status until it reports a TERMINAL one (T3).
+///
+/// A non-terminal status such as `"open"` means the cancel has not landed yet;
+/// the order can still fill in the next millisecond. Returning that snapshot as
+/// the final count under-states `filled_so_far`, and because every later slice
+/// sizes off that number, the run then over-orders on EVERY remaining slice —
+/// precisely the accident this recovery path exists to prevent. So only a
+/// terminal status is adopted; a non-terminal one keeps retrying, and running
+/// out of retries is a hard stop, deliberately the safe side.
+async fn poll_terminal_status(
+    client: &dyn HlApi,
+    user: &Address,
+    oid: crate::types::OrderId,
+) -> Result<OrderStatusFill, HlError> {
+    let mut last_err: Option<String> = None;
+    for attempt in 0..ORDER_STATUS_RETRIES {
+        match client.fetch_order_status(user, oid).await {
+            Ok(Some(st)) if st.is_terminal() => {
+                tracing::info!(
+                    oid = %oid,
+                    filled = %human(st.filled_sz),
+                    status = %st.status,
+                    "recovered resting order fill (terminal status)"
+                );
+                return Ok(st);
+            }
+            Ok(Some(st)) => {
+                last_err = Some(format!(
+                    "status '{}' is not terminal (filled {} so far)",
+                    st.status,
+                    human(st.filled_sz)
+                ));
+                tracing::warn!(
+                    oid = %oid,
+                    status = %st.status,
+                    filled_so_far = %human(st.filled_sz),
+                    attempt = attempt + 1,
+                    "orderStatus not yet terminal; the order can still fill — retrying"
+                );
+            }
+            Ok(None) => last_err = Some(format!("HL reports unknown oid {oid}")),
+            Err(e) => last_err = Some(e.to_string()),
+        }
+        if attempt + 1 < ORDER_STATUS_RETRIES {
+            tokio::time::sleep(ORDER_STATUS_RETRY_INTERVAL).await;
+        }
+    }
+    Err(HlError::InvalidResponse(format!(
+        "could not determine a terminal fill for oid {oid} after {ORDER_STATUS_RETRIES} attempts \
+         ({}); stopping rather than risk over-ordering",
+        last_err.unwrap_or_else(|| "no detail".into())
+    )))
+}
+
+/// Recover the true filled quantity of a resting order (§8).
+///
+/// IOC should never rest, but if it does we cancel and then ask HL what
+/// actually filled — assuming zero would over-order on the next slice
+/// (over-fill is unrecoverable).
+///
+/// T5: returns the whole `OrderStatusFill`, not just the size, so the caller
+/// can attribute the fill at HL's reported `avgPx` instead of at the limit
+/// price (the worst price the order could possibly have got).
+async fn recover_resting_fill(
+    client: &dyn HlApi,
+    plan: &TwapPlan,
+    cloid: Cloid,
+    oid: crate::types::OrderId,
+) -> Result<OrderStatusFill, HlError> {
+    tracing::warn!(oid = %oid, cloid = %cloid, "IOC order rested unexpectedly; cancelling");
+    let cancel = CancelIntent {
+        symbol: plan.symbol.clone(),
+        by_cloid: cloid,
+    };
+    // A cancel failure is not fatal by itself — the order may have filled in
+    // the interim. orderStatus below is what decides.
+    if let Err(e) = client.cancel_by_cloid(&cancel, plan.asset_index).await {
+        tracing::warn!(error = %e, "cancelByCloid failed; querying orderStatus anyway");
+    }
+
+    // F1: orderStatus must be queried as the MASTER, not the agent.
+    let user = plan.status_user()?;
+    poll_terminal_status(client, user, oid).await
+}
+
+/// How many times a place may be re-signed and re-sent after an AMBIGUOUS
+/// transport failure (W1). Each attempt is preceded by an `orderStatus`
+/// reconciliation, so a resend only happens once HL has told us the order is
+/// genuinely absent.
+const PLACE_RESEND_LIMIT: u32 = 2;
+
+/// Delay before reconciling an ambiguous place, giving HL time to book the
+/// order it may already have received.
+const RECONCILE_DELAY: Duration = Duration::from_millis(500);
+
+/// What a slice's order attempt finally resolved to: the size to credit and
+/// the price to credit it at.
+///
+/// A zero size is a legitimate outcome (an IOC that rested and was cancelled
+/// without trading), so there is no separate "nothing happened" variant — every
+/// resolved slice flows through one accounting path.
+struct SliceOutcome {
+    sz: Decimal,
+    px: Decimal,
+}
+
+/// Place one slice, resolving any transport ambiguity via cloid reconciliation
+/// (W1).
+///
+/// The problem this solves: `/exchange` is not idempotent. The nonce is
+/// consumed the moment HL receives the body, so the old behaviour — sign once,
+/// blind-resend the same body up to three times — could only ever produce a
+/// stale-nonce rejection on the retry, while the ORIGINAL order might have
+/// filled. The run would then hard-stop without knowing it held a position.
+///
+/// The fix keys recovery on the cloid, which we chose before signing and which
+/// therefore survives a lost response:
+/// - send exactly once;
+/// - on an ambiguous failure, ask HL about the cloid;
+/// - if HL knows the order, adopt its (terminal) state — no resend;
+/// - if HL returns `unknownOid`, the order never landed, so re-sign with a
+///   FRESH nonce and send again (bounded);
+/// - if reconciliation itself keeps failing, hard-stop with the ambiguity
+///   stated plainly. Guessing here risks a double fill, which cannot be undone.
+async fn place_slice_reconciled(
+    client: &dyn HlApi,
+    plan: &TwapPlan,
+    intent: &OrderIntent,
+) -> Result<SliceOutcome, HlError> {
+    let mut attempt = 0u32;
+    loop {
+        let send_err = match client.place_order_once(intent, plan.asset_index).await {
+            Ok((
+                nonce,
+                PlaceOutcome::Filled {
+                    total_sz, avg_px, ..
+                },
+            )) => {
+                tracing::debug!(nonce, "place acknowledged");
+                return Ok(SliceOutcome {
+                    sz: total_sz,
+                    px: avg_px,
+                });
+            }
+            Ok((_, PlaceOutcome::Resting { oid })) => {
+                let st = recover_resting_fill(client, plan, intent.cloid, oid).await?;
+                // T5: credit at HL's realised average, not at our limit.
+                let px = st.avg_px.unwrap_or(intent.px);
+                return Ok(SliceOutcome {
+                    sz: st.filled_sz,
+                    px,
+                });
+            }
+            // Exchange rejections are decisions, not ambiguity — propagate.
+            Err(e @ HlError::Exchange { .. }) => return Err(e),
+            // Transport failure: the order may or may not have landed.
+            Err(e @ HlError::Network(_)) => e,
+            Err(e) => return Err(e),
+        };
+
+        tracing::warn!(
+            cloid = %intent.cloid,
+            error = %send_err,
+            attempt = attempt + 1,
+            "place outcome UNKNOWN after transport failure; reconciling by cloid"
+        );
+
+        // Give HL a moment to book an order it may already have accepted.
+        tokio::time::sleep(RECONCILE_DELAY).await;
+
+        let user = plan.status_user()?;
+        match reconcile_by_cloid(client, user, intent.cloid).await {
+            // HL has it, and it is settled — adopt that as the truth.
+            Ok(Some(st)) => {
+                tracing::info!(
+                    cloid = %intent.cloid,
+                    filled = %human(st.filled_sz),
+                    status = %st.status,
+                    "reconciled: HL had the order; no resend"
+                );
+                let px = st.avg_px.unwrap_or(intent.px);
+                return Ok(SliceOutcome {
+                    sz: st.filled_sz,
+                    px,
+                });
+            }
+            // HL never received it — safe to re-sign with a fresh nonce.
+            Ok(None) => {
+                attempt += 1;
+                if attempt > PLACE_RESEND_LIMIT {
+                    return Err(HlError::Network(format!(
+                        "place failed {attempt} times and HL never received the order \
+                         (cloid {}); giving up: {send_err}",
+                        intent.cloid
+                    )));
+                }
+                tracing::warn!(
+                    cloid = %intent.cloid,
+                    attempt,
+                    "reconciled: HL never received the order; re-signing with a fresh nonce"
+                );
+            }
+            // We cannot establish what happened. Stop rather than risk a
+            // double fill.
+            Err(e) => {
+                return Err(HlError::InvalidResponse(format!(
+                    "place outcome UNKNOWN for cloid {} and reconciliation failed ({e}); \
+                     the order may or may not be live. Stopping rather than risk a duplicate \
+                     fill — check your fills on Hyperliquid before re-running. \
+                     Original send error: {send_err}",
+                    intent.cloid
+                )));
+            }
+        }
+    }
+}
+
+/// Ask HL whether it holds `cloid`, retrying until the answer is unambiguous.
+///
+/// `Ok(Some(st))` — HL has the order in a TERMINAL state.
+/// `Ok(None)`     — HL definitively does not know the cloid (`unknownOid`).
+/// `Err(_)`       — could not establish either, including "HL has it but it is
+///                  still open", which is NOT a safe basis for a resend.
+async fn reconcile_by_cloid(
+    client: &dyn HlApi,
+    user: &Address,
+    cloid: Cloid,
+) -> Result<Option<OrderStatusFill>, HlError> {
+    let mut last_err: Option<String> = None;
+    for attempt in 0..ORDER_STATUS_RETRIES {
+        match client.fetch_order_status_by_cloid(user, cloid).await {
+            Ok(Some(st)) if st.is_terminal() => return Ok(Some(st)),
+            Ok(Some(st)) => {
+                // The order exists and is still working. A resend here would
+                // duplicate it, so keep waiting for it to settle.
+                last_err = Some(format!("order is live but non-terminal ('{}')", st.status));
+            }
+            Ok(None) => return Ok(None),
+            Err(e) => last_err = Some(e.to_string()),
+        }
+        if attempt + 1 < ORDER_STATUS_RETRIES {
+            tokio::time::sleep(ORDER_STATUS_RETRY_INTERVAL).await;
+        }
+    }
+    Err(HlError::InvalidResponse(
+        last_err.unwrap_or_else(|| "no detail".into()),
+    ))
+}
+
+/// Run the TWAP loop (§8).
+pub async fn run_twap(client: &dyn HlApi, plan: &TwapPlan) -> TwapReport {
+    let start = tokio::time::Instant::now();
+    let mut stats = FillStats::default();
+    let mut slices_executed = 0u32;
+    let mut slices_skipped = 0u32;
+    let mut abort_reason: Option<String> = None;
+
+    for slice_idx in 1..=plan.slices {
+        if plan.read_only {
+            println!("{READ_ONLY_BANNER}");
+        }
+
+        let deadline = slice_deadline(start, plan.duration, slice_idx, plan.slices);
+
+        // Hard window cut-off (§8, T2): never place past the requested
+        // duration — the final slice included.
+        //
+        // The old code exempted the last slice (`&& slice_idx < plan.slices`).
+        // That is the worst possible exemption: delay accumulates through
+        // retries, stale-book refetches and fill recovery, and the final slice
+        // is also the catch-up slice that carries every earlier shortfall, so
+        // the exemption let the LARGEST order fire the FURTHEST outside the
+        // window the operator asked for. A normal run reaches its last slice
+        // inside the window anyway, so removing it changes nothing there.
+        if start.elapsed() >= plan.duration {
+            abort_reason = Some(format!(
+                "duration {} elapsed at slice {slice_idx}/{}",
+                humantime::format_duration(plan.duration),
+                plan.slices
+            ));
+            break;
+        }
+
+        let book = match fetch_fresh_book(client, &plan.symbol, plan.max_book_age_ms).await {
+            Ok(b) => b,
+            Err(e) => {
+                abort_reason = Some(format!("book fetch failed at slice {slice_idx}: {e}"));
+                break;
+            }
+        };
+        let (bid, ask, mid) = match (book.best_bid(), book.best_ask(), book.mid()) {
+            (Some(b), Some(a), Some(m)) => (b, a, m),
+            _ => {
+                abort_reason = Some(format!("empty book side at slice {slice_idx}"));
+                break;
+            }
+        };
+
+        // T1: the price we are about to sign, computed BEFORE the gate so the
+        // gate judges the notional that will actually reach HL.
+        let px = taker_limit_price(bid, ask, plan.side, plan.slippage_bps, plan.sz_decimals);
+
+        let decision = decide_slice(
+            slice_idx,
+            plan.slices,
+            plan.per_slice,
+            plan.total_adjusted,
+            stats.filled,
+            plan.sz_decimals,
+            px,
+        );
+
+        let order_sz = match decision {
+            SliceDecision::Place(sz) => sz,
+            SliceDecision::SkipAhead => {
+                slices_skipped += 1;
+                tracing::info!(slice = slice_idx, "slice skipped: already at target");
+                sleep_until(deadline).await;
+                continue;
+            }
+            SliceDecision::SkipBelowMinNotional { sz, notional } => {
+                slices_skipped += 1;
+                if slice_idx == plan.slices {
+                    tracing::warn!(
+                        slice = slice_idx,
+                        sz = %human(sz),
+                        notional = %human(notional),
+                        order_px = %human(px),
+                        gate = %human(min_notional_gate()),
+                        "FINAL slice below min notional — residual is unexecutable"
+                    );
+                } else {
+                    tracing::info!(
+                        slice = slice_idx,
+                        sz = %human(sz),
+                        notional = %human(notional),
+                        order_px = %human(px),
+                        gate = %human(min_notional_gate()),
+                        "slice below min notional; carrying to next slice"
+                    );
+                }
+                sleep_until(deadline).await;
+                continue;
+            }
+        };
+
+        let cloid = Cloid::new();
+
+        if plan.read_only {
+            println!(
+                "[READ-ONLY] would place: slice {}/{} {} {} {} @ {} (IOC, cloid {}, mid {})",
+                slice_idx,
+                plan.slices,
+                plan.side,
+                human(order_sz),
+                plan.symbol,
+                human(px),
+                cloid,
+                human(mid)
+            );
+            // Assume a full fill so the dry run walks the same slice path.
+            stats.add(order_sz, px);
+            slices_executed += 1;
+            sleep_until(deadline).await;
+            continue;
+        }
+
+        let intent = OrderIntent {
+            cloid,
+            symbol: plan.symbol.clone(),
+            side: plan.side,
+            px,
+            sz: order_sz,
+            tif: Tif::Ioc,
+            reduce_only: false,
+        };
+        tracing::info!(
+            slice = slice_idx,
+            slices = plan.slices,
+            sz = %human(order_sz),
+            px = %human(px),
+            cloid = %cloid,
+            "placing IOC slice"
+        );
+
+        match place_slice_reconciled(client, plan, &intent).await {
+            // Every fill — direct, recovered from a resting order, or
+            // reconciled after an ambiguous send — is credited here EXACTLY
+            // ONCE (T3/T5). There is no second accounting path.
+            Ok(SliceOutcome { sz, px: fill_px }) => {
+                stats.add(sz, fill_px);
+                slices_executed += 1;
+                tracing::info!(
+                    slice = slice_idx,
+                    filled = %human(sz),
+                    avg_px = %human(fill_px),
+                    cumulative = %human(stats.filled),
+                    "slice filled"
+                );
+            }
+            // Exchange rejection: NEVER retried, hard stop (§5).
+            Err(HlError::Exchange { code, message }) => {
+                let kind = RejectionKind::classify(&message);
+                abort_reason = Some(format!(
+                    "slice {slice_idx} rejected by exchange [{}]: {message} — {}",
+                    code.unwrap_or_else(|| "?".into()),
+                    kind.advice()
+                ));
+                break;
+            }
+            Err(e) => {
+                abort_reason = Some(format!("slice {slice_idx} failed: {e}"));
+                break;
+            }
+        }
+
+        if stats.filled >= plan.total_adjusted {
+            tracing::info!(filled = %human(stats.filled), "target reached; finishing early");
+            break;
+        }
+
+        sleep_until(deadline).await;
+    }
+
+    TwapReport {
+        symbol: plan.symbol.clone(),
+        side: plan.side,
+        total_requested: plan.total_requested,
+        total_adjusted: plan.total_adjusted,
+        filled: stats.filled,
+        avg_px: stats.avg_px(),
+        slices_executed,
+        slices_skipped,
+        elapsed: start.elapsed(),
+        abort_reason,
+        read_only: plan.read_only,
+    }
+}
+
+async fn sleep_until(deadline: tokio::time::Instant) {
+    let now = tokio::time::Instant::now();
+    if deadline > now {
+        tokio::time::sleep_until(deadline).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    // === pre-flight sizing ===
+
+    #[test]
+    fn sizing_rounds_per_slice_down_and_reports_adjusted_total() {
+        // 10 / 3 = 3.3333... → 3.33 at szDecimals=2 → adjusted 9.99
+        let s = compute_sizing(dec!(10), 3, 2, dec!(100)).unwrap();
+        assert_eq!(s.per_slice, dec!(3.33));
+        assert_eq!(s.total_adjusted, dec!(9.99));
+    }
+
+    #[test]
+    fn sizing_exact_division_leaves_no_remainder() {
+        let s = compute_sizing(dec!(10), 5, 2, dec!(100)).unwrap();
+        assert_eq!(s.per_slice, dec!(2));
+        assert_eq!(s.total_adjusted, dec!(10));
+    }
+
+    #[test]
+    fn sizing_errors_when_per_slice_rounds_to_zero() {
+        // 0.005 / 10 = 0.0005 → 0 at szDecimals=2
+        let err = compute_sizing(dec!(0.005), 10, 2, dec!(100000)).unwrap_err();
+        assert!(matches!(err, PreflightError::PerSliceZero { .. }));
+    }
+
+    #[test]
+    fn sizing_errors_when_per_slice_below_min_notional() {
+        // 1 coin / 10 slices = 0.1 @ $50 = $5 < $10
+        let err = compute_sizing(dec!(1), 10, 2, dec!(50)).unwrap_err();
+        match err {
+            PreflightError::PerSliceBelowMinNotional { notional, min } => {
+                assert_eq!(notional, dec!(5.0));
+                assert_eq!(min, dec!(10));
+            }
+            other => panic!("expected min-notional error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sizing_at_exactly_min_notional_is_accepted() {
+        // 2 coins / 10 = 0.2 @ $50 = exactly $10
+        let s = compute_sizing(dec!(2), 10, 2, dec!(50)).unwrap();
+        assert_eq!(s.per_slice, dec!(0.2));
+    }
+
+    #[test]
+    fn sizing_rejects_non_positive_total() {
+        assert!(matches!(
+            compute_sizing(dec!(0), 10, 2, dec!(50)).unwrap_err(),
+            PreflightError::NonPositiveTotal(_)
+        ));
+    }
+
+    // === USD conversion ===
+
+    #[test]
+    fn usd_converts_to_coin_at_mid() {
+        assert_eq!(usd_to_coin(dec!(1500), dec!(30)).unwrap(), dec!(50));
+    }
+
+    #[test]
+    fn usd_conversion_rejects_non_positive_mid() {
+        assert!(usd_to_coin(dec!(1500), dec!(0)).is_err());
+    }
+
+    #[test]
+    fn usd_flow_end_to_end_matches_spec_example() {
+        // --usd 1500 at mid 30 → 50 coins over 10 slices → 5 per slice.
+        let coin = usd_to_coin(dec!(1500), dec!(30)).unwrap();
+        let s = compute_sizing(coin, 10, 2, dec!(30)).unwrap();
+        assert_eq!(s.per_slice, dec!(5));
+        assert_eq!(s.total_adjusted, dec!(50));
+    }
+
+    // === target / catch-up ===
+
+    #[test]
+    fn target_is_linear_until_final_slice_absorbs_remainder() {
+        let (per, total) = (dec!(3.33), dec!(9.99));
+        assert_eq!(target_at_slice(1, 3, per, total), dec!(3.33));
+        assert_eq!(target_at_slice(2, 3, per, total), dec!(6.66));
+        // Final slice targets the adjusted total exactly.
+        assert_eq!(target_at_slice(3, 3, per, total), dec!(9.99));
+    }
+
+    #[test]
+    fn catch_up_orders_the_shortfall_after_a_partial_fill() {
+        // Slice 1 targeted 5 but only 3 filled; slice 2 must order 7 (=10-3),
+        // NOT 5 — the shortfall is caught up exactly once.
+        let sz = slice_order_size(2, 10, dec!(5), dec!(50), dec!(3), 2);
+        assert_eq!(sz, dec!(7));
+    }
+
+    #[test]
+    fn catch_up_never_double_orders_when_fully_filled() {
+        // Everything up to slice 2's target is already filled → order exactly
+        // one slice worth.
+        let sz = slice_order_size(3, 10, dec!(5), dec!(50), dec!(10), 2);
+        assert_eq!(sz, dec!(5));
+    }
+
+    #[test]
+    fn over_fill_yields_zero_not_a_negative_order() {
+        // Filled 12 but slice-2 target is 10 → nothing to do.
+        let sz = slice_order_size(2, 10, dec!(5), dec!(50), dec!(12), 2);
+        assert_eq!(sz, Decimal::ZERO);
+    }
+
+    #[test]
+    fn last_slice_absorbs_the_rounding_remainder() {
+        // per_slice 3.33 × 3 = 9.99. After two full slices (6.66), the last
+        // slice must order the 3.33 that completes total_adjusted.
+        let sz = slice_order_size(3, 3, dec!(3.33), dec!(9.99), dec!(6.66), 2);
+        assert_eq!(sz, dec!(3.33));
+    }
+
+    #[test]
+    fn order_size_is_rounded_down_to_sz_decimals() {
+        // Shortfall of 3.456789 must truncate, never round up.
+        let sz = slice_order_size(1, 10, dec!(3.456789), dec!(34.56789), dec!(0), 2);
+        assert_eq!(sz, dec!(3.45));
+    }
+
+    #[test]
+    fn full_run_arithmetic_never_exceeds_total_adjusted() {
+        // Walk all 10 slices assuming full fills; the cumulative total must
+        // land exactly on total_adjusted and never overshoot en route.
+        let (per, total, slices) = (dec!(3.33), dec!(33.30), 10u32);
+        let mut filled = Decimal::ZERO;
+        for i in 1..=slices {
+            let sz = slice_order_size(i, slices, per, total, filled, 2);
+            filled += sz;
+            assert!(filled <= total, "slice {i} overshot: {filled} > {total}");
+        }
+        assert_eq!(filled, total);
+    }
+
+    #[test]
+    fn run_with_partial_fills_still_converges_to_total() {
+        // Every slice fills only half; the catch-up logic keeps pushing the
+        // shortfall forward and the last slice requests the full remainder.
+        let (per, total, slices) = (dec!(5), dec!(50), 10u32);
+        let mut filled = Decimal::ZERO;
+        let mut last_requested = Decimal::ZERO;
+        let mut filled_before_last = Decimal::ZERO;
+        for i in 1..=slices {
+            let sz = slice_order_size(i, slices, per, total, filled, 2);
+            if i == slices {
+                filled_before_last = filled;
+                last_requested = sz;
+            }
+            filled += sz / dec!(2);
+            // The catch-up must never request more than the outstanding gap.
+            assert!(filled <= total, "slice {i} overshot: {filled} > {total}");
+        }
+        // The final slice asks for the entire outstanding shortfall, modulo
+        // the size-precision truncation (which can only ever under-request).
+        let gap = total - filled_before_last;
+        assert_eq!(last_requested, round_size(gap, 2));
+        assert!(
+            last_requested <= gap,
+            "must never request more than the gap"
+        );
+        assert!(last_requested > per, "shortfall should have accumulated");
+    }
+
+    // === min-notional skip / carry ===
+
+    #[test]
+    fn slice_below_min_notional_is_skipped_and_carried() {
+        // per-slice 0.1 @ $50 = $5 < $10 → skip.
+        let d = decide_slice(1, 10, dec!(0.1), dec!(1), dec!(0), 2, dec!(50));
+        match d {
+            SliceDecision::SkipBelowMinNotional { sz, notional } => {
+                assert_eq!(sz, dec!(0.1));
+                assert_eq!(notional, dec!(5.0));
+            }
+            other => panic!("expected skip, got {other:?}"),
+        }
+        // Slice 2's target is cumulative → 0.2 = $10.00. That sits exactly on
+        // the bare floor and so is now SKIPPED: the T1 margin demands headroom
+        // (see `min_notional_gate_requires_headroom_over_the_bare_floor`).
+        assert!(matches!(
+            decide_slice(2, 10, dec!(0.1), dec!(1), dec!(0), 2, dec!(50)),
+            SliceDecision::SkipBelowMinNotional { .. }
+        ));
+        // Slice 3 carries to 0.3 = $15, comfortably clear of the gate.
+        assert_eq!(
+            decide_slice(3, 10, dec!(0.1), dec!(1), dec!(0), 2, dec!(50)),
+            SliceDecision::Place(dec!(0.3))
+        );
+    }
+
+    // === T1: the gate uses the ORDER price, not the mid ===
+
+    #[test]
+    fn t1_short_slice_priced_below_mid_is_gated_on_the_order_price() {
+        // The reviewed counter-example. bid=49.9 / ask=50.1 → mid=50.0.
+        // A SHORT's taker limit sits BELOW the bid: 49.9 - 20bps = 49.80.
+        // sz=0.2 → mid notional $10.00 (would have passed the old gate) but the
+        // real order is 0.2 × 49.80 = $9.96, which HL rejects as MinTradeNtl —
+        // a FATAL rejection that would stop the whole run.
+        let (bid, ask) = (dec!(49.9), dec!(50.1));
+        let mid = (bid + ask) / dec!(2);
+        assert_eq!(mid, dec!(50.0));
+
+        let px = taker_limit_price(bid, ask, Side::Short, dec!(20), 2);
+        assert!(px < mid, "short limit {px} must sit below mid {mid}");
+        assert_eq!(px, dec!(49.80));
+
+        let sz = dec!(0.2);
+        assert_eq!(sz * mid, dec!(10.00), "mid notional sits on the old gate");
+        assert!(
+            sz * px < MIN_NOTIONAL_USD,
+            "real notional is under the floor"
+        );
+
+        // Gating on the order price skips (and carries) instead of placing a
+        // doomed order.
+        match decide_slice(1, 10, sz, sz * dec!(10), dec!(0), 2, px) {
+            SliceDecision::SkipBelowMinNotional { sz: s, notional } => {
+                assert_eq!(s, sz);
+                assert_eq!(notional, dec!(9.960));
+            }
+            other => panic!("expected skip on the real order price, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn t1_long_slice_priced_above_mid_still_gates_on_the_order_price() {
+        // The long case is the mirror image: the limit is ABOVE the mid, so the
+        // order-price gate is strictly more permissive than the mid gate. It
+        // must still be the order price that decides.
+        let (bid, ask) = (dec!(49.9), dec!(50.1));
+        let px = taker_limit_price(bid, ask, Side::Long, dec!(20), 2);
+        assert!(px > dec!(50.0));
+        // 0.21 × ~50.2 = ~$10.54 — over the margined gate.
+        assert!(dec!(0.21) * px > min_notional_gate());
+        assert_eq!(
+            decide_slice(1, 10, dec!(0.21), dec!(2.1), dec!(0), 2, px),
+            SliceDecision::Place(dec!(0.21))
+        );
+    }
+
+    #[test]
+    fn min_notional_gate_requires_headroom_over_the_bare_floor() {
+        // A notional resting exactly on $10.00 is one adverse tick away from a
+        // FATAL MinTradeNtl rejection. The margin converts that hard stop into
+        // a skip-and-carry, so the gate must sit strictly above the floor.
+        assert!(min_notional_gate() > MIN_NOTIONAL_USD);
+        assert_eq!(min_notional_gate(), dec!(10.10));
+
+        // Exactly $10.00 → skipped.
+        assert!(matches!(
+            decide_slice(1, 10, dec!(0.2), dec!(2), dec!(0), 2, dec!(50)),
+            SliceDecision::SkipBelowMinNotional { .. }
+        ));
+        // $10.20 → placed.
+        assert_eq!(
+            decide_slice(1, 10, dec!(0.2), dec!(2), dec!(0), 2, dec!(51)),
+            SliceDecision::Place(dec!(0.2))
+        );
+    }
+
+    #[test]
+    fn carry_accumulates_across_several_skipped_slices() {
+        // $4 per slice: needs 3 slices to clear the $10 floor.
+        let (per, total, mid) = (dec!(0.08), dec!(0.8), dec!(50));
+        assert!(matches!(
+            decide_slice(1, 10, per, total, dec!(0), 2, mid),
+            SliceDecision::SkipBelowMinNotional { .. }
+        ));
+        assert!(matches!(
+            decide_slice(2, 10, per, total, dec!(0), 2, mid),
+            SliceDecision::SkipBelowMinNotional { .. }
+        ));
+        // Slice 3: 0.24 @ $50 = $12 ≥ $10 → place the accumulated carry.
+        assert_eq!(
+            decide_slice(3, 10, per, total, dec!(0), 2, mid),
+            SliceDecision::Place(dec!(0.24))
+        );
+    }
+
+    #[test]
+    fn slice_at_target_skips_ahead() {
+        assert_eq!(
+            decide_slice(1, 10, dec!(5), dec!(50), dec!(5), 2, dec!(100)),
+            SliceDecision::SkipAhead
+        );
+    }
+
+    #[test]
+    fn slice_above_min_notional_is_placed() {
+        assert_eq!(
+            decide_slice(1, 10, dec!(5), dec!(50), dec!(0), 2, dec!(100)),
+            SliceDecision::Place(dec!(5))
+        );
+    }
+
+    // === deadlines ===
+
+    #[tokio::test(start_paused = true)]
+    async fn deadlines_are_evenly_spaced_from_the_absolute_start() {
+        let start = tokio::time::Instant::now();
+        let dur = Duration::from_secs(30 * 60);
+        let d1 = slice_deadline(start, dur, 1, 10);
+        let d5 = slice_deadline(start, dur, 5, 10);
+        let d10 = slice_deadline(start, dur, 10, 10);
+        assert_eq!(d1 - start, Duration::from_secs(180));
+        assert_eq!(d5 - start, Duration::from_secs(900));
+        assert_eq!(d10 - start, dur);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_deadline_equals_the_full_duration_with_odd_slice_counts() {
+        let start = tokio::time::Instant::now();
+        let dur = Duration::from_secs(100);
+        assert_eq!(slice_deadline(start, dur, 3, 3) - start, dur);
+        assert_eq!(slice_deadline(start, dur, 7, 7) - start, dur);
+    }
+
+    // === report ===
+
+    fn report(filled: Decimal, adjusted: Decimal, abort: Option<&str>) -> TwapReport {
+        TwapReport {
+            symbol: Symbol::new("HYPE"),
+            side: Side::Long,
+            total_requested: adjusted,
+            total_adjusted: adjusted,
+            filled,
+            avg_px: Some(dec!(38.1)),
+            slices_executed: 10,
+            slices_skipped: 0,
+            elapsed: Duration::from_secs(1800),
+            abort_reason: abort.map(str::to_string),
+            read_only: false,
+        }
+    }
+
+    #[test]
+    fn complete_run_exits_zero() {
+        let r = report(dec!(50), dec!(50), None);
+        assert_eq!(r.exit_code(), 0);
+        assert!(!r.is_partial());
+        assert!(r.render().contains("status:          complete"));
+    }
+
+    #[test]
+    fn partial_but_unaborted_run_exits_zero_with_warning() {
+        let r = report(dec!(30), dec!(50), None);
+        assert_eq!(r.exit_code(), 0);
+        assert!(r.is_partial());
+        assert!(r.render().contains("WARNING"), "{}", r.render());
+    }
+
+    #[test]
+    fn aborted_run_exits_one() {
+        let r = report(dec!(30), dec!(50), Some("exchange rejected"));
+        assert_eq!(r.exit_code(), 1);
+        assert!(r.render().contains("ABORTED"));
+    }
+
+    // === T4: pre-flight rounding loss is always re-surfaced ===
+
+    /// Report where the requested and adjusted totals differ.
+    fn report_with_requested(
+        requested: Decimal,
+        adjusted: Decimal,
+        filled: Decimal,
+        abort: Option<&str>,
+    ) -> TwapReport {
+        TwapReport {
+            total_requested: requested,
+            ..report(filled, adjusted, abort)
+        }
+    }
+
+    #[test]
+    fn t4_rounding_loss_is_reported_even_when_the_adjusted_target_is_met() {
+        // szDecimals=0, requested 10.5 over some slices → adjusted 8. Filling
+        // all 8 is "complete" against the adjusted target, but 2.5 of what the
+        // operator asked for (24%) never entered the market. Reporting a bare
+        // "complete" here hides that entirely.
+        let r = report_with_requested(dec!(10.5), dec!(8), dec!(8), None);
+        assert!(!r.is_partial(), "filled == adjusted, so not a partial fill");
+        assert_eq!(r.exit_code(), 0);
+        assert_eq!(r.rounding_dropped(), Some(dec!(2.5)));
+
+        let out = r.render();
+        assert!(
+            out.contains("NOTE:            rounding dropped 2.5 of requested 10.5 at pre-flight"),
+            "{out}"
+        );
+        // "complete" must never appear unqualified when a shortfall exists.
+        assert!(
+            out.contains("complete (against the adjusted target)"),
+            "{out}"
+        );
+        assert!(!out.contains("status:          complete\n"), "{out}");
+    }
+
+    #[test]
+    fn t4_no_note_when_rounding_dropped_nothing() {
+        let r = report_with_requested(dec!(50), dec!(50), dec!(50), None);
+        assert_eq!(r.rounding_dropped(), None);
+        let out = r.render();
+        assert!(!out.contains("NOTE:"), "{out}");
+        assert!(out.contains("status:          complete\n"), "{out}");
+    }
+
+    #[test]
+    fn t4_note_survives_a_partial_fill_and_an_abort() {
+        // A partial fill or an abort does not make the pre-flight shortfall any
+        // less real, so the note is printed alongside either.
+        let partial = report_with_requested(dec!(10.5), dec!(8), dec!(5), None).render();
+        assert!(partial.contains("WARNING"), "{partial}");
+        assert!(partial.contains("rounding dropped 2.5"), "{partial}");
+
+        let aborted = report_with_requested(dec!(10.5), dec!(8), dec!(5), Some("boom")).render();
+        assert!(aborted.contains("ABORTED"), "{aborted}");
+        assert!(aborted.contains("rounding dropped 2.5"), "{aborted}");
+    }
+
+    #[test]
+    fn read_only_report_is_labelled() {
+        let mut r = report(dec!(50), dec!(50), None);
+        r.read_only = true;
+        assert!(r.render().contains("READ-ONLY"));
+    }
+
+    #[test]
+    fn avg_px_is_size_weighted() {
+        let mut s = FillStats::default();
+        s.add(dec!(1), dec!(100));
+        s.add(dec!(3), dec!(200));
+        // (1*100 + 3*200) / 4 = 175
+        assert_eq!(s.avg_px(), Some(dec!(175)));
+    }
+
+    #[test]
+    fn avg_px_is_none_with_no_fills() {
+        assert_eq!(FillStats::default().avg_px(), None);
+    }
+
+    #[test]
+    fn read_only_banner_is_loud() {
+        assert!(READ_ONLY_BANNER.contains("READ-ONLY"));
+        assert!(READ_ONLY_BANNER.contains("NO ORDERS ARE SENT"));
+    }
+}
+
+/// Loop-level tests driving `run_twap` through the `HlApi` seam (T6).
+///
+/// The pure slice arithmetic above is well covered, but it was the SEQUENCING
+/// layer — the part that actually commits money — that carried T1, T2, T3 and
+/// T5 past a green suite. These tests exercise `run_twap` itself, with virtual
+/// time so a 30-minute window costs nothing.
+#[cfg(test)]
+mod loop_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use crate::api::{Call, HlApi, ScriptedApi};
+    use crate::client::OrderStatusFill;
+    use crate::types::{BookLevel, OrderId};
+
+    const MASTER: &str = "0x00000000000000000000000000000000000000aa";
+    const AGENT: &str = "0x00000000000000000000000000000000000000bb";
+
+    fn book_at(bid: Decimal, ask: Decimal) -> OrderBook {
+        OrderBook {
+            bids: vec![BookLevel {
+                px: bid,
+                sz: dec!(1000),
+                n: 1,
+            }],
+            asks: vec![BookLevel {
+                px: ask,
+                sz: dec!(1000),
+                n: 1,
+            }],
+            // `max_book_age_ms: 0` in these plans disables the freshness gate,
+            // so the timestamp is irrelevant to the behaviour under test.
+            time_ms: 0,
+        }
+    }
+
+    /// 10 slices of 5 coins over 30 minutes, long, at ~$50.
+    fn plan(read_only: bool) -> TwapPlan {
+        TwapPlan {
+            symbol: Symbol::new("HYPE"),
+            side: Side::Long,
+            asset_index: 2,
+            sz_decimals: 2,
+            per_slice: dec!(5),
+            total_adjusted: dec!(50),
+            total_requested: dec!(50),
+            slices: 10,
+            duration: Duration::from_secs(1800),
+            slippage_bps: dec!(20),
+            // Disabled: these tests pin sequencing, not freshness.
+            max_book_age_ms: 0,
+            read_only,
+            agent: Some(Address::new(AGENT)),
+            master: if read_only {
+                None
+            } else {
+                Some(Address::new(MASTER))
+            },
+        }
+    }
+
+    fn filled(sz: Decimal, px: Decimal) -> Result<PlaceOutcome, HlError> {
+        Ok(PlaceOutcome::Filled {
+            oid: OrderId(1),
+            total_sz: sz,
+            avg_px: px,
+        })
+    }
+
+    fn status(filled_sz: Decimal, avg_px: Option<Decimal>, st: &str) -> OrderStatusFill {
+        OrderStatusFill {
+            filled_sz,
+            avg_px,
+            status: st.into(),
+        }
+    }
+
+    // === (d) happy path ===
+
+    #[tokio::test(start_paused = true)]
+    async fn d_ten_slice_happy_path_fills_exactly_the_adjusted_total() {
+        let mut api = ScriptedApi::new().with_default_book(book_at(dec!(49.9), dec!(50.1)));
+        for _ in 0..10 {
+            api = api.push_place(filled(dec!(5), dec!(50)));
+        }
+
+        let report = run_twap(&api, &plan(false)).await;
+
+        assert_eq!(report.filled, dec!(50));
+        assert_eq!(report.total_adjusted, dec!(50));
+        assert_eq!(report.slices_executed, 10);
+        assert_eq!(report.slices_skipped, 0);
+        assert_eq!(report.abort_reason, None);
+        assert_eq!(report.exit_code(), 0);
+        assert!(!report.is_partial());
+        assert_eq!(api.place_count(), 10);
+
+        // The cumulative total must never overshoot at ANY step, not just at
+        // the end — an intermediate overshoot is an unrecoverable over-fill.
+        let mut cumulative = Decimal::ZERO;
+        for c in api.place_calls() {
+            if let Call::Place { sz, .. } = c {
+                cumulative += sz;
+                assert!(
+                    cumulative <= dec!(50),
+                    "overshot mid-run: {cumulative} > 50"
+                );
+            }
+        }
+        assert_eq!(cumulative, dec!(50));
+    }
+
+    // === (a) T2: the duration cut-off exempts nothing ===
+
+    #[tokio::test(start_paused = true)]
+    async fn a_t2_no_order_is_placed_after_the_duration_elapses() {
+        // Every place takes 5 minutes to come back (HL slow / retries / fill
+        // recovery). With a 20-minute window and 10 slices, the clock runs out
+        // partway through and the run must stop — including on the FINAL slice,
+        // which the old code exempted.
+        struct SlowApi {
+            inner: ScriptedApi,
+            start: tokio::time::Instant,
+            /// Elapsed time at each place, to prove none happened late.
+            place_times: std::sync::Mutex<Vec<Duration>>,
+        }
+
+        #[async_trait::async_trait]
+        impl HlApi for SlowApi {
+            async fn fetch_l2_book(&self, s: &Symbol) -> Result<OrderBook, HlError> {
+                self.inner.fetch_l2_book(s).await
+            }
+            async fn place_order_once(
+                &self,
+                i: &OrderIntent,
+                a: u32,
+            ) -> Result<(u64, PlaceOutcome), HlError> {
+                self.place_times.lock().unwrap().push(self.start.elapsed());
+                let r = self.inner.place_order_once(i, a).await;
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                r
+            }
+            async fn cancel_by_cloid(&self, i: &CancelIntent, a: u32) -> Result<(), HlError> {
+                self.inner.cancel_by_cloid(i, a).await
+            }
+            async fn fetch_order_status(
+                &self,
+                u: &Address,
+                o: OrderId,
+            ) -> Result<Option<OrderStatusFill>, HlError> {
+                self.inner.fetch_order_status(u, o).await
+            }
+            async fn fetch_order_status_by_cloid(
+                &self,
+                u: &Address,
+                c: Cloid,
+            ) -> Result<Option<OrderStatusFill>, HlError> {
+                self.inner.fetch_order_status_by_cloid(u, c).await
+            }
+        }
+
+        let mut inner = ScriptedApi::new().with_default_book(book_at(dec!(49.9), dec!(50.1)));
+        for _ in 0..10 {
+            inner = inner.push_place(filled(dec!(5), dec!(50)));
+        }
+        let window = Duration::from_secs(1200);
+        let api = SlowApi {
+            inner,
+            start: tokio::time::Instant::now(),
+            place_times: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let mut p = plan(false);
+        p.duration = window;
+        let report = run_twap(&api, &p).await;
+
+        // The window ran out, so the run aborted rather than finishing.
+        let reason = report.abort_reason.clone().expect("must abort on duration");
+        assert!(reason.contains("elapsed"), "{reason}");
+        assert_eq!(report.exit_code(), 1);
+
+        // The pin: not one order was sent at or past the window edge.
+        let times = api.place_times.lock().unwrap().clone();
+        assert!(!times.is_empty(), "the run should have placed something");
+        for (i, t) in times.iter().enumerate() {
+            assert!(
+                *t < window,
+                "slice {} placed at {t:?}, outside the {window:?} window",
+                i + 1
+            );
+        }
+        // And it stopped short of the full slice count.
+        assert!(
+            times.len() < 10,
+            "expected an early stop, placed {} slices",
+            times.len()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_t2_final_slice_gets_no_exemption_from_the_window() {
+        // Directly targets the removed `&& slice_idx < plan.slices` clause.
+        //
+        // Two slices over 10 minutes. Slice 1 is fine, but its place takes 15
+        // minutes to resolve (retries / recovery), so by the time slice 2 — the
+        // FINAL slice — comes up the window is long gone. Under the old code
+        // that slice was exempt and fired anyway, and because it is also the
+        // catch-up slice it would have carried the largest size of the run.
+        struct SlowPlace {
+            inner: ScriptedApi,
+        }
+
+        #[async_trait::async_trait]
+        impl HlApi for SlowPlace {
+            async fn fetch_l2_book(&self, s: &Symbol) -> Result<OrderBook, HlError> {
+                self.inner.fetch_l2_book(s).await
+            }
+            async fn place_order_once(
+                &self,
+                i: &OrderIntent,
+                a: u32,
+            ) -> Result<(u64, PlaceOutcome), HlError> {
+                let r = self.inner.place_order_once(i, a).await;
+                tokio::time::sleep(Duration::from_secs(900)).await;
+                r
+            }
+            async fn cancel_by_cloid(&self, i: &CancelIntent, a: u32) -> Result<(), HlError> {
+                self.inner.cancel_by_cloid(i, a).await
+            }
+            async fn fetch_order_status(
+                &self,
+                u: &Address,
+                o: OrderId,
+            ) -> Result<Option<OrderStatusFill>, HlError> {
+                self.inner.fetch_order_status(u, o).await
+            }
+            async fn fetch_order_status_by_cloid(
+                &self,
+                u: &Address,
+                c: Cloid,
+            ) -> Result<Option<OrderStatusFill>, HlError> {
+                self.inner.fetch_order_status_by_cloid(u, c).await
+            }
+        }
+
+        let api = SlowPlace {
+            inner: ScriptedApi::new()
+                .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+                // Only slice 1 is fillable; slice 2 must never be attempted.
+                .push_place(filled(dec!(2), dec!(50))),
+        };
+
+        let mut p = plan(false);
+        p.slices = 2;
+        p.per_slice = dec!(5);
+        p.total_adjusted = dec!(10);
+        p.total_requested = dec!(10);
+        p.duration = Duration::from_secs(600);
+
+        let report = run_twap(&api, &p).await;
+
+        assert_eq!(
+            api.inner.place_count(),
+            1,
+            "the FINAL slice must not be exempt from the window"
+        );
+        // Only slice 1's 2 coins were filled; the catch-up never fired.
+        assert_eq!(report.filled, dec!(2));
+        let reason = report
+            .abort_reason
+            .clone()
+            .expect("running past the window must abort");
+        assert!(reason.contains("elapsed"), "{reason}");
+        assert!(reason.contains("slice 2/2"), "{reason}");
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    // === (b) T3/T5: resting-order recovery ===
+
+    #[tokio::test(start_paused = true)]
+    async fn b_t3_resting_partial_fill_is_credited_once_from_the_terminal_status() {
+        // Slice 1 rests. The first orderStatus says "open" with 2 filled — that
+        // is a LIVE order which can still fill, so it must NOT be adopted. The
+        // second says "canceled" with 3 filled: terminal, and the value that
+        // counts. Adopting the "open" 2 would under-count and make every later
+        // slice over-order.
+        let mut api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(Ok(PlaceOutcome::Resting { oid: OrderId(77) }))
+            .push_status(Ok(Some(status(dec!(2), Some(dec!(49.5)), "open"))))
+            .push_status(Ok(Some(status(dec!(3), Some(dec!(49.5)), "canceled"))));
+        for _ in 0..9 {
+            api = api.push_place(filled(dec!(5), dec!(50)));
+        }
+
+        let report = run_twap(&api, &plan(false)).await;
+
+        // Credited exactly once, at the TERMINAL value (3), never the open 2.
+        let places: Vec<Decimal> = api
+            .place_calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Place { sz, .. } => Some(sz),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(places[0], dec!(5), "slice 1 ordered its full share");
+        // Slice 2 catches up the 2-coin shortfall: target 10 - filled 3 = 7.
+        assert_eq!(
+            places[1],
+            dec!(7),
+            "slice 2 must catch up from the terminal fill of 3, not from 2"
+        );
+
+        // The status was queried as the MASTER (F1), not the agent.
+        let status_users: Vec<String> = api
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::StatusByOid { user, .. } | Call::StatusByCloid { user, .. } => Some(user),
+                _ => None,
+            })
+            .collect();
+        assert!(!status_users.is_empty());
+        for u in status_users {
+            assert_eq!(u, MASTER, "orderStatus must query the master (F1)");
+        }
+        assert_eq!(report.abort_reason, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn b_t3_never_terminal_status_hard_stops_rather_than_guess() {
+        // orderStatus stays "open" for every retry. The fill count is genuinely
+        // unknown, so the run must stop — guessing low over-orders on every
+        // later slice, guessing high under-executes silently.
+        let mut api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(Ok(PlaceOutcome::Resting { oid: OrderId(77) }));
+        for _ in 0..ORDER_STATUS_RETRIES {
+            api = api.push_status(Ok(Some(status(dec!(2), None, "open"))));
+        }
+
+        let report = run_twap(&api, &plan(false)).await;
+
+        let reason = report.abort_reason.clone().expect("must hard-stop");
+        assert!(reason.contains("terminal"), "{reason}");
+        assert_eq!(report.exit_code(), 1);
+        // Nothing was credited from the non-terminal snapshot.
+        assert_eq!(report.filled, Decimal::ZERO);
+        assert_eq!(api.place_count(), 1, "must not place further slices");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn b_t5_recovered_fill_is_priced_at_the_reported_avg_px_not_the_limit() {
+        // T5: the recovered fill is credited at HL's realised avgPx (49.50),
+        // not at our limit price (~50.2, the worst price it could have got).
+        // Crediting the limit skews the avg-price report against us.
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(Ok(PlaceOutcome::Resting { oid: OrderId(77) }))
+            .push_status(Ok(Some(status(dec!(5), Some(dec!(49.5)), "filled"))));
+
+        let mut p = plan(false);
+        p.slices = 1;
+        p.per_slice = dec!(5);
+        p.total_adjusted = dec!(5);
+        p.total_requested = dec!(5);
+
+        let report = run_twap(&api, &p).await;
+
+        assert_eq!(report.filled, dec!(5));
+        assert_eq!(
+            report.avg_px,
+            Some(dec!(49.5)),
+            "must use orderStatus avgPx, not the limit price"
+        );
+        let limit = taker_limit_price(dec!(49.9), dec!(50.1), Side::Long, dec!(20), 2);
+        assert!(
+            report.avg_px.unwrap() < limit,
+            "avg {:?} should be better than the limit {limit}",
+            report.avg_px
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn b_t5_missing_avg_px_falls_back_to_the_limit_price() {
+        // HL omits avgPx for orders that never filled. With filled_sz 0 the
+        // price is immaterial, but the code must not panic or credit nonsense.
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(Ok(PlaceOutcome::Resting { oid: OrderId(77) }))
+            .push_status(Ok(Some(status(dec!(0), None, "canceled"))));
+
+        let mut p = plan(false);
+        p.slices = 1;
+        p.per_slice = dec!(5);
+        p.total_adjusted = dec!(5);
+        p.total_requested = dec!(5);
+
+        let report = run_twap(&api, &p).await;
+        assert_eq!(report.filled, Decimal::ZERO);
+        assert_eq!(report.avg_px, None);
+        assert_eq!(report.abort_reason, None, "a zero fill is not an abort");
+    }
+
+    // === (c) T1: a mid-run price drop pushes a slice under the floor ===
+
+    #[tokio::test(start_paused = true)]
+    async fn c_t1_slice_under_the_floor_is_skipped_and_carried_to_the_next() {
+        // Slice 1 places 0.3 at ~$50 (~$15, clear of the gate). Then price
+        // collapses to ~$25, so slice 2's 0.3 is worth only ~$7.5 — under the
+        // gate. It must be SKIPPED (not sent and rejected), and because targets
+        // are cumulative the quantity carries forward: slice 3 orders 0.6 at the
+        // recovered price.
+        let api = ScriptedApi::new()
+            .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+            .push_place(filled(dec!(0.3), dec!(50)))
+            .push_book(Ok(book_at(dec!(24.9), dec!(25.1)))) // crash
+            .push_book(Ok(book_at(dec!(49.9), dec!(50.1)))) // recovery
+            .push_place(filled(dec!(0.6), dec!(50)))
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)));
+
+        let mut p = plan(false);
+        p.slices = 3;
+        p.per_slice = dec!(0.3);
+        p.total_adjusted = dec!(0.9);
+        p.total_requested = dec!(0.9);
+
+        let report = run_twap(&api, &p).await;
+
+        let sizes: Vec<Decimal> = api
+            .place_calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Place { sz, .. } => Some(sz),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sizes,
+            vec![dec!(0.3), dec!(0.6)],
+            "slice 2 must be skipped and its size carried into slice 3"
+        );
+        assert_eq!(report.slices_executed, 2);
+        assert_eq!(report.slices_skipped, 1);
+        assert_eq!(report.filled, dec!(0.9));
+        assert_eq!(report.abort_reason, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn c_t1_short_slice_between_the_two_gates_is_not_sent() {
+        // The counter-example from the review, driven through the whole loop.
+        //
+        // A SHORT's taker limit sits BELOW the mid, so there is a band of sizes
+        // where the mid says "fine" and the price that actually reaches HL is
+        // under the floor. This test sits squarely in that band, which is what
+        // makes it able to tell the two gates apart — with a LONG the limit is
+        // ABOVE the mid and both gates agree, so no long test can detect this.
+        //
+        // bid=40 / ask=60 → mid 50. With 500bps of slippage the short limit is
+        // 40 - 5% = 38, a wide spread chosen to make the band easy to land in.
+        // sz=0.26 is worth $13.00 at the mid — comfortably over the $10.10 gate
+        // — but 0.26 × 38 = $9.88 at the price that actually reaches HL, which
+        // comes back as a fatal MinTradeNtl and stops the entire run.
+        let api = ScriptedApi::new().with_default_book(book_at(dec!(40), dec!(60)));
+        // No place is scripted: if the loop tries to send, the fake errors and
+        // the assertions below fail loudly.
+
+        let mut p = plan(false);
+        p.side = Side::Short;
+        p.slippage_bps = dec!(500);
+        p.slices = 1;
+        p.per_slice = dec!(0.26);
+        p.total_adjusted = dec!(0.26);
+        p.total_requested = dec!(0.26);
+
+        // Pin the arithmetic this test depends on, so a change to the price
+        // rounding cannot silently move the case out of the discriminating band.
+        let limit = taker_limit_price(dec!(40), dec!(60), Side::Short, dec!(500), 2);
+        assert_eq!(limit, dec!(38));
+        assert!(
+            dec!(0.26) * dec!(50) > min_notional_gate(),
+            "the mid gate must PASS, or this test proves nothing"
+        );
+        assert!(
+            dec!(0.26) * limit < MIN_NOTIONAL_USD,
+            "the real order price must be under HL's floor"
+        );
+
+        let report = run_twap(&api, &p).await;
+
+        assert_eq!(
+            api.place_count(),
+            0,
+            "a short slice worth $9.88 at its own limit price must not be sent, \
+             even though it looks like $13.00 at the mid"
+        );
+        assert_eq!(report.slices_skipped, 1);
+        assert_eq!(report.slices_executed, 0);
+        assert_eq!(report.filled, Decimal::ZERO);
+        // Skipping is not an abort — the residual is simply unexecutable.
+        assert_eq!(report.abort_reason, None);
+        assert_eq!(report.exit_code(), 0);
+    }
+
+    // === (e) read-only accounting ===
+
+    #[tokio::test(start_paused = true)]
+    async fn e_read_only_assumes_full_fills_and_sends_nothing() {
+        let api = ScriptedApi::new().with_default_book(book_at(dec!(49.9), dec!(50.1)));
+        // No places scripted at all: any attempt to send would error out.
+
+        let report = run_twap(&api, &plan(true)).await;
+
+        assert_eq!(api.place_count(), 0, "read-only must send NOTHING");
+        assert!(
+            !api.calls().iter().any(|c| matches!(
+                c,
+                Call::Cancel { .. } | Call::StatusByOid { .. } | Call::StatusByCloid { .. }
+            )),
+            "read-only must not touch the exchange or orderStatus"
+        );
+        // The dry run walks the same accounting path, assuming full fills.
+        assert_eq!(report.filled, dec!(50));
+        assert_eq!(report.slices_executed, 10);
+        assert!(report.read_only);
+        assert_eq!(report.exit_code(), 0);
+        assert!(report.render().contains("READ-ONLY"));
+    }
+
+    // === (f) early exit once the target is reached ===
+
+    #[tokio::test(start_paused = true)]
+    async fn f_run_breaks_early_once_filled_reaches_the_adjusted_total() {
+        // Slice 1 over-fills relative to its own share (HL filled the whole
+        // remaining size). The loop must stop immediately rather than keep
+        // sending slices that would push past the target.
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(filled(dec!(50), dec!(50)));
+
+        let report = run_twap(&api, &plan(false)).await;
+
+        assert_eq!(api.place_count(), 1, "must break after the target is met");
+        assert_eq!(report.filled, dec!(50));
+        assert_eq!(report.slices_executed, 1);
+        assert_eq!(report.abort_reason, None);
+        assert!(!report.is_partial());
+    }
+
+    // === W1: ambiguous transport failure is reconciled by cloid ===
+
+    #[tokio::test(start_paused = true)]
+    async fn w1_ambiguous_send_that_actually_landed_is_credited_without_a_resend() {
+        // The POST timed out AFTER HL received it. Reconciling by cloid finds a
+        // terminal fill, so the order must be credited and NOT re-sent — a
+        // resend here would double the position.
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(Err(HlError::Network("operation timed out".into())))
+            .push_status(Ok(Some(status(dec!(5), Some(dec!(50.05)), "filled"))));
+
+        let mut p = plan(false);
+        p.slices = 1;
+        p.per_slice = dec!(5);
+        p.total_adjusted = dec!(5);
+        p.total_requested = dec!(5);
+
+        let report = run_twap(&api, &p).await;
+
+        assert_eq!(api.place_count(), 1, "must NOT resend an order HL received");
+        assert_eq!(report.filled, dec!(5));
+        assert_eq!(report.avg_px, Some(dec!(50.05)));
+        assert_eq!(report.abort_reason, None);
+
+        // Reconciliation used the cloid of the order we sent, as the master.
+        let sent_cloid = match api.place_calls().first() {
+            Some(Call::Place { cloid, .. }) => *cloid,
+            other => panic!("expected a place call, got {other:?}"),
+        };
+        assert!(
+            api.calls().iter().any(|c| matches!(
+                c,
+                Call::StatusByCloid { user, cloid } if user == MASTER && *cloid == sent_cloid
+            )),
+            "reconciliation must query the master by the sent cloid"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn w1_unknown_oid_means_hl_never_got_it_so_a_fresh_nonce_resend_is_safe() {
+        // The POST failed BEFORE HL saw it. `unknownOid` proves the order does
+        // not exist, so re-signing with a FRESH nonce is safe — and required,
+        // since the old nonce may have been burned.
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(Err(HlError::Network("connection refused".into())))
+            .push_status(Ok(None)) // unknownOid
+            .push_place(filled(dec!(5), dec!(50)));
+
+        let mut p = plan(false);
+        p.slices = 1;
+        p.per_slice = dec!(5);
+        p.total_adjusted = dec!(5);
+        p.total_requested = dec!(5);
+
+        let report = run_twap(&api, &p).await;
+
+        assert_eq!(report.filled, dec!(5));
+        assert_eq!(report.abort_reason, None);
+
+        let nonces: Vec<u64> = api
+            .place_calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Place { nonce, .. } => Some(nonce),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nonces.len(), 2, "should have resent exactly once");
+        assert!(
+            nonces[1] > nonces[0],
+            "the resend must use a FRESH nonce ({:?}); reusing the signed body \
+             could only ever be rejected as stale",
+            nonces
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn w1_unresolvable_ambiguity_hard_stops_instead_of_guessing() {
+        // The send failed and reconciliation cannot establish what happened.
+        // The order may or may not be live, so the only safe move is to stop
+        // and tell the operator to check their fills.
+        let mut api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(Err(HlError::Network("timed out".into())));
+        for _ in 0..ORDER_STATUS_RETRIES {
+            api = api.push_status(Err(HlError::Network("info also down".into())));
+        }
+
+        let mut p = plan(false);
+        p.slices = 1;
+        p.per_slice = dec!(5);
+        p.total_adjusted = dec!(5);
+        p.total_requested = dec!(5);
+
+        let report = run_twap(&api, &p).await;
+
+        assert_eq!(api.place_count(), 1, "must not blind-resend");
+        assert_eq!(report.filled, Decimal::ZERO);
+        let reason = report
+            .abort_reason
+            .clone()
+            .expect("must hard-stop on ambiguity");
+        assert!(reason.contains("UNKNOWN"), "{reason}");
+        assert!(reason.contains("check your fills"), "{reason}");
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn w1_resend_is_bounded_and_gives_up_safely() {
+        // HL keeps not receiving the order. The resend loop must be bounded
+        // rather than hammering the exchange forever.
+        let mut api = ScriptedApi::new().with_default_book(book_at(dec!(49.9), dec!(50.1)));
+        for _ in 0..(PLACE_RESEND_LIMIT + 1) {
+            api = api
+                .push_place(Err(HlError::Network("connection refused".into())))
+                .push_status(Ok(None));
+        }
+
+        let mut p = plan(false);
+        p.slices = 1;
+        p.per_slice = dec!(5);
+        p.total_adjusted = dec!(5);
+        p.total_requested = dec!(5);
+
+        let report = run_twap(&api, &p).await;
+
+        assert_eq!(
+            api.place_count() as u32,
+            PLACE_RESEND_LIMIT + 1,
+            "1 initial send + {PLACE_RESEND_LIMIT} resends, then stop"
+        );
+        assert_eq!(report.filled, Decimal::ZERO);
+        assert!(report.abort_reason.is_some());
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn w1_exchange_rejection_is_a_decision_not_ambiguity_and_never_reconciles() {
+        // A rejection is HL's final answer. Reconciling or resending it would
+        // be pointless at best and a duplicate order at worst.
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(Err(HlError::Exchange {
+                code: Some("order_error".into()),
+                message: "Insufficient margin".into(),
+            }));
+
+        let report = run_twap(&api, &plan(false)).await;
+
+        assert_eq!(api.place_count(), 1, "a rejection must never be resent");
+        assert!(
+            !api.calls()
+                .iter()
+                .any(|c| matches!(c, Call::StatusByCloid { .. })),
+            "a rejection is unambiguous; no reconciliation should occur"
+        );
+        let reason = report.abort_reason.clone().expect("must abort");
+        assert!(reason.contains("rejected by exchange"), "{reason}");
+        assert!(reason.contains("insufficient margin"), "{reason}");
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    // === F1: a missing master is a config error, never a silent agent query ===
+
+    #[tokio::test(start_paused = true)]
+    async fn f1_recovery_without_a_resolved_master_is_a_hard_error() {
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(Ok(PlaceOutcome::Resting { oid: OrderId(77) }));
+
+        let mut p = plan(false);
+        p.master = None; // probe never ran
+        p.slices = 1;
+        p.per_slice = dec!(5);
+        p.total_adjusted = dec!(5);
+        p.total_requested = dec!(5);
+
+        let report = run_twap(&api, &p).await;
+
+        let reason = report
+            .abort_reason
+            .clone()
+            .expect("must abort without a master");
+        assert!(reason.contains("master address"), "{reason}");
+        assert_eq!(report.exit_code(), 1);
+    }
+}
