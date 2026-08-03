@@ -137,11 +137,146 @@ impl WireL2Book {
                 .collect()
         };
         OrderBook {
+            coin: self.coin.clone(),
             bids: self.levels.first().map(map).unwrap_or_default(),
             asks: self.levels.get(1).map(map).unwrap_or_default(),
             time_ms: self.time,
         }
     }
+}
+
+/// A `l2Book` snapshot that has passed every check a price it feeds into a
+/// trade decision must clear (Issue #6).
+///
+/// This is the ONLY form a book should take once it is used to decide a
+/// trigger or size an order: raw `OrderBook` / `WireL2Book` are the untrusted
+/// wire shapes, this is the trusted domain value. Constructing one is
+/// fallible on purpose — every field here is load-bearing for either the
+/// limit price or the order quantity, so a bad response must fail closed
+/// before it reaches either.
+///
+/// Checks applied by [`ValidatedMarketSnapshot::validate`]:
+/// - the response's `coin` matches the symbol that was requested (guards
+///   against a misrouted or malformed response silently pricing the wrong
+///   asset);
+/// - best bid and best ask are both present and strictly positive;
+/// - `best_bid <= best_ask` (a crossed book is not a valid market to price
+///   against);
+/// - levels are ordered as HL promises (bids descending, asks ascending);
+/// - the snapshot is not older than `max_age_ms` (F2's freshness gate);
+/// - the snapshot is not from more than [`MAX_FUTURE_SKEW_MS`] in the future
+///   (a clock/replay bug producing a future timestamp must not buy extra
+///   "freshness" it did not earn).
+///
+/// `max_age_ms == 0` disables ONLY the max-age half of the freshness check
+/// (the pre-Issue-#6 `is_book_fresh` contract this supersedes) — semantic
+/// validation (coin, positivity, crossing, ordering) and the future-skew
+/// check still apply unconditionally. There is no way to construct a
+/// `ValidatedMarketSnapshot` that skips those.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedMarketSnapshot {
+    pub coin: String,
+    /// HL server timestamp of the snapshot (ms epoch).
+    pub server_ts_ms: i64,
+    pub best_bid: Decimal,
+    pub best_ask: Decimal,
+    pub mid: Decimal,
+}
+
+/// Future-skew tolerance for a snapshot's `time_ms` (Issue #6 PM decision):
+/// a snapshot timestamped more than this far ahead of our clock is rejected
+/// regardless of `max_age_ms`, since no legitimate clock drift should exceed
+/// a couple of seconds and a much larger skew is more likely a bad response.
+pub const MAX_FUTURE_SKEW_MS: i64 = 2_000;
+
+impl ValidatedMarketSnapshot {
+    /// Validate a raw `OrderBook` (as returned by [`crate::api::HlApi::fetch_l2_book`])
+    /// into a trusted snapshot.
+    ///
+    /// `max_age_ms == 0` disables the max-age check only; see the type docs
+    /// for what still applies unconditionally.
+    pub fn validate(
+        book: &OrderBook,
+        requested: &Symbol,
+        max_age_ms: u64,
+    ) -> Result<Self, HlError> {
+        if book.coin != requested.as_str() {
+            return Err(HlError::InvalidResponse(format!(
+                "l2Book coin mismatch: requested {requested}, got {}",
+                book.coin
+            )));
+        }
+
+        let best_bid = book.bids.first().ok_or_else(|| {
+            HlError::InvalidResponse(format!("l2Book for {requested}: empty bid side"))
+        })?;
+        let best_ask = book.asks.first().ok_or_else(|| {
+            HlError::InvalidResponse(format!("l2Book for {requested}: empty ask side"))
+        })?;
+
+        for (side, levels) in [("bid", &book.bids), ("ask", &book.asks)] {
+            for l in levels {
+                if l.px <= Decimal::ZERO || l.sz <= Decimal::ZERO {
+                    return Err(HlError::InvalidResponse(format!(
+                        "l2Book for {requested}: non-positive {side} level (px={}, sz={})",
+                        l.px, l.sz
+                    )));
+                }
+            }
+        }
+
+        if best_bid.px > best_ask.px {
+            return Err(HlError::InvalidResponse(format!(
+                "l2Book for {requested}: crossed book (best_bid={} > best_ask={})",
+                best_bid.px, best_ask.px
+            )));
+        }
+
+        if !is_sorted_desc(&book.bids) {
+            return Err(HlError::InvalidResponse(format!(
+                "l2Book for {requested}: bid levels not descending"
+            )));
+        }
+        if !is_sorted_asc(&book.asks) {
+            return Err(HlError::InvalidResponse(format!(
+                "l2Book for {requested}: ask levels not ascending"
+            )));
+        }
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let skew_ms = book.time_ms - now_ms;
+        if skew_ms > MAX_FUTURE_SKEW_MS {
+            return Err(HlError::InvalidResponse(format!(
+                "l2Book for {requested}: timestamp {skew_ms}ms in the future \
+                 (tolerance {MAX_FUTURE_SKEW_MS}ms)"
+            )));
+        }
+
+        if max_age_ms > 0 {
+            let age_ms = now_ms - book.time_ms;
+            if age_ms > max_age_ms as i64 {
+                return Err(HlError::InvalidResponse(format!(
+                    "l2Book for {requested}: stale (age {age_ms}ms > max {max_age_ms}ms)"
+                )));
+            }
+        }
+
+        Ok(ValidatedMarketSnapshot {
+            coin: book.coin.clone(),
+            server_ts_ms: book.time_ms,
+            best_bid: best_bid.px,
+            best_ask: best_ask.px,
+            mid: (best_bid.px + best_ask.px) / Decimal::TWO,
+        })
+    }
+}
+
+fn is_sorted_desc(levels: &[BookLevel]) -> bool {
+    levels.windows(2).all(|w| w[0].px >= w[1].px)
+}
+
+fn is_sorted_asc(levels: &[BookLevel]) -> bool {
+    levels.windows(2).all(|w| w[0].px <= w[1].px)
 }
 
 /// HL `meta` response (perp universe).
@@ -780,19 +915,6 @@ pub fn parse_user_role(text: &str) -> Result<Role, HlError> {
     Ok(wire.into())
 }
 
-/// True if `book.time_ms` is within `max_age` of now (§3 / §8).
-///
-/// `max_age_ms == 0` disables the check. A NEGATIVE age (HL's clock running
-/// ahead of ours) counts as fresh — clock skew must not stall execution.
-pub fn is_book_fresh(book: &OrderBook, max_age_ms: u64) -> bool {
-    if max_age_ms == 0 {
-        return true;
-    }
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let age = now_ms - book.time_ms;
-    age <= max_age_ms as i64
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1081,43 +1203,187 @@ mod tests {
         }
     }
 
-    // === book freshness ===
+    // === ValidatedMarketSnapshot (Issue #6) — supersedes the old
+    // standalone `is_book_fresh`: freshness is now one clause of
+    // `validate`, alongside the semantic checks, so it is tested here
+    // instead of in isolation. ===
 
-    #[test]
-    fn book_fresh_when_recent() {
-        let book = OrderBook {
+    fn valid_book() -> OrderBook {
+        OrderBook {
+            coin: "HYPE".to_string(),
+            bids: vec![
+                BookLevel {
+                    px: dec!(49.9),
+                    sz: dec!(10),
+                    n: 1,
+                },
+                BookLevel {
+                    px: dec!(49.8),
+                    sz: dec!(10),
+                    n: 1,
+                },
+            ],
+            asks: vec![
+                BookLevel {
+                    px: dec!(50.1),
+                    sz: dec!(10),
+                    n: 1,
+                },
+                BookLevel {
+                    px: dec!(50.2),
+                    sz: dec!(10),
+                    n: 1,
+                },
+            ],
             time_ms: chrono::Utc::now().timestamp_millis(),
-            ..Default::default()
-        };
-        assert!(is_book_fresh(&book, 3000));
+        }
     }
 
     #[test]
-    fn book_stale_when_old() {
-        let book = OrderBook {
-            time_ms: chrono::Utc::now().timestamp_millis() - 10_000,
-            ..Default::default()
-        };
-        assert!(!is_book_fresh(&book, 3000));
+    fn validate_accepts_a_well_formed_fresh_book() {
+        let book = valid_book();
+        let snap = ValidatedMarketSnapshot::validate(&book, &Symbol::new("HYPE"), 3000).unwrap();
+        assert_eq!(snap.coin, "HYPE");
+        assert_eq!(snap.best_bid, dec!(49.9));
+        assert_eq!(snap.best_ask, dec!(50.1));
+        assert_eq!(snap.mid, dec!(50.0));
     }
 
     #[test]
-    fn book_freshness_check_disabled_with_zero() {
-        let book = OrderBook {
-            time_ms: 0,
-            ..Default::default()
-        };
-        assert!(is_book_fresh(&book, 0));
+    fn validate_rejects_wrong_coin() {
+        let book = valid_book();
+        let err = ValidatedMarketSnapshot::validate(&book, &Symbol::new("BTC"), 3000).unwrap_err();
+        match err {
+            HlError::InvalidResponse(msg) => assert!(msg.contains("coin mismatch"), "{msg}"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
     }
 
+    #[test]
+    fn validate_rejects_non_positive_price() {
+        let mut book = valid_book();
+        book.bids[0].px = dec!(0);
+        let err = ValidatedMarketSnapshot::validate(&book, &Symbol::new("HYPE"), 3000).unwrap_err();
+        match err {
+            HlError::InvalidResponse(msg) => assert!(msg.contains("non-positive"), "{msg}"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_non_positive_size() {
+        let mut book = valid_book();
+        book.asks[0].sz = dec!(-1);
+        let err = ValidatedMarketSnapshot::validate(&book, &Symbol::new("HYPE"), 3000).unwrap_err();
+        match err {
+            HlError::InvalidResponse(msg) => assert!(msg.contains("non-positive"), "{msg}"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_crossed_book() {
+        let mut book = valid_book();
+        // best_bid (50.5) > best_ask (50.1): crossed.
+        book.bids[0].px = dec!(50.5);
+        let err = ValidatedMarketSnapshot::validate(&book, &Symbol::new("HYPE"), 3000).unwrap_err();
+        match err {
+            HlError::InvalidResponse(msg) => assert!(msg.contains("crossed"), "{msg}"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_bids_not_descending() {
+        let mut book = valid_book();
+        book.bids[0].px = dec!(49.5); // now ascending: 49.5, 49.8 — invalid.
+        let err = ValidatedMarketSnapshot::validate(&book, &Symbol::new("HYPE"), 3000).unwrap_err();
+        match err {
+            HlError::InvalidResponse(msg) => assert!(msg.contains("not descending"), "{msg}"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_asks_not_ascending() {
+        let mut book = valid_book();
+        book.asks[0].px = dec!(50.3); // now descending: 50.3, 50.2 — invalid.
+        let err = ValidatedMarketSnapshot::validate(&book, &Symbol::new("HYPE"), 3000).unwrap_err();
+        match err {
+            HlError::InvalidResponse(msg) => assert!(msg.contains("not ascending"), "{msg}"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_timestamp_further_in_the_future_than_the_skew_tolerance() {
+        let mut book = valid_book();
+        book.time_ms = chrono::Utc::now().timestamp_millis() + MAX_FUTURE_SKEW_MS + 500;
+        let err = ValidatedMarketSnapshot::validate(&book, &Symbol::new("HYPE"), 3000).unwrap_err();
+        match err {
+            HlError::InvalidResponse(msg) => assert!(msg.contains("in the future"), "{msg}"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_timestamp_within_the_skew_tolerance() {
+        let mut book = valid_book();
+        book.time_ms = chrono::Utc::now().timestamp_millis() + MAX_FUTURE_SKEW_MS - 100;
+        ValidatedMarketSnapshot::validate(&book, &Symbol::new("HYPE"), 3000).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_stale_book_when_max_age_is_nonzero() {
+        let mut book = valid_book();
+        book.time_ms = chrono::Utc::now().timestamp_millis() - 10_000;
+        let err = ValidatedMarketSnapshot::validate(&book, &Symbol::new("HYPE"), 3000).unwrap_err();
+        match err {
+            HlError::InvalidResponse(msg) => assert!(msg.contains("stale"), "{msg}"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    /// HL's server clock running slightly ahead of ours (a negative age) must
+    /// NOT be treated as stale — only skew beyond `MAX_FUTURE_SKEW_MS` is
+    /// rejected, and this case sits well inside that tolerance.
     #[test]
     fn negative_age_counts_as_fresh() {
-        // HL server clock ahead of ours — must NOT be treated as stale.
-        let book = OrderBook {
-            time_ms: chrono::Utc::now().timestamp_millis() + 5_000,
-            ..Default::default()
-        };
-        assert!(is_book_fresh(&book, 3000));
+        let mut book = valid_book();
+        book.time_ms = chrono::Utc::now().timestamp_millis() + 500;
+        ValidatedMarketSnapshot::validate(&book, &Symbol::new("HYPE"), 3000).unwrap();
+    }
+
+    /// PM decision: `--max-book-age-ms=0` disables ONLY the max-age check.
+    /// Semantic validation and the future-skew policy still apply.
+    #[test]
+    fn validate_with_max_age_zero_still_accepts_a_very_old_but_otherwise_valid_book() {
+        let mut book = valid_book();
+        book.time_ms = chrono::Utc::now().timestamp_millis() - 3_600_000;
+        ValidatedMarketSnapshot::validate(&book, &Symbol::new("HYPE"), 0).unwrap();
+    }
+
+    #[test]
+    fn validate_with_max_age_zero_still_rejects_wrong_coin() {
+        let book = valid_book();
+        let err = ValidatedMarketSnapshot::validate(&book, &Symbol::new("BTC"), 0).unwrap_err();
+        assert!(matches!(err, HlError::InvalidResponse(_)));
+    }
+
+    #[test]
+    fn validate_with_max_age_zero_still_rejects_crossed_book() {
+        let mut book = valid_book();
+        book.bids[0].px = dec!(50.5);
+        let err = ValidatedMarketSnapshot::validate(&book, &Symbol::new("HYPE"), 0).unwrap_err();
+        assert!(matches!(err, HlError::InvalidResponse(_)));
+    }
+
+    #[test]
+    fn validate_with_max_age_zero_still_rejects_future_skew_beyond_tolerance() {
+        let mut book = valid_book();
+        book.time_ms = chrono::Utc::now().timestamp_millis() + MAX_FUTURE_SKEW_MS + 500;
+        let err = ValidatedMarketSnapshot::validate(&book, &Symbol::new("HYPE"), 0).unwrap_err();
+        assert!(matches!(err, HlError::InvalidResponse(_)));
     }
 
     // === nonce ===

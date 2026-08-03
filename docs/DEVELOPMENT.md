@@ -18,23 +18,23 @@ cargo fmt --check
 
 | ファイル | 行数 | 役割 |
 |---|---|---|
-| `src/main.rs` | 801 | CLI 定義 (clap)、起動シーケンス、事前検証、終了コード |
-| `src/twap.rs` | 2048 | スライスループ、サイジング、キャッチアップ、約定照合、レポート |
-| `src/client.rs` | 1151 | Hyperliquid REST クライアント (`/info`, `/exchange`)、応答解析、再試行方針 |
+| `src/main.rs` | 819 | CLI 定義 (clap)、起動シーケンス、事前検証、終了コード |
+| `src/twap.rs` | 2051 | スライスループ、サイジング、キャッチアップ、約定照合、レポート |
+| `src/client.rs` | 1417 | Hyperliquid REST クライアント (`/info`, `/exchange`)、応答解析、再試行方針、`ValidatedMarketSnapshot` (板の検証境界) |
 | `src/eip712.rs` | 370 | **移植物** — EIP-712 型定義、msgpack パック、action_hash |
-| `src/trigger.rs` | 336 | 価格・時間トリガーの待機ループ |
+| `src/trigger.rs` | 520 | 価格・時間トリガーの待機ループ (`&dyn HlApi` シーム、`ValidatedMarketSnapshot` 検証込み) |
 | `src/format.rs` | 359 | 価格・数量の丸め (szDecimals、有効数字、方向制御)、テイカー指値の算出 |
 | `src/api.rs` | 292 | `HlApi` トレイト (テストシーム) と `ScriptedApi` (テスト用偽実装) |
-| `src/types.rs` | 287 | `Side` / `Tif` / `Cloid` / `Symbol` / `OrderBook` などのドメイン型 |
+| `src/types.rs` | 292 | `Side` / `Tif` / `Cloid` / `Symbol` / `OrderBook` などのドメイン型 |
 | `src/signer.rs` | 266 | **移植物** — `Eip712AgentSigner` (alloy による署名) |
 | `src/errors.rs` | 129 | `HlError` と `RejectionKind` (拒否メッセージの分類) |
 | `src/lib.rs` | 15 | 結合テストから内部モジュールを参照するためのライブラリターゲット |
 
-テストの内訳:
+テストの内訳 (Issue #6 で `ValidatedMarketSnapshot` のテストを追加):
 
 | ターゲット | 件数 | 内容 |
 |---|---|---|
-| `src/lib.rs` (単体) | 138 | 純関数の算術、丸め、応答解析、署名、`run_twap` のループレベルテスト |
+| `src/lib.rs` (単体) | 154 | 純関数の算術、丸め、応答解析、署名、`run_twap` のループレベルテスト、`ValidatedMarketSnapshot` の検証・トリガーの `ScriptedApi` テスト |
 | `src/main.rs` (単体) | 21 | CLI 引数の検証、`--help` の内容、起動シーケンス |
 | `tests/exchange_parse.rs` | 16 | mockito による `/exchange` 応答の解析と再試行方針 |
 | `tests/reconcile_and_probe.rs` | 19 | 曖昧な送信の照合、`userRole` 照会、トリガーの end-to-end |

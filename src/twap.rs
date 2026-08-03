@@ -20,10 +20,10 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 use crate::api::HlApi;
-use crate::client::{is_book_fresh, OrderStatusFill, PlaceOutcome};
+use crate::client::{OrderStatusFill, PlaceOutcome, ValidatedMarketSnapshot};
 use crate::errors::{HlError, RejectionKind};
 use crate::format::{human, round_size, taker_limit_price};
-use crate::types::{Address, CancelIntent, Cloid, OrderBook, OrderIntent, Side, Symbol, Tif};
+use crate::types::{Address, CancelIntent, Cloid, OrderIntent, Side, Symbol, Tif};
 
 /// HL's practical minimum order notional in USD (§8).
 pub const MIN_NOTIONAL_USD: Decimal = dec!(10);
@@ -373,37 +373,45 @@ impl FillStats {
     }
 }
 
-/// Fetch a book that passes the freshness gate, retrying a stale one (§8).
+/// Fetch a book that passes full validation — freshness included — retrying a
+/// stale or otherwise-invalid one (§8, Issue #6).
 ///
 /// F2: this is the ONLY way a book should enter a sizing decision — pre-flight
-/// included. Sizing off an unchecked snapshot can fix the whole run's quantity
-/// against a price that is minutes old.
+/// and price-trigger polling included. Sizing off an unchecked snapshot can
+/// fix the whole run's quantity against a price that is minutes old, from the
+/// wrong coin, or from a crossed/malformed book. Validation is
+/// [`ValidatedMarketSnapshot::validate`] — the same policy the trigger wait
+/// loop uses — so a snapshot that clears this gate is fit to size an order or
+/// satisfy a price trigger.
 pub async fn fetch_fresh_book(
     client: &dyn HlApi,
     symbol: &Symbol,
     max_age_ms: u64,
-) -> Result<OrderBook, HlError> {
-    let mut last_age_ms = 0i64;
+) -> Result<ValidatedMarketSnapshot, HlError> {
+    let mut last_err: Option<HlError> = None;
     for attempt in 0..=STALE_BOOK_RETRIES {
         let book = client.fetch_l2_book(symbol).await?;
-        if is_book_fresh(&book, max_age_ms) {
-            return Ok(book);
+        match ValidatedMarketSnapshot::validate(&book, symbol, max_age_ms) {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(e) => {
+                tracing::warn!(
+                    symbol = %symbol,
+                    max_age_ms,
+                    attempt = attempt + 1,
+                    error = %e,
+                    "invalid or stale book; refetching"
+                );
+                last_err = Some(e);
+            }
         }
-        last_age_ms = chrono::Utc::now().timestamp_millis() - book.time_ms;
-        tracing::warn!(
-            symbol = %symbol,
-            age_ms = last_age_ms,
-            max_age_ms,
-            attempt = attempt + 1,
-            "stale book; refetching"
-        );
         if attempt < STALE_BOOK_RETRIES {
             tokio::time::sleep(STALE_BOOK_RETRY_INTERVAL).await;
         }
     }
     Err(HlError::InvalidResponse(format!(
-        "book still stale after {} retries (age {last_age_ms}ms > {max_age_ms}ms)",
-        STALE_BOOK_RETRIES
+        "book still invalid after {} retries: {}",
+        STALE_BOOK_RETRIES,
+        last_err.map(|e| e.to_string()).unwrap_or_default()
     )))
 }
 
@@ -690,20 +698,14 @@ pub async fn run_twap(client: &dyn HlApi, plan: &TwapPlan) -> TwapReport {
             break;
         }
 
-        let book = match fetch_fresh_book(client, &plan.symbol, plan.max_book_age_ms).await {
-            Ok(b) => b,
+        let snapshot = match fetch_fresh_book(client, &plan.symbol, plan.max_book_age_ms).await {
+            Ok(s) => s,
             Err(e) => {
                 abort_reason = Some(format!("book fetch failed at slice {slice_idx}: {e}"));
                 break;
             }
         };
-        let (bid, ask, mid) = match (book.best_bid(), book.best_ask(), book.mid()) {
-            (Some(b), Some(a), Some(m)) => (b, a, m),
-            _ => {
-                abort_reason = Some(format!("empty book side at slice {slice_idx}"));
-                break;
-            }
-        };
+        let (bid, ask) = (snapshot.best_bid, snapshot.best_ask);
 
         // T1: the price we are about to sign, computed BEFORE the gate so the
         // gate judges the notional that will actually reach HL.
@@ -765,7 +767,7 @@ pub async fn run_twap(client: &dyn HlApi, plan: &TwapPlan) -> TwapReport {
                 plan.symbol,
                 human(px),
                 cloid,
-                human(mid)
+                human(snapshot.mid)
             );
             // Assume a full fill so the dry run walks the same slice path.
             stats.add(order_sz, px);
@@ -1320,13 +1322,14 @@ mod loop_tests {
     use super::*;
     use crate::api::{Call, HlApi, ScriptedApi};
     use crate::client::OrderStatusFill;
-    use crate::types::{BookLevel, OrderId};
+    use crate::types::{BookLevel, OrderBook, OrderId};
 
     const MASTER: &str = "0x00000000000000000000000000000000000000aa";
     const AGENT: &str = "0x00000000000000000000000000000000000000bb";
 
     fn book_at(bid: Decimal, ask: Decimal) -> OrderBook {
         OrderBook {
+            coin: "HYPE".to_string(),
             bids: vec![BookLevel {
                 px: bid,
                 sz: dec!(1000),

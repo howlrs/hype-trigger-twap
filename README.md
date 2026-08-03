@@ -67,7 +67,7 @@ hype-twap --symbol ETH --side short --usd 5000 --duration 2h --slices 20 \
 | `--read-only` | `true` \| `false` | **`true`** | `true` signs nothing and sends nothing. |
 | `--network` | `mainnet` \| `testnet` | `mainnet` | Sets the API URLs *and* the EIP-712 `Agent.source` domain together. |
 | `--slippage-bps` | decimal | `20` | Cushion on the IOC limit price. |
-| `--max-book-age-ms` | u64 | `3000` | Reject a book snapshot older than this. `0` disables. |
+| `--max-book-age-ms` | u64 | `3000` | Reject a book snapshot older than this. `0` disables ONLY the max-age check — every book (trigger polls, pre-flight, each slice) still has to pass semantic validation (matching symbol, positive prices/sizes, uncrossed and correctly-ordered levels) and a fixed 2s future-timestamp tolerance, unconditionally. |
 | `--trigger-poll-secs` | u64 | `2` | Poll interval while waiting for the trigger. |
 
 ## Environment variables
@@ -118,8 +118,12 @@ hard stop, so a persistently blind trigger never sits silent forever.
 
 ## Sizing, rounding, and the `--usd` caveat
 
-> **`--usd` fixes the coin quantity at trigger time.** The USD figure is
-> converted to coins once, using the mid observed when the trigger fires, and
+> **`--usd` fixes the coin quantity at trigger time.** "Trigger-time mid" has
+> exactly one meaning: for a price trigger, it is the *same already-validated
+> book snapshot* that satisfied the trigger condition, re-used as-is — never
+> re-fetched. For an immediate start or a time-only trigger (no price
+> condition), it is the first pre-flight snapshot, fetched fresh right before
+> sizing. Either way the USD figure is converted to coins exactly once, and
 > that quantity is held constant for the rest of the run. If price moves during
 > the window, the *executed notional will drift away from the number you typed*.
 > Use `--size` if you need an exact coin quantity.
