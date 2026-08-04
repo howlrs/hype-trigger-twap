@@ -787,11 +787,20 @@ async fn recover_resting_fill(
 struct RestingChild {
     cloid: Cloid,
     oid: crate::types::OrderId,
-    /// Size credited to `filled_so_far` if this order is settled with a
-    /// PARTIAL fill smaller than its full requested size — kept only for
-    /// tracing; the actual credited amount always comes from `orderStatus`.
+    /// Size this ALO was requested at. Not just tracing: it feeds
+    /// `ValidatedFill::try_from_status`'s overfill check via
+    /// `intent_for_validation.sz` in `settle_resting_child` — a settled fill
+    /// larger than this is rejected as a trusted-boundary violation (Issue
+    /// #7), so this value has a real correctness role, not merely a
+    /// diagnostic one.
     requested_sz: Decimal,
     px: Decimal,
+    /// The slice this ALO was placed for — carried so a `Terminal` journal
+    /// record written at settle time (which may be a LATER slice's boundary,
+    /// or the post-loop cleanup) still attributes the fill to the slice that
+    /// actually placed the order, matching how `place_slice_reconciled`
+    /// journals market-mode fills under their own `slice_idx`.
+    slice_idx: u32,
 }
 
 /// Settle a resting passive child order: `cancelByCloid` then `orderStatus`
@@ -801,10 +810,20 @@ struct RestingChild {
 /// reinventing it). This is what closes the cancel/late-fill race: the
 /// caller must NEVER assume zero (or the pre-cancel snapshot) filled — only
 /// the post-cancel `orderStatus` response is trusted.
+///
+/// Issue #1 Finding 1 fix: writes the closing `Terminal` journal record for
+/// `resting.cloid` when a journal is attached — this is what makes a passive
+/// order visible to `--resume`/crash recovery instead of vanishing the
+/// moment it settles. Every settle path (boundary cancel→status, a natural
+/// terminal status observed without ever cancelling, and end-of-run
+/// cleanup) funnels through this one function, so there is exactly one
+/// place that writes a passive `Terminal` record — matching how
+/// `journal_terminal` is the single write point for market mode.
 async fn settle_resting_child(
     client: &dyn HlApi,
     plan: &TwapPlan,
     resting: RestingChild,
+    journal: Option<&mut ExecutionJournal>,
 ) -> Result<SliceOutcome, HlError> {
     let st = recover_resting_fill(client, plan, resting.cloid, resting.oid).await?;
     let intent_for_validation = OrderIntent {
@@ -817,6 +836,14 @@ async fn settle_resting_child(
         reduce_only: false,
     };
     let vf = ValidatedFill::try_from_status(&st, &intent_for_validation)?;
+    journal_terminal(
+        journal,
+        resting.slice_idx,
+        resting.cloid,
+        &st.status,
+        vf.filled_sz,
+        vf.avg_px,
+    )?;
     Ok(SliceOutcome {
         sz: vf.filled_sz,
         px: vf.avg_px.unwrap_or(resting.px),
@@ -1076,6 +1103,48 @@ fn journal_terminal(
     Ok(())
 }
 
+/// Known, EXACT Hyperliquid wire indicators for a post-only (ALO) rejection
+/// — the order would have crossed the book and taken instead of resting
+/// (Issue #1 Finding 2 fix).
+///
+/// Fail-closed by construction: matching is exact-substring against a short,
+/// explicit allow-list of KNOWN HL wording, never a loose "contains 'alo'"
+/// heuristic. The old substring check (`message.contains("alo")`) was
+/// fail-OPEN — any unrelated fatal rejection whose message happened to
+/// contain the letters "alo" (e.g. a fabricated "position halted: aloha
+/// margin requirement") would have been wrongly classified as a normal
+/// skip-and-continue instead of a fatal abort. Every other rejection keeps
+/// the existing fatal/abort semantics unchanged.
+///
+/// Sourced from the `orderStatus` vocabulary's own `badAloPxRejected` entry
+/// (`ORDER_STATUS_VOCABULARY` in `src/client.rs`) plus HL's documented
+/// place-time error wording for a post-only cross
+/// ("Post only order would have immediately matched"). See
+/// `tests/status_vocabulary_conformance.rs` for the manual, `#[ignore]`d
+/// hook that verifies this wording against the live API.
+///
+/// Compared lower-cased, exact-substring (not a loose keyword match) against
+/// the FULL known phrase — "alo" alone is deliberately NOT in this list.
+const ALO_REJECT_EXACT: &[&str] = &[
+    "badalopxrejected",
+    "post only order would have immediately matched",
+];
+
+/// Classify an exchange rejection at ALO PLACE time as a normal post-only
+/// skip (Issue #1 Finding 2 fix). `code` is checked for the exact
+/// `badAloPxRejected` value (matching `ORDER_STATUS_VOCABULARY`'s own
+/// naming); `message` is checked for an EXACT known HL wire phrase, never a
+/// loose substring — see `ALO_REJECT_EXACT`'s docs for why.
+fn is_alo_reject(code: Option<&str>, message: &str) -> bool {
+    if code == Some("badAloPxRejected") {
+        return true;
+    }
+    let m = message.to_ascii_lowercase();
+    ALO_REJECT_EXACT
+        .iter()
+        .any(|indicator| m.contains(indicator))
+}
+
 /// Ask HL whether it holds `cloid`, retrying until the answer is unambiguous
 /// under the Issue #7 W1 safe-resend policy.
 ///
@@ -1198,6 +1267,21 @@ pub async fn run_twap(client: &dyn HlApi, plan: &TwapPlan) -> TwapReport {
 /// - Neither resolves within the reconciliation budget → the error is
 ///   propagated as-is; `main.rs` surfaces it and the run does not proceed
 ///   (leaving the cloid unresolved in the journal for a future attempt).
+///
+/// Issue #1 Finding 1 fix: before falling into the market-mode
+/// `reconcile_by_cloid` W1 streak policy (which is built around "either
+/// terminal or genuinely unknown," and simply times out on a LIVE
+/// non-terminal order — impossible for market's IOC orders, but the NORMAL
+/// case for a crashed passive ALO that was still resting), this function
+/// first probes `orderStatus` once. If HL reports the order live/resting
+/// (non-terminal), that is exactly the passive-crash case this finding
+/// covers: actively `cancelByCloid` then poll to a real terminal status,
+/// reusing `recover_resting_fill` — the SAME helper `settle_resting_child`
+/// already calls for the live-run boundary-settle case — rather than
+/// duplicating the cancel-then-poll sequence. This guarantees the resumed
+/// run never leaves a live order unresolved AND never double-places (the
+/// cloid is resolved to `Terminal` here; nothing on this codepath ever
+/// calls `place_order_once`).
 pub async fn reconcile_unresolved_cloid(
     client: &dyn HlApi,
     plan: &TwapPlan,
@@ -1206,6 +1290,34 @@ pub async fn reconcile_unresolved_cloid(
     journal: &mut ExecutionJournal,
 ) -> Result<(), HlError> {
     let user = plan.status_user()?;
+
+    // Single probe: is this cloid currently live/non-terminal (resting)?
+    // Market-mode IOC orders can never observably be in this state by the
+    // time a resume reconciles them (IOC either fills or is cancelled by HL
+    // itself immediately), so this branch is passive-specific in practice,
+    // but it is safe and correct for either child algo.
+    if let Ok(Some(st)) = client.fetch_order_status_by_cloid(user, cloid).await {
+        if !st.is_terminal() {
+            tracing::info!(
+                cloid = %cloid,
+                status = %st.status,
+                "resume: unresolved cloid is a LIVE resting order; \
+                 cancelling and polling to a terminal status before continuing"
+            );
+            let settled = recover_resting_fill(client, plan, cloid, st.oid).await?;
+            settled.cross_check(plan.symbol.as_str(), &plan.side, Some(cloid))?;
+            journal_terminal(
+                Some(journal),
+                slice_idx,
+                cloid,
+                &settled.status,
+                settled.filled_sz,
+                settled.avg_px,
+            )?;
+            return Ok(());
+        }
+    }
+
     match reconcile_by_cloid(client, plan, user, cloid).await {
         Ok(Some(st)) => {
             journal_terminal(
@@ -1340,7 +1452,7 @@ pub async fn run_twap_journaled(
         // late-fill race: `settle_resting_child` NEVER trusts a pre-cancel
         // fill snapshot, only the post-cancel `orderStatus` truth.
         if let Some(child) = resting.take() {
-            match settle_resting_child(client, plan, child).await {
+            match settle_resting_child(client, plan, child, journal.as_deref_mut()).await {
                 Ok(SliceOutcome { sz, px: fill_px }) => {
                     if sz > Decimal::ZERO {
                         stats.add(sz, fill_px);
@@ -1614,6 +1726,32 @@ pub async fn run_twap_journaled(
                     "placing ALO (post-only) slice"
                 );
 
+                // Issue #1 Finding 1 fix: durably record intent+cloid BEFORE
+                // the send that could have an ambiguous outcome — the same
+                // "Prepared fsynced before the POST" guarantee
+                // `place_slice_reconciled` gives market mode (Issue #4). A
+                // crash between this fsync and the send completing leaves a
+                // durable record that `--resume` can reconcile via
+                // `orderStatus`, closing the gap this finding reported (a
+                // killed passive run's resting order used to be completely
+                // invisible to the journal).
+                if let Some(j) = journal.as_deref_mut() {
+                    if let Err(e) = j.record(&JournalRecord::Prepared {
+                        slice_idx,
+                        cloid,
+                        nonce: None,
+                        symbol: intent.symbol.clone(),
+                        side: intent.side,
+                        px: intent.px.to_string(),
+                        sz: intent.sz.to_string(),
+                    }) {
+                        abort_reason = Some(format!(
+                            "slice {slice_idx}: journal write (Prepared) failed: {e}"
+                        ));
+                        break;
+                    }
+                }
+
                 // Issue #1 PM decision: an ALO rejection (e.g.
                 // `badAloPxRejected` — the touch moved across our signed
                 // price between snapshot and send, so the order would have
@@ -1628,11 +1766,25 @@ pub async fn run_twap_journaled(
                     .await
                 {
                     Ok((_, PlaceOutcome::Resting { oid })) => {
+                        if let Some(j) = journal.as_deref_mut() {
+                            if let Err(e) = j.record(&JournalRecord::Acknowledged {
+                                slice_idx,
+                                cloid,
+                                oid: Some(oid.0),
+                                status: "resting".into(),
+                            }) {
+                                abort_reason = Some(format!(
+                                    "slice {slice_idx}: journal write (Acknowledged) failed: {e}"
+                                ));
+                                break;
+                            }
+                        }
                         resting = Some(RestingChild {
                             cloid,
                             oid,
                             requested_sz: order_sz,
                             px,
+                            slice_idx,
                         });
                         slices_executed += 1;
                         tracing::info!(
@@ -1655,9 +1807,27 @@ pub async fn run_twap_journaled(
                         break;
                     }
                     Err(HlError::Exchange { code, message }) => {
-                        let is_alo_reject = message.to_ascii_lowercase().contains("alo")
-                            || code.as_deref() == Some("badAloPxRejected");
-                        if is_alo_reject {
+                        if is_alo_reject(code.as_deref(), &message) {
+                            // A rejected ALO never landed — it is not
+                            // `Prepared`-only in the journal sense of "we
+                            // don't know," it is a KNOWN zero-fill outcome,
+                            // so close the cloid out immediately as a
+                            // zero-fill Terminal rather than leaving it
+                            // dangling as unresolved for a future --resume.
+                            if let Err(e) = journal_terminal(
+                                journal.as_deref_mut(),
+                                slice_idx,
+                                cloid,
+                                "aloRejected",
+                                Decimal::ZERO,
+                                None,
+                            ) {
+                                abort_reason = Some(format!(
+                                    "slice {slice_idx}: journal write (Terminal, aloRejected) \
+                                     failed: {e}"
+                                ));
+                                break;
+                            }
                             slices_skipped += 1;
                             tracing::info!(
                                 slice = slice_idx,
@@ -1676,6 +1846,18 @@ pub async fn run_twap_journaled(
                         }
                     }
                     Err(e) => {
+                        // Transport failure: the send outcome is genuinely
+                        // unknown (same ambiguity class `place_slice_reconciled`
+                        // handles for market mode) — journal it as
+                        // `SubmittedUnknown` so a future `--resume` knows
+                        // this cloid needs `orderStatus` reconciliation
+                        // rather than being silently forgotten. This binary
+                        // does not attempt an in-run resend for an ambiguous
+                        // passive send (out of this finding's scope); the
+                        // run aborts and `--resume` is the recovery path.
+                        if let Some(j) = journal.as_deref_mut() {
+                            let _ = j.record(&JournalRecord::SubmittedUnknown { slice_idx, cloid });
+                        }
                         abort_reason = Some(format!("slice {slice_idx} failed: {e}"));
                         break;
                     }
@@ -1729,7 +1911,7 @@ pub async fn run_twap_journaled(
     // recovered) extended to the case a passive order is DELIBERATELY still
     // resting when the loop stops.
     if let Some(child) = resting.take() {
-        match settle_resting_child(client, plan, child).await {
+        match settle_resting_child(client, plan, child, journal.as_deref_mut()).await {
             Ok(SliceOutcome { sz, px: fill_px }) => {
                 if sz > Decimal::ZERO {
                     stats.add(sz, fill_px);
@@ -4114,6 +4296,82 @@ mod loop_tests {
             assert_eq!(places, vec![dec!(5), dec!(10)]);
         }
 
+        /// **Finding 2 (Important) regression test.** The old classifier
+        /// (`message.to_ascii_lowercase().contains("alo")`) was fail-OPEN:
+        /// any unrelated FATAL rejection whose message merely contains the
+        /// substring "alo" would have been wrongly treated as a normal
+        /// post-only skip instead of aborting. This fabricated (but
+        /// illustrative) message contains "alo" only as part of the
+        /// unrelated word "aloha" — it must still be classified fatal.
+        #[test]
+        fn unrelated_rejection_containing_the_substring_alo_is_not_misclassified_as_an_alo_reject()
+        {
+            assert!(
+                !is_alo_reject(
+                    Some("order_error"),
+                    "position halted: aloha margin requirement not met"
+                ),
+                "a substring match on 'alo' inside an unrelated word ('aloha') must NOT be \
+                 classified as an ALO post-only reject — this is exactly the fail-open bug \
+                 Finding 2 reported"
+            );
+        }
+
+        /// The real, exact HL wire wording (with the `badAloPxRejected`
+        /// vocabulary token embedded, matching `ORDER_STATUS_VOCABULARY` in
+        /// `src/client.rs`) must still be classified as a normal ALO
+        /// post-only skip — proves the fix is exact-match, not a total
+        /// removal of ALO-reject recognition.
+        #[test]
+        fn genuine_alo_reject_wording_is_still_classified_as_a_skip() {
+            assert!(is_alo_reject(
+                Some("order_error"),
+                "Post only order would have immediately matched, bad ALO px (badAloPxRejected)"
+            ));
+            assert!(is_alo_reject(Some("badAloPxRejected"), "generic message"));
+        }
+
+        /// Any OTHER genuine fatal rejection (no ALO wording at all) keeps
+        /// the existing fatal/abort semantics — unchanged by this fix.
+        #[test]
+        fn unrelated_fatal_rejection_without_any_alo_wording_is_not_classified_as_a_skip() {
+            assert!(!is_alo_reject(
+                Some("order_error"),
+                "Insufficient margin to place order"
+            ));
+        }
+
+        /// End-to-end loop pin: a genuinely FATAL rejection whose message
+        /// happens to contain "alo" as a substring of an unrelated word
+        /// must still abort the whole run, never skip-and-continue — the
+        /// same failure mode Finding 2 reported, exercised through the full
+        /// `run_twap` loop rather than the unit-level classifier alone.
+        #[tokio::test(start_paused = true)]
+        async fn unrelated_alo_substring_rejection_still_aborts_the_run() {
+            let mut p = plan_passive(false);
+            p.slices = 2;
+            p.duration = Duration::from_secs(120);
+            p.per_slice = dec!(5);
+            p.total_adjusted = dec!(10);
+            p.total_requested = dec!(10);
+
+            let api = ScriptedApi::new()
+                .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+                .push_place(Err(HlError::Exchange {
+                    code: Some("order_error".into()),
+                    message: "position halted: aloha margin requirement not met".into(),
+                }));
+
+            let report = run_twap(&api, &p).await;
+
+            assert!(
+                report.abort_reason.is_some(),
+                "a fatal rejection merely containing the substring 'alo' must still abort"
+            );
+            assert_eq!(report.exit_code(), 1);
+            assert_eq!(api.place_count(), 1, "must never continue to slice 2");
+        }
+
         /// Deadline interaction: once `ExecutionDeadline` has passed, passive
         /// mode must place no NEW quote, but a resting order from an earlier
         /// slice must still be cancelled during final cleanup — no leaked
@@ -4743,6 +5001,228 @@ mod loop_tests {
             let final_summary = summarize(&all_records);
             assert_eq!(final_summary.cloids.len(), 10);
             assert_eq!(final_summary.total_filled(), dec!(50));
+        }
+
+        // === Issue #1 Finding 1: passive crash-recovery via --resume ===
+
+        /// **Finding 1 (CRITICAL) regression test.** Before the fix, a
+        /// passive ALO's `resting: Option<RestingChild>` never touched the
+        /// journal at all — a process killed while `resting = Some(...)`
+        /// left a live order on the book with ZERO trace in the journal, so
+        /// `--resume`/`reconcile_incomplete_run` (which walks
+        /// `unresolved_cloids()`) could never find it, let alone cancel and
+        /// settle it.
+        ///
+        /// Seeds a journal simulating exactly that crash: an `Acknowledged`
+        /// resting cloid for slice 1 (requested 3, nothing settled yet — the
+        /// crash happened before the next slice boundary's settle step ever
+        /// ran). Then drives `reconcile_unresolved_cloid` — the SAME
+        /// function `main.rs`'s `reconcile_incomplete_run` calls for every
+        /// `unresolved_cloids()` entry on `--resume` — directly against a
+        /// `ScriptedApi` scripted to report the order as still LIVE/open on
+        /// the first probe (proving this is the passive-crash case, not a
+        /// market IOC's always-terminal-or-unknown case), then resolves it
+        /// through an active cancel + terminal poll.
+        ///
+        /// Asserts:
+        /// (a) the resting order is actively cancelled and settled — proven
+        ///     via the `ScriptedApi` call log (a `StatusByCloid` probe, then
+        ///     a `Cancel`, then the `recover_resting_fill` terminal poll);
+        /// (b) the settled fill (2 of the 3 requested) is counted exactly
+        ///     once in `RunSummary::total_filled()` after reconciliation —
+        ///     no double count;
+        /// (c) continuing the run for the remainder places an order sized to
+        ///     EXACTLY the shortfall (1 = 3 requested − 2 settled for slice
+        ///     1, continuing toward a 6-total two-slice plan), never the
+        ///     full original per-slice size.
+        #[tokio::test(start_paused = true)]
+        async fn resume_reconciles_a_crashed_passive_resting_order_cancels_settles_and_continues_the_remainder(
+        ) {
+            let tmp = TempDir::new();
+            let resting_cloid = Cloid::new();
+
+            // "First process": places a passive ALO for slice 1 (size 3),
+            // gets it confirmed resting (Acknowledged), then "crashes" — no
+            // Terminal record ever gets written, exactly the gap Finding 1
+            // reported.
+            {
+                let mut journal =
+                    ExecutionJournal::start(tmp.path(), "run-passive-resume".into(), test_header())
+                        .unwrap();
+                journal
+                    .record(&JournalRecord::Prepared {
+                        slice_idx: 1,
+                        cloid: resting_cloid,
+                        nonce: None,
+                        symbol: Symbol::new("HYPE"),
+                        side: Side::Long,
+                        px: "49.9".into(),
+                        sz: "3".into(),
+                    })
+                    .unwrap();
+                journal
+                    .record(&JournalRecord::Acknowledged {
+                        slice_idx: 1,
+                        cloid: resting_cloid,
+                        oid: Some(555),
+                        status: "resting".into(),
+                    })
+                    .unwrap();
+            }
+
+            let pre_resume_records =
+                ExecutionJournal::read_all(tmp.path(), "run-passive-resume").unwrap();
+            let pre_resume_summary = summarize(&pre_resume_records);
+            assert_eq!(
+                pre_resume_summary.unresolved_cloids(),
+                vec![resting_cloid],
+                "the crashed passive cloid must be visible to resume as unresolved — \
+                 this is exactly what Finding 1 says was broken pre-fix"
+            );
+
+            // "Resume": force-reconcile the one unresolved cloid, exactly as
+            // `main.rs::reconcile_incomplete_run` does for every entry in
+            // `unresolved_cloids()`.
+            let mut p = plan_passive(false);
+            p.slices = 2;
+            p.per_slice = dec!(3);
+            p.total_adjusted = dec!(6);
+            p.total_requested = dec!(6);
+
+            let reconcile_api = ScriptedApi::new()
+                // 1) The new resume-path probe: HL reports the order is
+                //    STILL LIVE/open — the normal case for a crashed
+                //    passive order, impossible for market's IOC. This is
+                //    what must route into the active cancel+poll branch
+                //    instead of the market-mode "terminal or unknown" W1
+                //    streak loop (which would just time out on this).
+                .push_status(Ok(Some(status_full(
+                    dec!(0),
+                    None,
+                    "open",
+                    OrderId(555),
+                    Some(resting_cloid),
+                    "HYPE",
+                    "B",
+                ))))
+                // 2) cancelByCloid.
+                .push_cancel(Ok(()))
+                // 3) recover_resting_fill's poll_terminal_status: the order
+                //    settled with a partial fill (2 of the 3 requested)
+                //    before the cancel actually took effect.
+                .push_status(Ok(Some(status_full(
+                    dec!(2),
+                    Some(dec!(49.9)),
+                    "canceled",
+                    OrderId(555),
+                    Some(resting_cloid),
+                    "HYPE",
+                    "B",
+                ))));
+
+            let mut journal =
+                ExecutionJournal::open_existing(tmp.path(), "run-passive-resume").unwrap();
+            reconcile_unresolved_cloid(&reconcile_api, &p, resting_cloid, 1, &mut journal)
+                .await
+                .expect("reconciling a live passive resting order must succeed");
+
+            // (a) the resting order was actively cancelled and settled —
+            // proven via the call log, not just the outcome.
+            let calls = reconcile_api.calls();
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| matches!(c, Call::StatusByCloid { .. })),
+                "must probe orderStatus for the resting cloid: {calls:?}"
+            );
+            assert!(
+                calls.iter().any(|c| matches!(c, Call::Cancel { .. })),
+                "a live resting order found on resume must be actively cancelled: {calls:?}"
+            );
+            assert_eq!(
+                calls.iter().filter(|c| c.is_place()).count(),
+                0,
+                "reconciling an unresolved cloid on resume must NEVER place a new order \
+                 (no double-place): {calls:?}"
+            );
+
+            // (b) settled fill counted exactly once — never adopted as the
+            // pre-cancel "open" snapshot (which would have been 0, or any
+            // value other than the true post-cancel terminal fill).
+            let after_reconcile_records =
+                ExecutionJournal::read_all(tmp.path(), "run-passive-resume").unwrap();
+            let after_reconcile_summary = summarize(&after_reconcile_records);
+            assert!(
+                after_reconcile_summary.unresolved_cloids().is_empty(),
+                "the cloid must be fully resolved after reconciliation: {after_reconcile_records:?}"
+            );
+            assert_eq!(
+                after_reconcile_summary.total_filled(),
+                dec!(2),
+                "the credited fill must be the TRUE post-cancel settled amount (2), \
+                 counted exactly once"
+            );
+
+            // (c) continuing the run for the remainder: 6 total − 2 already
+            // settled = 4 remaining, over 1 remaining slice (slice 2) — the
+            // continuation must place exactly that shortfall, never the
+            // full original per-slice size (3) and never the full original
+            // total (6).
+            let mut resumed_plan = plan_passive(false);
+            resumed_plan.slices = 1;
+            resumed_plan.per_slice = dec!(4);
+            resumed_plan.total_adjusted = dec!(4);
+            resumed_plan.total_requested = dec!(4);
+
+            let continue_api = ScriptedApi::new()
+                .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+                .push_place(Ok(PlaceOutcome::Resting { oid: OrderId(556) }))
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(4),
+                    Some(dec!(49.9)),
+                    "canceled",
+                    OrderId(556),
+                    Some(Cloid::new()),
+                    "HYPE",
+                    "B",
+                ))));
+
+            let mut journal2 =
+                ExecutionJournal::open_existing(tmp.path(), "run-passive-resume").unwrap();
+            let report2 =
+                run_twap_journaled(&continue_api, &resumed_plan, Some(&mut journal2), None).await;
+
+            let continuation_places = continue_api.place_calls();
+            assert_eq!(
+                continuation_places.len(),
+                1,
+                "continuation must place exactly one order for the remainder"
+            );
+            if let Call::Place { sz, .. } = &continuation_places[0] {
+                assert_eq!(
+                    *sz,
+                    dec!(4),
+                    "continuation must place only the correct remainder (4), \
+                     not the full original per-slice size or total"
+                );
+            } else {
+                panic!("expected a Place call");
+            }
+            assert_eq!(report2.filled, dec!(4));
+
+            // Grand total across the whole crash+resume+continuation
+            // lifecycle: 2 (recovered from the crashed order) + 4
+            // (continuation) = 6, the original target, each unit counted
+            // exactly once.
+            let grand_total = after_reconcile_summary.total_filled() + report2.filled;
+            assert_eq!(grand_total, dec!(6));
+
+            let final_records =
+                ExecutionJournal::read_all(tmp.path(), "run-passive-resume").unwrap();
+            let final_summary = summarize(&final_records);
+            assert!(final_summary.unresolved_cloids().is_empty());
+            assert_eq!(final_summary.total_filled(), dec!(6));
         }
     }
 }
