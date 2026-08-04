@@ -336,8 +336,15 @@ cancel を送った直後に約定がすり抜けて着地する race が起き�
 catch-up サイジングに合流する。
 
 **ALO 拒否は正常系**: `place_order_once` が `HlError::Exchange` を返し、
-メッセージに `alo` を含む (例: `badAloPxRejected`) 場合、それは板を跨いで
-taker になってしまう post-only 拒否であり、**エラーとして扱わない**。
+`is_alo_reject()` (`src/twap.rs`) がそのエラーを ALO post-only 拒否と
+判定した場合、それは板を跨いで taker になってしまう post-only 拒否であり、
+**エラーとして扱わない**。判定は **既知の完全一致ワーディングのみ**
+(exchange の `code == "badAloPxRejected"`、または `message` 中の
+既知の正確な HL 文言 — 例: `"Post only order would have immediately
+matched"`) を対象とした fail-closed な判定であり、`message` に部分文字列
+`"alo"` が含まれるだけの緩い判定ではない (旧実装はこの緩い部分一致で
+fail-open だった — 無関係な致命的拒否のメッセージがたまたま `"alo"` を
+含む場合に誤って skip 扱いしてしまうバグがあり、修正済み)。
 そのスライスはゼロ約定の skip として `slices_skipped` に計上され、
 実行は中断せずに次のスライスへ進む。不足分は `target_at_slice` が
 累積目標であることから自動的に catch-up される — 最低名目金額未満の
@@ -353,6 +360,23 @@ status 照会/cancel は継続可" ポリシー)。ループを抜けた直後
 `resting` がまだ `Some` であれば同じ `settle_resting_child` で
 cancel→確定させてから最終レポートを組み立てる。これにより
 「resting のまま板に注文が残る」リークは構造的に発生しない。
+
+この無条件クリーンアップが保証するのは **プロセスが生きたまま終了する
+経路** (正常終了・`--duration` 経過・`SIGINT`/`SIGTERM` によるシャット
+ダウン) のみである点に注意。**ハードキル** (`SIGKILL`・電源断など、
+クリーンアップコードを一切実行する機会がない終了) はこの後処理では
+救えない — その代わりを担うのが journal + `--resume` による再照合
+(Issue #1 Finding 1 の修正で追加) であり、`settle_resting_child` は
+resting 注文の `Acknowledged`/`Terminal` を journal に記録するように
+なったため、ハードキルされた passive 実行も `--resume` 時に
+`reconcile_unresolved_cloid` が「未解決の resting 注文」として発見し、
+cancel→terminal ポーリングで確実に確定させる。この 2 段構え
+(プロセス内クリーンアップ = 生きて終了する経路、journal+resume =
+ハードキル経路) で「resting のまま板に注文が残る」リークが構造的に
+発生しないことを保証する。この修正より前は、passive の resting 注文が
+journal に一切記録されなかったため、ハードキルされた passive 実行の
+`--resume` はこの注文を見つけられず、上記の保証はハードキルには
+成立していなかった。
 
 **スコープ外**: スライス内での即時 re-quote (touch が動いた瞬間の
 cancel→再quote) は実装していない。再quote はスライス境界でのみ発生する
