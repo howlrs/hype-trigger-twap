@@ -23,6 +23,7 @@ use crate::api::HlApi;
 use crate::client::{OrderStatusFill, PlaceOutcome, ValidatedFill, ValidatedMarketSnapshot};
 use crate::errors::{HlError, RejectionKind};
 use crate::format::{human, round_size, taker_limit_price};
+use crate::journal::{ExecutionJournal, JournalRecord};
 use crate::risk::RiskEnvelope;
 use crate::types::{Address, CancelIntent, Cloid, OrderIntent, Side, Symbol, Tif};
 
@@ -807,8 +808,32 @@ async fn place_slice_reconciled(
     plan: &TwapPlan,
     intent: &OrderIntent,
     deadline: &ExecutionDeadline,
+    slice_idx: u32,
+    journal: Option<&mut ExecutionJournal>,
 ) -> Result<SliceOutcome, HlError> {
     deadline.check_before_send(tokio::time::Instant::now())?;
+
+    // Issue #4: durably record intent+cloid BEFORE the send that could have
+    // an ambiguous outcome. `nonce` is not known until `place_order_once`
+    // mints it (the trait signs internally), so this Prepared record leaves
+    // `nonce: None` — the crash window this closes is "did we even attempt
+    // to send this cloid," which does not require the nonce value itself.
+    // fsync happens inside `ExecutionJournal::record`; a failure to journal
+    // aborts the slice rather than risk sending an order this run cannot
+    // later prove it attempted.
+    let mut journal = journal;
+    if let Some(j) = journal.as_deref_mut() {
+        j.record(&JournalRecord::Prepared {
+            slice_idx,
+            cloid: intent.cloid,
+            nonce: None,
+            symbol: intent.symbol.clone(),
+            side: intent.side,
+            px: intent.px.to_string(),
+            sz: intent.sz.to_string(),
+        })
+        .map_err(|e| HlError::InvalidResponse(format!("journal write (Prepared) failed: {e}")))?;
+    }
 
     let mut attempt = 0u32;
     loop {
@@ -822,15 +847,44 @@ async fn place_slice_reconciled(
                 // signed limit are all hard errors here, never credited.
                 let vf = ValidatedFill::try_from_place(&outcome, intent)?;
                 tracing::debug!(nonce, "place acknowledged");
+                journal_terminal(
+                    journal.as_deref_mut(),
+                    slice_idx,
+                    intent.cloid,
+                    "filled",
+                    vf.filled_sz,
+                    Some(vf.avg_px.unwrap_or(intent.px)),
+                )?;
                 return Ok(SliceOutcome {
                     sz: vf.filled_sz,
                     px: vf.avg_px.unwrap_or(intent.px),
                 });
             }
             Ok((_, PlaceOutcome::Resting { oid })) => {
+                if let Some(j) = journal.as_deref_mut() {
+                    j.record(&JournalRecord::Acknowledged {
+                        slice_idx,
+                        cloid: intent.cloid,
+                        oid: Some(oid.0),
+                        status: "resting".into(),
+                    })
+                    .map_err(|e| {
+                        HlError::InvalidResponse(format!(
+                            "journal write (Acknowledged) failed: {e}"
+                        ))
+                    })?;
+                }
                 let st = recover_resting_fill(client, plan, intent.cloid, oid).await?;
                 let vf = ValidatedFill::try_from_status(&st, intent)?;
                 // T5: credit at HL's realised average, not at our limit.
+                journal_terminal(
+                    journal.as_deref_mut(),
+                    slice_idx,
+                    intent.cloid,
+                    &st.status,
+                    vf.filled_sz,
+                    vf.avg_px,
+                )?;
                 return Ok(SliceOutcome {
                     sz: vf.filled_sz,
                     px: vf.avg_px.unwrap_or(intent.px),
@@ -850,6 +904,21 @@ async fn place_slice_reconciled(
             "place outcome UNKNOWN after transport failure; reconciling by cloid"
         );
 
+        // Issue #4: the POST was sent but its response was never read — this
+        // is the crash-injection window between "sent" and "response read."
+        // Journal it as SubmittedUnknown BEFORE the reconciliation sleep/poll
+        // below, so a process death here still leaves a durable record that
+        // this cloid's outcome must be resolved via orderStatus on restart.
+        if let Some(j) = journal.as_deref_mut() {
+            j.record(&JournalRecord::SubmittedUnknown {
+                slice_idx,
+                cloid: intent.cloid,
+            })
+            .map_err(|e| {
+                HlError::InvalidResponse(format!("journal write (SubmittedUnknown) failed: {e}"))
+            })?;
+        }
+
         // Give HL a moment to book an order it may already have accepted.
         tokio::time::sleep(RECONCILE_DELAY).await;
 
@@ -864,6 +933,14 @@ async fn place_slice_reconciled(
                     status = %st.status,
                     "reconciled: HL had the order; no resend"
                 );
+                journal_terminal(
+                    journal.as_deref_mut(),
+                    slice_idx,
+                    intent.cloid,
+                    &st.status,
+                    vf.filled_sz,
+                    vf.avg_px,
+                )?;
                 return Ok(SliceOutcome {
                     sz: vf.filled_sz,
                     px: vf.avg_px.unwrap_or(intent.px),
@@ -904,6 +981,31 @@ async fn place_slice_reconciled(
             }
         }
     }
+}
+
+/// Write a [`JournalRecord::Terminal`] record if a journal is attached.
+/// Small helper to keep the three call sites in `place_slice_reconciled`
+/// (direct fill, resting→recovered fill, ambiguous→reconciled fill) from
+/// repeating the same `if let Some(j) = ...` boilerplate and error mapping.
+fn journal_terminal(
+    journal: Option<&mut ExecutionJournal>,
+    slice_idx: u32,
+    cloid: Cloid,
+    status: &str,
+    filled_sz: Decimal,
+    avg_px: Option<Decimal>,
+) -> Result<(), HlError> {
+    if let Some(j) = journal {
+        j.record(&JournalRecord::Terminal {
+            slice_idx,
+            cloid,
+            status: status.to_string(),
+            filled_sz: filled_sz.to_string(),
+            avg_px: avg_px.map(|p| p.to_string()),
+        })
+        .map_err(|e| HlError::InvalidResponse(format!("journal write (Terminal) failed: {e}")))?;
+    }
+    Ok(())
 }
 
 /// Ask HL whether it holds `cloid`, retrying until the answer is unambiguous
@@ -992,7 +1094,71 @@ async fn reconcile_by_cloid(
 }
 
 /// Run the TWAP loop (§8).
+///
+/// Thin wrapper over [`run_twap_journaled`] with no journal and no shutdown
+/// signal — preserves the exact behaviour every pre-Issue-#4 caller (and the
+/// 40+ existing `loop_tests` in this file) already depends on.
 pub async fn run_twap(client: &dyn HlApi, plan: &TwapPlan) -> TwapReport {
+    run_twap_journaled(client, plan, None, None).await
+}
+
+/// Cooperative shutdown signal (Issue #4).
+///
+/// Backed by [`tokio::sync::watch`] rather than a real OS signal so both the
+/// production SIGINT/SIGTERM handler (`main.rs`) and tests can drive it
+/// identically — a test sets the watch value directly, no real signal
+/// delivery required. `true` means "a shutdown has been requested; stop
+/// scheduling new slices, reconcile/cancel in-flight work, and return."
+#[derive(Clone)]
+pub struct ShutdownSignal(tokio::sync::watch::Receiver<bool>);
+
+impl ShutdownSignal {
+    pub fn new(rx: tokio::sync::watch::Receiver<bool>) -> Self {
+        Self(rx)
+    }
+
+    pub fn is_triggered(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    /// Wait until shutdown is requested. Used to race against `sleep_until`
+    /// so an interrupt during the inter-slice pause is noticed immediately
+    /// rather than only at the top of the next loop iteration.
+    async fn wait(&mut self) {
+        // `changed()` only returns Err if the sender was dropped without
+        // ever sending — in that case there is nothing more to wait for, so
+        // treat it the same as "never triggers" by parking forever; the
+        // caller's `select!` biases on the other branch finishing normally.
+        while !*self.0.borrow() {
+            if self.0.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
+/// Run the TWAP loop with optional crash-safety journaling and cooperative
+/// shutdown (Issue #4).
+///
+/// `journal`: when `Some`, every slice's Prepared/SubmittedUnknown/
+/// Acknowledged/Terminal transitions are durably recorded (see
+/// `src/journal.rs`). `None` reproduces the pre-Issue-#4 in-memory-only
+/// behaviour exactly (used by `run_twap` and all pre-existing tests).
+///
+/// `shutdown`: when `Some` and triggered (SIGINT/SIGTERM in production, or a
+/// test driving the underlying `watch` channel directly), the loop stops
+/// scheduling NEW slices at the next opportunity — the top of a slice
+/// iteration, or during the inter-slice sleep — lets any in-flight
+/// `place_slice_reconciled` call for the CURRENT slice run to completion
+/// (never abandoned mid-send, so no is-it-terminal ambiguity is created by
+/// the shutdown itself beyond what a normal ambiguous send already produces),
+/// then returns with `abort_reason` describing the interruption.
+pub async fn run_twap_journaled(
+    client: &dyn HlApi,
+    plan: &TwapPlan,
+    mut journal: Option<&mut ExecutionJournal>,
+    mut shutdown: Option<ShutdownSignal>,
+) -> TwapReport {
     let start = tokio::time::Instant::now();
     // Issue #2: the run-level ExecutionDeadline, constructed ONCE at the
     // very start of execution so `monotonic` and `expires_after_ms` are
@@ -1007,6 +1173,20 @@ pub async fn run_twap(client: &dyn HlApi, plan: &TwapPlan) -> TwapReport {
     let mut abort_reason: Option<String> = None;
 
     for slice_idx in 1..=plan.slices {
+        // Issue #4: stop scheduling NEW slices once shutdown has been
+        // requested. Checked at the top of every iteration so an interrupt
+        // noticed during the previous slice's inter-slice sleep (via the
+        // `select!` below) or between slices takes effect before the next
+        // network call is ever made.
+        if let Some(sd) = &shutdown {
+            if sd.is_triggered() {
+                abort_reason = Some(format!(
+                    "shutdown requested; stopped before slice {slice_idx}/{}",
+                    plan.slices
+                ));
+                break;
+            }
+        }
         if plan.read_only {
             println!("{READ_ONLY_BANNER}");
         }
@@ -1167,7 +1347,24 @@ pub async fn run_twap(client: &dyn HlApi, plan: &TwapPlan) -> TwapReport {
             "placing IOC slice"
         );
 
-        match place_slice_reconciled(client, plan, &intent, &exec_deadline).await {
+        // Issue #4: once a place is in flight it runs to completion — the
+        // journal's Prepared/SubmittedUnknown/Acknowledged/Terminal
+        // sequence inside `place_slice_reconciled` is what makes THIS call
+        // crash-safe; a shutdown signal arriving mid-call is handled by the
+        // NEXT iteration's top-of-loop check (or by the caller's own grace
+        // timeout racing this whole `run_twap_journaled` future), never by
+        // cancelling the call itself — an abandoned in-flight place is
+        // exactly the ambiguity this feature exists to prevent.
+        match place_slice_reconciled(
+            client,
+            plan,
+            &intent,
+            &exec_deadline,
+            slice_idx,
+            journal.as_deref_mut(),
+        )
+        .await
+        {
             // Every fill — direct, recovered from a resting order, or
             // reconciled after an ambiguous send — is credited here EXACTLY
             // ONCE (T3/T5). There is no second accounting path.
@@ -1203,7 +1400,34 @@ pub async fn run_twap(client: &dyn HlApi, plan: &TwapPlan) -> TwapReport {
             break;
         }
 
-        sleep_until(slice_end).await;
+        // Issue #4: race the inter-slice sleep against the shutdown signal
+        // so an interrupt during a (potentially long) pause is noticed
+        // immediately rather than only at the top of the next iteration.
+        match &mut shutdown {
+            Some(sd) if !sd.is_triggered() => {
+                let mut sd_wait = sd.clone();
+                tokio::select! {
+                    _ = sleep_until(slice_end) => {}
+                    _ = sd_wait.wait() => {
+                        abort_reason = Some(format!(
+                            "shutdown requested during inter-slice wait after slice {slice_idx}/{}",
+                            plan.slices
+                        ));
+                        break;
+                    }
+                }
+            }
+            _ => sleep_until(slice_end).await,
+        }
+    }
+
+    if let Some(j) = journal {
+        let _ = j.record(&JournalRecord::FinalReport {
+            completed: abort_reason.is_none(),
+            filled_total: stats.filled.to_string(),
+            outcome_unknown_cloids: Vec::new(),
+            note: abort_reason.clone().unwrap_or_else(|| "completed".into()),
+        });
     }
 
     TwapReport {
@@ -2288,7 +2512,7 @@ mod loop_tests {
         let dl =
             ExecutionDeadline::from_parts(start + Duration::from_millis(800), 1_700_000_000_000);
 
-        let err = place_slice_reconciled(&api, &plan_val, &intent, &dl)
+        let err = place_slice_reconciled(&api, &plan_val, &intent, &dl, 1, None)
             .await
             .unwrap_err();
 
@@ -2337,7 +2561,7 @@ mod loop_tests {
         let start = tokio::time::Instant::now();
         let dl = ExecutionDeadline::from_parts(start + Duration::from_secs(60), 1_700_000_000_000);
 
-        let outcome = place_slice_reconciled(&api, &plan_val, &intent, &dl)
+        let outcome = place_slice_reconciled(&api, &plan_val, &intent, &dl, 1, None)
             .await
             .unwrap();
 
@@ -2376,7 +2600,7 @@ mod loop_tests {
         let start = tokio::time::Instant::now();
         let dl = ExecutionDeadline::from_parts(start + Duration::from_secs(60), 1_700_123_456_789);
 
-        place_slice_reconciled(&api, &plan_val, &intent, &dl)
+        place_slice_reconciled(&api, &plan_val, &intent, &dl, 1, None)
             .await
             .unwrap();
 
