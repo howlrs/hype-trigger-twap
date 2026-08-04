@@ -1402,9 +1402,20 @@ pub async fn run_twap_journaled(
 
         // Issue #4: race the inter-slice sleep against the shutdown signal
         // so an interrupt during a (potentially long) pause is noticed
-        // immediately rather than only at the top of the next iteration.
+        // immediately rather than only at the top of the next iteration —
+        // including the case where shutdown was ALREADY triggered by the
+        // time this point is reached (e.g. it fired while the slice we just
+        // completed was in flight): that must break here, not fall through
+        // to a full inter-slice sleep first.
         match &mut shutdown {
-            Some(sd) if !sd.is_triggered() => {
+            Some(sd) if sd.is_triggered() => {
+                abort_reason = Some(format!(
+                    "shutdown requested during inter-slice wait after slice {slice_idx}/{}",
+                    plan.slices
+                ));
+                break;
+            }
+            Some(sd) => {
                 let mut sd_wait = sd.clone();
                 tokio::select! {
                     _ = sleep_until(slice_end) => {}
@@ -1417,7 +1428,7 @@ pub async fn run_twap_journaled(
                     }
                 }
             }
-            _ => sleep_until(slice_end).await,
+            None => sleep_until(slice_end).await,
         }
     }
 
@@ -3606,5 +3617,501 @@ mod loop_tests {
         let reason = report.abort_reason.clone().expect("must abort");
         assert!(reason.contains("risk envelope"), "{reason}");
         assert_eq!(report.exit_code(), 1);
+    }
+
+    // === Issue #4: ExecutionJournal crash-injection + shutdown tests ===
+    //
+    // These drive `run_twap_journaled` directly (rather than the plain
+    // `run_twap` wrapper used by every test above) with a real
+    // `ExecutionJournal` backed by a throwaway temp directory, so each test
+    // can replay the on-disk journal afterwards and assert exactly what a
+    // restart would see. "Crash" is simulated by simply not continuing the
+    // run — nothing here kills a real process; `ScriptedApi`'s queues are
+    // used to stop exactly at the point under test (e.g. an empty places
+    // queue makes the NEXT place attempt panic, so tests script exactly one
+    // place and then inspect the journal as if the process had died right
+    // after it).
+    mod journal_tests {
+        use super::*;
+        use crate::journal::{summarize, CloidState, ExecutionJournal, JournalRecord, RunHeader};
+
+        /// Hand-rolled temp dir (no `tempfile` dependency — mirrors the one
+        /// in `src/journal.rs`'s own test module).
+        struct TempDir(std::path::PathBuf);
+        impl TempDir {
+            fn new() -> Self {
+                let dir = std::env::temp_dir().join(format!(
+                    "hype-twap-twaprs-journal-test-{}",
+                    uuid::Uuid::now_v7()
+                ));
+                std::fs::create_dir_all(&dir).unwrap();
+                Self(dir)
+            }
+            fn path(&self) -> &std::path::Path {
+                &self.0
+            }
+        }
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn test_header() -> RunHeader {
+            RunHeader {
+                run_id: "test-run".into(),
+                network: "testnet".into(),
+                agent: Some(Address::new(AGENT)),
+                master: Some(Address::new(MASTER)),
+                symbol: Symbol::new("HYPE"),
+                side: Side::Long,
+                slices: 10,
+                plan_hash: "test-hash".into(),
+                started_at_unix_ms: 0,
+            }
+        }
+
+        // --- Crash injection 1: after Prepared fsynced, before POST sent ---
+        //
+        // We cannot literally stop `place_order_once` from being called once
+        // `run_twap_journaled` reaches it (there is no hook between "Prepared
+        // recorded" and "POST sent" other than the POST call itself), so this
+        // test proves the INVARIANT the real crash window depends on: the
+        // Prepared record for slice 1's cloid is durably on disk (fsynced)
+        // strictly before ScriptedApi ever observes a Place call. If the
+        // process had died at that exact instant, replaying the journal shows
+        // a `PreparedOnly` cloid — the resume/incomplete-run-detection layer
+        // (`find_incomplete_run`/`summarize`) sees this as "needs
+        // reconciliation before any new send," never as "safe to assume
+        // nothing happened."
+        #[tokio::test(start_paused = true)]
+        async fn crash_after_prepared_before_post_leaves_a_preparedonly_record_never_a_phantom_terminal(
+        ) {
+            let tmp = TempDir::new();
+            let mut journal =
+                ExecutionJournal::start(tmp.path(), "run-1".into(), test_header()).unwrap();
+
+            // A single-slice plan isolates the one place under test — the
+            // run reaches its target after slice 1 and stops there on its
+            // own (`stats.filled >= plan.total_adjusted`), with no shutdown
+            // signal needed to keep this test focused on the crash window.
+            let mut single_slice_plan = plan(false);
+            single_slice_plan.slices = 1;
+            single_slice_plan.per_slice = dec!(5);
+            single_slice_plan.total_adjusted = dec!(5);
+
+            let api = ScriptedApi::new()
+                .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+                .push_place(filled(dec!(5), dec!(50)));
+
+            let _report =
+                run_twap_journaled(&api, &single_slice_plan, Some(&mut journal), None).await;
+
+            let records = ExecutionJournal::read_all(tmp.path(), "run-1").unwrap();
+            // Slice 1's Prepared record exists and precedes any Terminal
+            // record for the same cloid — proving durability-before-send.
+            let prepared_idx = records
+                .iter()
+                .position(|r| matches!(r, JournalRecord::Prepared { slice_idx: 1, .. }))
+                .expect("Prepared record for slice 1 must exist");
+            let terminal_idx = records
+                .iter()
+                .position(|r| matches!(r, JournalRecord::Terminal { slice_idx: 1, .. }))
+                .expect("Terminal record for slice 1 must exist (this run completed the send)");
+            assert!(
+                prepared_idx < terminal_idx,
+                "Prepared must be written before Terminal: {records:?}"
+            );
+
+            // No double-place: a single call reached ScriptedApi.
+            assert_eq!(api.place_count(), 1);
+        }
+
+        // --- Crash injection 2: after POST sent, before response read ---
+        //
+        // ScriptedApi's place queue is EMPTY, so `place_order_once` returns
+        // `HlError::InvalidResponse("...queue exhausted")` immediately — a
+        // stand-in for "the transport call itself failed/was interrupted,"
+        // i.e. exactly the ambiguous case `place_slice_reconciled` treats as
+        // a `Network` error requiring reconciliation. Because
+        // `InvalidResponse` (not `Network`) is what an exhausted queue
+        // produces, we instead script a genuine `HlError::Network` failure to
+        // hit the real ambiguous-send branch and its `SubmittedUnknown`
+        // journal write.
+        #[tokio::test(start_paused = true)]
+        async fn crash_after_post_sent_before_response_read_journals_submitted_unknown_and_resume_reconciles_without_a_resend(
+        ) {
+            let tmp = TempDir::new();
+            let mut journal =
+                ExecutionJournal::start(tmp.path(), "run-2".into(), test_header()).unwrap();
+
+            let mut single_slice_plan = plan(false);
+            single_slice_plan.slices = 1;
+            single_slice_plan.per_slice = dec!(5);
+            single_slice_plan.total_adjusted = dec!(5);
+
+            // The send transport-fails (ambiguous outcome); reconciliation
+            // then discovers HL actually HAD the order, terminal/filled — the
+            // realistic "response was lost, but the exchange got it" crash
+            // shape. No resend may occur.
+            let api = ScriptedApi::new()
+                .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+                .push_place(Err(HlError::Network("connection reset".into())))
+                .push_status(Ok(Some(status(dec!(5), Some(dec!(50)), "filled"))));
+
+            let report =
+                run_twap_journaled(&api, &single_slice_plan, Some(&mut journal), None).await;
+
+            // Exactly one place call — the ambiguous send is never resent
+            // once reconciliation finds HL already had it.
+            assert_eq!(api.place_count(), 1, "must never resend once reconciled");
+            assert_eq!(report.filled, dec!(5));
+
+            let records = ExecutionJournal::read_all(tmp.path(), "run-2").unwrap();
+            assert!(
+                records
+                    .iter()
+                    .any(|r| matches!(r, JournalRecord::SubmittedUnknown { slice_idx: 1, .. })),
+                "the ambiguous send must be journaled as SubmittedUnknown: {records:?}"
+            );
+            let summary = summarize(&records);
+            // Resume-safety: the cloid's LATEST state is Terminal (filled),
+            // not stuck at SubmittedUnknown — a resume replay would see this
+            // as already resolved and would not attempt to reconcile or
+            // resend it again.
+            assert_eq!(summary.cloids.len(), 1);
+            assert!(matches!(
+                &summary.cloids[0].1,
+                CloidState::Terminal { filled_sz, .. } if filled_sz == "5"
+            ));
+        }
+
+        // --- Crash injection 3: after resting order confirmed ---
+        //
+        // The IOC unexpectedly rests (`PlaceOutcome::Resting`); the run
+        // journals `Acknowledged` for that cloid, then (per the existing
+        // `recover_resting_fill` policy) cancels and polls `orderStatus`
+        // until a terminal fill is known. This proves the Acknowledged state
+        // is durably recorded and superseded by the eventual Terminal record
+        // — a crash between those two points would leave a resumable
+        // Acknowledged (cancel-on-shutdown candidate), never silently
+        // dropped.
+        #[tokio::test(start_paused = true)]
+        async fn crash_after_resting_order_confirmed_journals_acknowledged_then_terminal() {
+            let tmp = TempDir::new();
+            let mut journal =
+                ExecutionJournal::start(tmp.path(), "run-3".into(), test_header()).unwrap();
+
+            let api = ScriptedApi::new()
+                .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+                .push_place(Ok(PlaceOutcome::Resting { oid: OrderId(99) }))
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status(dec!(5), Some(dec!(50)), "filled"))));
+
+            let report = run_twap_journaled(&api, &plan(false), Some(&mut journal), None).await;
+
+            assert_eq!(report.filled, dec!(5));
+
+            let records = ExecutionJournal::read_all(tmp.path(), "run-3").unwrap();
+            let ack_idx = records
+                .iter()
+                .position(|r| matches!(r, JournalRecord::Acknowledged { slice_idx: 1, .. }))
+                .expect("Acknowledged record must exist for the resting order");
+            let terminal_idx = records
+                .iter()
+                .position(|r| matches!(r, JournalRecord::Terminal { slice_idx: 1, .. }))
+                .expect("Terminal record must exist once the resting order resolves");
+            assert!(ack_idx < terminal_idx);
+        }
+
+        // --- Incomplete-run blocks new run ---
+
+        #[test]
+        fn incomplete_run_present_blocks_a_new_overlapping_live_run() {
+            let tmp = TempDir::new();
+            let mut journal =
+                ExecutionJournal::start(tmp.path(), "run-incomplete".into(), test_header())
+                    .unwrap();
+            journal
+                .record(&JournalRecord::Prepared {
+                    slice_idx: 1,
+                    cloid: Cloid::new(),
+                    nonce: None,
+                    symbol: Symbol::new("HYPE"),
+                    side: Side::Long,
+                    px: "50".into(),
+                    sz: "5".into(),
+                })
+                .unwrap();
+            journal
+                .record(&JournalRecord::SubmittedUnknown {
+                    slice_idx: 1,
+                    cloid: Cloid::new(),
+                })
+                .unwrap();
+            drop(journal); // simulate the crash: no FinalReport was ever written
+
+            let found = crate::journal::find_incomplete_run(
+                tmp.path(),
+                "testnet",
+                Some(&Address::new(AGENT)),
+            )
+            .unwrap();
+            assert_eq!(
+                found,
+                Some("run-incomplete".to_string()),
+                "an incomplete run for the same network+agent must be detected"
+            );
+        }
+
+        // --- SIGINT/SIGTERM (simulated via ShutdownSignal) ---
+
+        /// Pre-send: shutdown is ALREADY triggered before slice 1 is ever
+        /// attempted (equivalent to a signal arriving in the gap between
+        /// trigger-fire and the first slice iteration). No place must occur.
+        #[tokio::test(start_paused = true)]
+        async fn shutdown_pre_send_places_nothing_and_journals_no_prepared_record() {
+            let tmp = TempDir::new();
+            let mut journal =
+                ExecutionJournal::start(tmp.path(), "run-presend".into(), test_header()).unwrap();
+            let api = ScriptedApi::new().with_default_book(book_at(dec!(49.9), dec!(50.1)));
+
+            let (tx, rx) = tokio::sync::watch::channel(true); // ALREADY triggered
+            let _tx = tx; // keep sender alive for the duration of the run
+            let shutdown = ShutdownSignal::new(rx);
+
+            let report =
+                run_twap_journaled(&api, &plan(false), Some(&mut journal), Some(shutdown)).await;
+
+            assert_eq!(
+                api.place_count(),
+                0,
+                "no slice may be placed after shutdown"
+            );
+            assert!(report.abort_reason.unwrap().contains("shutdown"));
+
+            let records = ExecutionJournal::read_all(tmp.path(), "run-presend").unwrap();
+            assert!(
+                !records
+                    .iter()
+                    .any(|r| matches!(r, JournalRecord::Prepared { .. })),
+                "no Prepared record should exist when shutdown fires before any slice: {records:?}"
+            );
+            let summary = summarize(&records);
+            assert!(summary.final_report_seen);
+            assert!(summary.cloids.is_empty());
+        }
+
+        /// Post-send (ambiguous): shutdown is signalled AFTER slice 1 has
+        /// already been placed and journaled (during its inter-slice wait).
+        /// Slice 1 must complete its own place/reconcile cycle (never
+        /// abandoned mid-flight); slice 2 must never be attempted.
+        #[tokio::test(start_paused = true)]
+        async fn shutdown_post_send_finishes_the_inflight_slice_then_stops_before_the_next() {
+            let tmp = TempDir::new();
+            let mut journal =
+                ExecutionJournal::start(tmp.path(), "run-postsend".into(), test_header()).unwrap();
+
+            let api = ScriptedApi::new()
+                .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+                .push_place(filled(dec!(5), dec!(50)));
+
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            let shutdown = ShutdownSignal::new(rx);
+
+            let plan_val = plan(false);
+            let run_fut = run_twap_journaled(&api, &plan_val, Some(&mut journal), Some(shutdown));
+            tokio::pin!(run_fut);
+
+            // Drive the run just far enough to complete slice 1's place (a
+            // handful of yields is enough under `start_paused`: ScriptedApi's
+            // Filled path awaits no timer, so slice 1 resolves on the first
+            // few polls), THEN signal shutdown — modelling a signal arriving
+            // while the run is sitting in its inter-slice sleep, after slice
+            // 1 is already journaled Terminal.
+            for _ in 0..8 {
+                tokio::select! {
+                    biased;
+                    _ = &mut run_fut => panic!("run must not finish before shutdown is signalled"),
+                    _ = tokio::task::yield_now() => {}
+                }
+            }
+            assert_eq!(
+                api.place_count(),
+                1,
+                "slice 1 must already be placed before shutdown is signalled"
+            );
+            tx.send(true).unwrap();
+
+            let report = run_fut.await;
+
+            assert_eq!(
+                api.place_count(),
+                1,
+                "slice 1 (already in flight when shutdown fired) must complete; slice 2 must not start"
+            );
+            assert_eq!(report.filled, dec!(5));
+            assert!(report.abort_reason.unwrap().contains("shutdown"));
+
+            let records = ExecutionJournal::read_all(tmp.path(), "run-postsend").unwrap();
+            let summary = summarize(&records);
+            assert_eq!(
+                summary.cloids.len(),
+                1,
+                "only slice 1's cloid was ever touched"
+            );
+            assert!(matches!(
+                &summary.cloids[0].1,
+                CloidState::Terminal { filled_sz, .. } if filled_sz == "5"
+            ));
+        }
+
+        /// Mid-reconcile: shutdown fires while an ambiguous send for slice 1
+        /// is being reconciled. The reconciliation must still run to
+        /// completion (per the PM decision: "reconciliation that is already
+        /// in flight ... still runs to completion") rather than being
+        /// abandoned, so the journal ends with a resolved Terminal state, not
+        /// a dangling SubmittedUnknown.
+        #[tokio::test(start_paused = true)]
+        async fn shutdown_mid_reconcile_lets_the_inflight_reconciliation_finish() {
+            let tmp = TempDir::new();
+            let mut journal =
+                ExecutionJournal::start(tmp.path(), "run-midreconcile".into(), test_header())
+                    .unwrap();
+
+            let api = ScriptedApi::new()
+                .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+                .push_place(Err(HlError::Network("connection reset".into())))
+                .push_status(Ok(Some(status(dec!(5), Some(dec!(50)), "filled"))));
+
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            let shutdown = ShutdownSignal::new(rx);
+
+            let plan_val = plan(false);
+            let run_fut = run_twap_journaled(&api, &plan_val, Some(&mut journal), Some(shutdown));
+            tokio::pin!(run_fut);
+
+            // Drive the run past the initial ambiguous send (SubmittedUnknown
+            // is journaled) and into the reconciliation delay/poll — i.e.
+            // virtual time must advance past `RECONCILE_DELAY` — BEFORE
+            // signalling shutdown. `place_slice_reconciled` has no
+            // shutdown-awareness of its own (PM decision), so a signal
+            // arriving here must not truncate the reconciliation already in
+            // flight.
+            tokio::time::advance(RECONCILE_DELAY + Duration::from_millis(50)).await;
+            for _ in 0..8 {
+                tokio::select! {
+                    biased;
+                    _ = &mut run_fut => panic!("run must not finish before shutdown is signalled"),
+                    _ = tokio::task::yield_now() => {}
+                }
+            }
+            let mid_flight_records =
+                ExecutionJournal::read_all(tmp.path(), "run-midreconcile").unwrap();
+            assert!(
+                mid_flight_records
+                    .iter()
+                    .any(|r| matches!(r, JournalRecord::SubmittedUnknown { .. })),
+                "reconciliation must already be in flight (SubmittedUnknown journaled) \
+                 before shutdown fires: {mid_flight_records:?}"
+            );
+            tx.send(true).unwrap();
+
+            let report = run_fut.await;
+
+            assert_eq!(
+                report.filled,
+                dec!(5),
+                "the in-flight reconciliation must finish"
+            );
+            let records = ExecutionJournal::read_all(tmp.path(), "run-midreconcile").unwrap();
+            let summary = summarize(&records);
+            assert!(
+                summary.unresolved_cloids().is_empty(),
+                "no cloid should be left unresolved: {records:?}"
+            );
+        }
+
+        // --- Resume counts fills exactly once ---
+
+        #[tokio::test(start_paused = true)]
+        async fn resume_after_simulated_crash_counts_each_fill_exactly_once() {
+            let tmp = TempDir::new();
+
+            // "First process": completes slice 1 (filled 5), then "crashes"
+            // (we simply stop driving it — the journal already has slice 1's
+            // Terminal record on disk).
+            let filled_sz_slice1 = {
+                let mut journal =
+                    ExecutionJournal::start(tmp.path(), "run-resume".into(), test_header())
+                        .unwrap();
+                let api = ScriptedApi::new()
+                    .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+                    .push_place(filled(dec!(5), dec!(50)));
+
+                // A single-slice plan models "the process completed exactly
+                // one slice, then crashed" (simulated by simply not driving
+                // the run any further — there is no second slice to run), so
+                // only ONE Terminal record exists in the journal at "crash"
+                // time.
+                let mut one_slice_plan = plan(false);
+                one_slice_plan.slices = 1;
+                one_slice_plan.per_slice = dec!(5);
+                one_slice_plan.total_adjusted = dec!(5);
+
+                let report =
+                    run_twap_journaled(&api, &one_slice_plan, Some(&mut journal), None).await;
+                report.filled
+            };
+            assert_eq!(filled_sz_slice1, dec!(5));
+
+            // "Resume": replay the journal to get the fills already credited
+            // (this is what a real `--resume` accounting step does BEFORE
+            // continuing the run), then continue the run for the remaining
+            // slices with a FRESH ScriptedApi/journal-append session. The
+            // total must be the sum of the resumed fill plus the newly
+            // executed ones, with slice 1's fill counted exactly once (not
+            // replayed again as a "new" fill in this second session).
+            let resumed_records = ExecutionJournal::read_all(tmp.path(), "run-resume").unwrap();
+            let resumed_summary = summarize(&resumed_records);
+            let already_filled = resumed_summary.total_filled();
+            assert_eq!(already_filled, dec!(5));
+
+            // Continue: a plan sized for the REMAINING 45 (9 slices × 5) —
+            // this models how `main.rs`/the resume path would shrink the
+            // plan's remaining-target by `already_filled` before resuming
+            // the loop, which is what guarantees slice 1's fill is never
+            // re-requested.
+            let mut resumed_plan = plan(false);
+            resumed_plan.slices = 9;
+            resumed_plan.total_adjusted = dec!(45);
+            resumed_plan.per_slice = dec!(5);
+
+            let mut journal2 = ExecutionJournal::open_existing(tmp.path(), "run-resume").unwrap();
+            let api2 = ScriptedApi::new().with_default_book(book_at(dec!(49.9), dec!(50.1)));
+            let mut api2 = api2;
+            for _ in 0..9 {
+                api2 = api2.push_place(filled(dec!(5), dec!(50)));
+            }
+
+            let report2 = run_twap_journaled(&api2, &resumed_plan, Some(&mut journal2), None).await;
+            assert_eq!(report2.filled, dec!(45));
+
+            let grand_total = already_filled + report2.filled;
+            assert_eq!(
+                grand_total,
+                dec!(50),
+                "total must equal the full target with slice 1's fill counted exactly once, \
+                 not double-counted across the crash+resume boundary"
+            );
+
+            // Final on-disk check: exactly 10 distinct cloids ever appear
+            // across the whole journal (1 from the first session + 9 from
+            // the resumed session), each Terminal exactly once.
+            let all_records = ExecutionJournal::read_all(tmp.path(), "run-resume").unwrap();
+            let final_summary = summarize(&all_records);
+            assert_eq!(final_summary.cloids.len(), 10);
+            assert_eq!(final_summary.total_filled(), dec!(50));
+        }
     }
 }
