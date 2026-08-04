@@ -72,6 +72,7 @@ hype-twap --symbol ETH --side short --usd 5000 --duration 2h --slices 20 \
 | `--trigger-poll-secs` | 整数 | `2` | トリガー待ち中の板ポーリング間隔 (秒) |
 | `--wait-network-grace` | 期間 (`30m`, `1h`) | `30m` | トリガー待ち中の連続ポーリング失敗 (通信エラーまたは空板) を許容する継続時間。最初の失敗時刻からの経過で判定し、1 回でも成功すればリセットします。`0` は不可 |
 | `--expire-after` | 期間 | なし | 期間内にどのトリガーも発火しなければ、何も発注せずに終了します (exit code 3)。`--start-after` (フォールバック**開始**) とは異なり、こちらは打ち切り。同一 tick ではトリガーが優先。`0` は不可。`--start-after` 併用時は `expire_after > start_after` が必須。トリガー未指定 (即時開始) との併用は不可 |
+| `--child-algo` | `market` \| `passive` | `market` | スライスごとの子注文アルゴリズム。`market` (既定・従来と同一挙動) は IOC 成行相当の指値を送信します。`passive` は板の反対側を跨がない ALO (post-only) 指値をベスト bid/ask に置きます。詳細は後述の「passive (post-only) モード」を参照 |
 
 `--size` と `--usd` はどちらか一方が必須です。両方指定または両方省略はエラーになります。
 
@@ -139,6 +140,58 @@ exit code:       0
 - 丸め落ちがある場合は `status` が `complete (against the adjusted target)` となり、
   `NOTE: rounding dropped ... at pre-flight` の行が追加されます
 - 部分約定で終わった場合は `WARNING: partial fill — X of Y unexecuted` が出ます
+
+## passive (post-only) モード
+
+`--child-algo passive` (既定は `market`) は、各スライスで IOC 成行相当の指値の代わりに
+ALO (Add Liquidity Only / post-only) 指値を発注します。taker 手数料とスリッページを
+削減する代わりに、約定するかどうかは板の動き次第になります。
+
+### 挙動
+
+1. スライス境界ごとに l2Book を取得し、**Long はベスト bid、Short はベスト ask** に
+   ALO 指値を置きます。price は market モードと**全く同じ** szDecimals / 5 有効数字の
+   丸めロジックを再利用します (別ロジックは実装していません)。slippage は乗せません
+   (post-only の意味上、taker になる方向へ寄せる理由がないため)。
+2. market モードと異なり、そのスライスの**インターバル全体**を待ちます
+   (即座に IOC の結果を確定させる market モードとは対照的です)。
+3. 次のスライス境界に到達した時点で未約定残 (部分約定含む) があれば、
+   `cancelByCloid` → `orderStatus(cloid)` の順で**確定約定量を取得してから**
+   次のスライスの新しい指値を出します。この cancel→確定の手順は、v0.1 で IOC が
+   意図せず resting した場合の回収ロジック (`recover_resting_fill` /
+   `poll_terminal_status`) をそのまま再利用しています。**cancel 送信後に約定が
+   すり抜けて着地する race** が起きても、`orderStatus` が返す真の約定量だけを
+   信頼するため、過大計上・過小計上のいずれも起きません。
+4. **同時に resting できる子注文は常に 1 件まで**という不変条件を構造的に
+   維持します (Option 型で 1 件しか保持しない設計)。これは姉妹リポジトリの
+   実装で経験した「cancel と place の競合で target を超過する」不具合
+   (PR-D10) を構造的に防ぐためのものです。
+
+### ALO 拒否は正常系
+
+`badAloPxRejected` など、板を跨いで taker になってしまう ALO 指値は取引所に
+拒否されます。**これはエラーではなく正常な結果として扱われます** — post-only の
+意味論上、拒否されるのは「跨がずに置けなかった」だけであり、そのスライスは
+ゼロ約定として skip され、不足分は次のスライスの catch-up サイジングに
+自動的に繰り越されます。実行を中断することはありません。
+
+### 執行ウィンドウ・シャットダウンとの関係
+
+`--duration` によるハードカットオフ (`ExecutionDeadline`) は passive モードでも
+同様に適用されます — 期限を過ぎたら**新規の指値は一切出しません**。ただし
+resting 中の注文がある場合、それを cancel して確定させる cleanup は期限後でも
+必ず実行されます。これは以下の**すべての終了経路**で保証されます:
+
+- 正常終了 (全スライス完了)
+- `--duration` 経過による中断
+- `SIGINT` / `SIGTERM` によるシャットダウン
+
+いずれの経路でも、resting のまま板に残る注文が発生しないことが受け入れ条件です。
+
+### スコープ外
+
+スライス**内**でのリアルタイム追従 (touch が動いた瞬間に即 cancel → 再quote)
+は本バージョンでは実装していません。再quote はスライス境界でのみ行われます。
 
 ## risk envelope (Issue #3)
 

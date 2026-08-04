@@ -70,6 +70,7 @@ hype-twap --symbol ETH --side short --usd 5000 --duration 2h --slices 20 \
 | `--max-book-age-ms` | u64 | `3000` | Reject a book snapshot older than this. `0` disables ONLY the max-age check — every book (trigger polls, pre-flight, each slice) still has to pass semantic validation (matching symbol, positive prices/sizes, uncrossed and correctly-ordered levels) and a fixed 2s future-timestamp tolerance, unconditionally. |
 | `--trigger-poll-secs` | u64 | `2` | Poll interval while waiting for the trigger. |
 | `--expire-after` | humantime | none | Terminate the wait, placing **nothing**, if no trigger condition fires within this duration. See "Trigger semantics" below. |
+| `--child-algo` | `market` \| `passive` | `market` | Per-slice order algorithm. `market` (default, unchanged behaviour) sends an IOC taker limit. `passive` sends a post-only (ALO) limit resting at the best bid/ask instead. See "Child-order algorithms" below. |
 
 ## Environment variables
 
@@ -215,6 +216,57 @@ NOTE:            rounding dropped 1.5 of requested 10.5 at pre-flight
 
 The note is printed on every outcome — a partial fill or an abort does not make
 the pre-flight shortfall any less real.
+
+## Child-order algorithms
+
+`--child-algo market` (the default) is unchanged from earlier releases: every
+slice sends an IOC taker limit at `mid +/- slippage-bps`, which either fills
+immediately or is cancelled by the exchange.
+
+`--child-algo passive` trades taker fees and slippage for patience: each slice
+places a post-only (**ALO**) limit resting *at the touch* — the best bid for a
+long, the best ask for a short — with no slippage cushion, and then waits the
+**full slice interval** rather than resolving immediately. The price is snapped
+to HL's grid with the exact same rounding rules as the market algorithm.
+
+What happens at each slice boundary:
+
+1. If the previous slice's ALO is still resting (fully or partially unfilled),
+   it is **cancelled**, and the true filled quantity is then read back from
+   `orderStatus` — never assumed from what was resting a moment before. This
+   closes a cancel/late-fill race: an order can fill in the split second
+   between the cancel request and HL processing it, and only `orderStatus`
+   after the cancel is trusted as ground truth.
+2. Whatever filled (fully, partially, or not at all) is credited, and the
+   shortfall is carried into the next slice's size via the same catch-up
+   sizing market mode already uses — a partial fill is never lost or
+   double-ordered.
+3. A **new** ALO is placed for the current slice's (possibly caught-up) size,
+   at the then-current touch.
+
+At most **one** passive child order rests on the book at any time — a
+placement is never sent while a prior one is still unresolved. This is a
+structural invariant, not just a convention: it is what prevents a
+cancel/place race from ever producing two live orders for the same slice's
+quantity.
+
+An ALO can be **rejected** by the exchange (e.g. `badAloPxRejected`) if the
+touch moves between the snapshot and the send, which would otherwise turn the
+order into a taker fill — the opposite of what post-only means. This is
+treated as a **normal outcome**, not an error: the slice is skipped as a
+zero-fill and its size is carried into the next slice's catch-up, exactly like
+a below-minimum-notional skip. The run never aborts because of an ALO
+rejection.
+
+Passive mode still respects `--duration` exactly as market mode does: once the
+run's `ExecutionDeadline` has passed, no *new* quote is placed. A resting order
+is always cancelled and settled during final cleanup — on normal completion,
+on hitting the duration deadline, and on `SIGINT`/`SIGTERM` — so a passive run
+never leaves an order resting on the book after the process exits.
+
+Re-quoting only happens at slice boundaries. If the touch moves mid-slice, the
+resting order is left alone until the next boundary — there is no intra-slice
+chasing in this release.
 
 ## Error handling
 
