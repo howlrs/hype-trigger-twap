@@ -134,7 +134,10 @@ async fn place_filled_response_parses() {
         .await;
 
     let client = make_client(&server);
-    let out = client.place_order(&order_intent(), 1).await.unwrap();
+    let out = client
+        .place_order(&order_intent(), 1, 1_700_000_000_000)
+        .await
+        .unwrap();
     assert_eq!(
         out,
         PlaceOutcome::Filled {
@@ -143,6 +146,72 @@ async fn place_filled_response_parses() {
             avg_px: dec!(2000.5),
         }
     );
+}
+
+/// Issue #2: the `/exchange` body's `expiresAfter` field must carry the exact
+/// same value that was used in the SIGNED action hash — this is the
+/// acceptance criterion "`/exchange` body の `expiresAfter` と署名に使った値
+/// が一致する". `Matcher::PartialJsonString` asserts the outgoing body
+/// contains this field with this exact value; a separate cross-check
+/// (`tests/signing_cross_check.rs`) proves the msgpack/hash side is correct
+/// against Hyperliquid python-sdk vectors — this test proves the CLIENT
+/// wires the two together, not just that each is independently plausible.
+#[tokio::test]
+async fn place_request_body_carries_the_same_expires_after_used_for_signing() {
+    let mut server = mockito::Server::new_async().await;
+    let m = server
+        .mock("POST", "/exchange")
+        .match_body(mockito::Matcher::PartialJsonString(
+            r#"{"expiresAfter": 1700000000000}"#.to_string(),
+        ))
+        .with_status(200)
+        .with_body(
+            r#"{"status":"ok","response":{"type":"order","data":{"statuses":[
+                {"filled":{"oid":1,"totalSz":"0.001","avgPx":"2000.5"}}]}}}"#,
+        )
+        .expect(1)
+        .create_async()
+        .await;
+
+    let client = make_client(&server);
+    client
+        .place_order(&order_intent(), 1, 1_700_000_000_000)
+        .await
+        .unwrap();
+
+    // mockito rejects the request (500, and the mock's expect(1) fails) if
+    // the body didn't carry the matching expiresAfter — this assertion is
+    // the proof the mock actually matched, not a false pass.
+    m.assert_async().await;
+}
+
+/// A `cancelByCloid` is NOT subject to the execution deadline (Issue #2 PM
+/// decision: cancels remain allowed past the deadline), so it must be signed
+/// with `expiresAfter: null` — cancelling should never itself be able to
+/// expire.
+#[tokio::test]
+async fn cancel_request_body_has_no_expires_after() {
+    let mut server = mockito::Server::new_async().await;
+    let m = server
+        .mock("POST", "/exchange")
+        .match_body(mockito::Matcher::PartialJsonString(
+            r#"{"expiresAfter": null}"#.to_string(),
+        ))
+        .with_status(200)
+        .with_body(
+            r#"{"status":"ok","response":{"type":"cancel","data":{"statuses":["success"]}}}"#,
+        )
+        .expect(1)
+        .create_async()
+        .await;
+
+    let client = make_client(&server);
+    let intent = CancelIntent {
+        symbol: Symbol::new("ETH"),
+        by_cloid: Cloid::new(),
+    };
+    client.cancel_by_cloid(&intent, 1).await.unwrap();
+    m.assert_async().await;
 }
 
 #[tokio::test]
@@ -159,7 +228,10 @@ async fn place_resting_response_parses() {
         .await;
 
     let client = make_client(&server);
-    let out = client.place_order(&order_intent(), 1).await.unwrap();
+    let out = client
+        .place_order(&order_intent(), 1, 1_700_000_000_000)
+        .await
+        .unwrap();
     assert_eq!(
         out,
         PlaceOutcome::Resting {
@@ -184,7 +256,10 @@ async fn place_per_order_error_is_fatal_and_never_retried() {
         .await;
 
     let client = make_client(&server);
-    let err = client.place_order(&order_intent(), 1).await.unwrap_err();
+    let err = client
+        .place_order(&order_intent(), 1, 1_700_000_000_000)
+        .await
+        .unwrap_err();
     match err {
         HlError::Exchange { code, message } => {
             assert_eq!(code.as_deref(), Some("order_error"));
@@ -210,7 +285,10 @@ async fn place_top_level_err_is_fatal_and_never_retried() {
         .await;
 
     let client = make_client(&server);
-    let err = client.place_order(&order_intent(), 1).await.unwrap_err();
+    let err = client
+        .place_order(&order_intent(), 1, 1_700_000_000_000)
+        .await
+        .unwrap_err();
     match err {
         HlError::Exchange { code, message } => {
             assert_eq!(code.as_deref(), Some("top_level_err"));
@@ -229,7 +307,10 @@ async fn read_only_client_cannot_place_an_order() {
     let server = mockito::Server::new_async().await;
     // No /exchange mock: proving we never get that far.
     let client = make_read_only_client(&server);
-    let err = client.place_order(&order_intent(), 1).await.unwrap_err();
+    let err = client
+        .place_order(&order_intent(), 1, 1_700_000_000_000)
+        .await
+        .unwrap_err();
     assert!(matches!(err, HlError::InvalidConfig(_)));
 }
 

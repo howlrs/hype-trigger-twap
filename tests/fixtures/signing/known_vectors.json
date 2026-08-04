@@ -204,5 +204,168 @@
     "expected_s": "0x342f8ede109a29f2c0723bd5efb9e9100e3bbb493f8fb5164ee3d385908233df",
     "expected_v": 28,
     "expected_address": "0x14791697260e4c9a71f18484c9f997b308e59325"
+  },
+  {
+    "name": "dummy_expires_after_mainnet",
+    "action": {
+      "type": "dummy",
+      "num": 100000000000
+    },
+    "nonce": 0,
+    "vault_address": null,
+    "expires_after": 1700000000000,
+    "is_mainnet": true,
+    "expected_r": "0x68691edfbce891b286ef07c6dd6049499c40ea91d7d3598e97f3762e3326599c",
+    "expected_s": "0x12e82ae18746955c9f826bc62542c0958cfdb925a0a464d6057ca0f8da087c9b",
+    "expected_v": 28,
+    "expected_address": "0x14791697260e4c9a71f18484c9f997b308e59325"
+  },
+  {
+    "name": "dummy_expires_after_testnet",
+    "action": {
+      "type": "dummy",
+      "num": 100000000000
+    },
+    "nonce": 0,
+    "vault_address": null,
+    "expires_after": 1700000000000,
+    "is_mainnet": false,
+    "expected_r": "0x213afb588271613e44d2cf7d1230b853af98e8e60327d15bab4f1d8534a88088",
+    "expected_s": "0x65f9fc75ec863848831b7d0c7b1f5258fbd8f61e2ea176c1c4635b5872801797",
+    "expected_v": 28,
+    "expected_address": "0x14791697260e4c9a71f18484c9f997b308e59325"
+  },
+  {
+    "name": "order_expires_after_mainnet",
+    "action": {
+      "type": "order",
+      "orders": [
+        {
+          "a": 1,
+          "b": true,
+          "p": "100",
+          "s": "100",
+          "r": false,
+          "t": {
+            "limit": {
+              "tif": "Ioc"
+            }
+          }
+        }
+      ],
+      "grouping": "na"
+    },
+    "nonce": 5,
+    "vault_address": null,
+    "expires_after": 1700000000000,
+    "is_mainnet": true,
+    "expected_r": "0x8d8b85ff1ec98a103d2e02aff03366e14c03b1bc1b15589e5dacd96d3a25f1e",
+    "expected_s": "0x392ba2243bf659702783ff47c84bed9a86cba196f7214ff5eb1828ef96f25908",
+    "expected_v": 28,
+    "expected_address": "0x14791697260e4c9a71f18484c9f997b308e59325"
+  },
+  {
+    "name": "order_expires_after_testnet",
+    "action": {
+      "type": "order",
+      "orders": [
+        {
+          "a": 1,
+          "b": true,
+          "p": "100",
+          "s": "100",
+          "r": false,
+          "t": {
+            "limit": {
+              "tif": "Ioc"
+            }
+          }
+        }
+      ],
+      "grouping": "na"
+    },
+    "nonce": 5,
+    "vault_address": null,
+    "expires_after": 1700000000000,
+    "is_mainnet": false,
+    "expected_r": "0xc775b9a9538315da2444b7ebd58eb7114cf58bd75af1624ebbef7fbff49aa3f",
+    "expected_s": "0x466e88a8f3a5d4a6adc21cffbb6e34b4db8afcd66dcca399d022319d58bc87dc",
+    "expected_v": 27,
+    "expected_address": "0x14791697260e4c9a71f18484c9f997b308e59325"
+  },
+  {
+    "name": "order_with_cloid_vault_expires_after_mainnet",
+    "action": {
+      "type": "order",
+      "orders": [
+        {
+          "a": 1,
+          "b": false,
+          "p": "2500",
+          "s": "50",
+          "r": false,
+          "t": {
+            "limit": {
+              "tif": "Ioc"
+            }
+          },
+          "c": "0x00000000000000000000000000000002"
+        }
+      ],
+      "grouping": "na"
+    },
+    "nonce": 9,
+    "vault_address": "0x1719884eb866cb12b2287399b15f7db5e7d775ea",
+    "expires_after": 1800000000001,
+    "is_mainnet": true,
+    "expected_r": "0x67eb339bc2a8b0800c6e71042730b4dd82017a5dd8b3de35670a378b16e55a00",
+    "expected_s": "0x675d4a6fb2c73efd64987a4d784d79d6216144bb9c328a372932b60f2a852935",
+    "expected_v": 27,
+    "expected_address": "0x14791697260e4c9a71f18484c9f997b308e59325"
+  },
+  {
+    "name": "order_with_cloid_vault_expires_after_testnet",
+    "action": {
+      "type": "order",
+      "orders": [
+        {
+          "a": 1,
+          "b": false,
+          "p": "2500",
+          "s": "50",
+          "r": false,
+          "t": {
+            "limit": {
+              "tif": "Ioc"
+            }
+          },
+          "c": "0x00000000000000000000000000000002"
+        }
+      ],
+      "grouping": "na"
+    },
+    "nonce": 9,
+    "vault_address": "0x1719884eb866cb12b2287399b15f7db5e7d775ea",
+    "expires_after": 1800000000001,
+    "is_mainnet": false,
+    "expected_r": "0xa86abb7a0bb86901714c84b3ffaf323ca21c5f82539761a605b1acdbc269ed83",
+    "expected_s": "0xcc7f98e74b72812150a99b457a7eee78f31aff838dd90f960e8f4904d030269",
+    "expected_v": 28,
+    "expected_address": "0x14791697260e4c9a71f18484c9f997b308e59325"
+  },
+  {
+    "name": "dummy_expires_after_zero_mainnet",
+    "action": {
+      "type": "dummy",
+      "num": 100000000000
+    },
+    "nonce": 1,
+    "vault_address": null,
+    "expires_after": 0,
+    "is_mainnet": true,
+    "expected_r": "0x852dec8b0188748027a9297e9f43a72564e4c2e540e7c81d93cdbce5db6324bb",
+    "expected_s": "0x42a7640885ab15a916253a28f016c23c91a71cc45f58508ab1df6c737428ba30",
+    "expected_v": 28,
+    "expected_address": "0x14791697260e4c9a71f18484c9f997b308e59325"
   }
 ]

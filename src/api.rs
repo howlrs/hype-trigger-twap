@@ -26,10 +26,17 @@ pub trait HlApi: Send + Sync {
     /// An `Err(HlError::Network(_))` means the outcome is UNKNOWN, not that the
     /// order was not placed. The returned `u64` is the nonce that was signed,
     /// which lets a caller (and a test) prove a resend used fresh material.
+    ///
+    /// `expires_after_ms` (Issue #2) is the run-level `ExecutionDeadline`'s
+    /// wall-clock Unix ms expiry — the SAME value must reach both the signed
+    /// action hash and the `/exchange` body's `expiresAfter` field. Every
+    /// caller of this trait method already re-checked the deadline before
+    /// calling, per `src/twap.rs`'s `ExecutionDeadline::check`.
     async fn place_order_once(
         &self,
         intent: &OrderIntent,
         asset: u32,
+        expires_after_ms: u64,
     ) -> Result<(u64, PlaceOutcome), HlError>;
 
     /// `/exchange cancelByCloid` — sent exactly once; failure is non-fatal.
@@ -60,8 +67,9 @@ impl HlApi for HlClient {
         &self,
         intent: &OrderIntent,
         asset: u32,
+        expires_after_ms: u64,
     ) -> Result<(u64, PlaceOutcome), HlError> {
-        HlClient::place_order_once(self, intent, asset).await
+        HlClient::place_order_once(self, intent, asset, expires_after_ms).await
     }
 
     async fn cancel_by_cloid(&self, intent: &CancelIntent, asset: u32) -> Result<(), HlError> {
@@ -98,6 +106,10 @@ pub enum Call {
         px: Decimal,
         cloid: Cloid,
         nonce: u64,
+        /// The `expiresAfter` value this place was signed and sent with
+        /// (Issue #2) — recorded so a test can assert every place used the
+        /// SAME run-level expiry, including resends.
+        expires_after_ms: u64,
     },
     Cancel {
         cloid: Cloid,
@@ -233,6 +245,7 @@ impl HlApi for ScriptedApi {
         &self,
         intent: &OrderIntent,
         _asset: u32,
+        expires_after_ms: u64,
     ) -> Result<(u64, PlaceOutcome), HlError> {
         let nonce = self.nonce.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.record(Call::Place {
@@ -240,6 +253,7 @@ impl HlApi for ScriptedApi {
             px: intent.px,
             cloid: intent.cloid,
             nonce,
+            expires_after_ms,
         });
         match lock(&self.places).pop_front() {
             Some(r) => r.map(|o| (nonce, o)),

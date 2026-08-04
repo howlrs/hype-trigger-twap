@@ -225,7 +225,10 @@ async fn w1_exchange_transport_failure_is_never_blind_retried() {
         .await;
 
     let client = make_client(&server);
-    let err = client.place_order(&intent(), 2).await.unwrap_err();
+    let err = client
+        .place_order(&intent(), 2, 1_700_000_000_000)
+        .await
+        .unwrap_err();
     assert!(matches!(err, HlError::Network(_)), "got {err:?}");
     m.assert_async().await;
 }
@@ -301,8 +304,14 @@ async fn w1_place_reports_the_nonce_so_a_resend_can_be_proven_fresh() {
         .await;
 
     let client = make_client(&server);
-    let (n1, o1) = client.place_order_once(&intent(), 2).await.unwrap();
-    let (n2, _) = client.place_order_once(&intent(), 2).await.unwrap();
+    let (n1, o1) = client
+        .place_order_once(&intent(), 2, 1_700_000_000_000)
+        .await
+        .unwrap();
+    let (n2, _) = client
+        .place_order_once(&intent(), 2, 1_700_000_000_000)
+        .await
+        .unwrap();
     assert!(matches!(o1, PlaceOutcome::Filled { .. }));
     assert!(
         n2 > n1,
@@ -331,7 +340,7 @@ async fn f2_stale_pre_flight_book_is_retried_then_hard_stops() {
     let client = read_only_client(&server);
     let err = tokio::time::timeout(
         Duration::from_secs(30),
-        fetch_fresh_book(&client, &Symbol::new("HYPE"), 3000),
+        fetch_fresh_book(&client, &Symbol::new("HYPE"), 3000, None),
     )
     .await
     .expect("stale retry timed out")
@@ -359,7 +368,7 @@ async fn f2_fresh_pre_flight_book_passes_the_gate_on_the_first_try() {
         .await;
 
     let client = read_only_client(&server);
-    let book = fetch_fresh_book(&client, &Symbol::new("HYPE"), 3000)
+    let book = fetch_fresh_book(&client, &Symbol::new("HYPE"), 3000, None)
         .await
         .unwrap();
     assert_eq!(book.mid, dec!(50.0));
@@ -381,7 +390,7 @@ async fn f2_stale_book_is_accepted_when_the_gate_is_disabled() {
         .await;
 
     let client = read_only_client(&server);
-    let book = fetch_fresh_book(&client, &Symbol::new("HYPE"), 0)
+    let book = fetch_fresh_book(&client, &Symbol::new("HYPE"), 0, None)
         .await
         .unwrap();
     assert_eq!(book.mid, dec!(50.0));

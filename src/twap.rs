@@ -95,6 +95,142 @@ const UNKNOWN_OID_MAX_ATTEMPTS: u32 = 8;
 
 pub const READ_ONLY_BANNER: &str = "=== READ-ONLY MODE: NO ORDERS ARE SENT ===";
 
+/// The absolute execution-phase deadline for a TWAP run (Issue #2).
+///
+/// This is DELIBERATELY a different concept from the `--expire-after`
+/// WAIT-phase cutoff in `src/trigger.rs` (Issue #8): that flag bounds how
+/// long the tool will wait for a trigger to fire BEFORE any slice is placed
+/// (and aborts with nothing sent if it elapses). `ExecutionDeadline` bounds
+/// the slice loop itself, AFTER the trigger has already fired — it is the
+/// enforcement mechanism behind the `--duration` hard-window invariant
+/// (`docs/DESIGN.md` "執行ウィンドウは厳格"). They are constructed at
+/// different times from different clocks-of-record and must never be
+/// conflated.
+///
+/// Two clocks are tracked, for two different purposes:
+/// - `monotonic`: a [`tokio::time::Instant`] used for every LOCAL decision —
+///   "may I still place / resend?", "how much retry budget is left?". Never
+///   affected by wall-clock adjustments (NTP step, DST, operator clock
+///   changes), which is exactly why it is the one that gates local control
+///   flow.
+/// - `expires_after_ms`: the wall-clock Unix ms sent to Hyperliquid, both in
+///   the signed action hash and the `/exchange` body's `expiresAfter` field.
+///   This is the EXCHANGE-side half of the hard window — HL enforces it
+///   independently of whatever our local clock thinks, which is the point:
+///   two independent enforcers of the same invariant, on two different
+///   clocks. See `docs/DESIGN.md` for the full local-vs-server responsibility
+///   split and the clock-skew fail-closed rule this pairs with.
+#[derive(Debug, Clone, Copy)]
+pub struct ExecutionDeadline {
+    monotonic: tokio::time::Instant,
+    expires_after_ms: u64,
+}
+
+impl ExecutionDeadline {
+    /// Construct from the run's monotonic start and its `--duration`.
+    ///
+    /// `expires_after_ms` is derived from the CURRENT wall clock plus the
+    /// remaining monotonic duration at construction time (i.e. call this
+    /// once, at `run_twap`'s start, not per-slice — `wall_now` and `start`
+    /// must be read at (approximately) the same instant for the two clocks to
+    /// stay in correspondence).
+    pub fn new(start: tokio::time::Instant, duration: Duration, wall_now_ms: u64) -> Self {
+        let monotonic = start + duration;
+        let expires_after_ms = wall_now_ms.saturating_add(duration.as_millis() as u64);
+        Self {
+            monotonic,
+            expires_after_ms,
+        }
+    }
+
+    /// Construct directly from both clock values. Exposed for tests that need
+    /// to control the wall-clock expiry independently of `Instant::now`
+    /// (virtual time).
+    #[cfg(test)]
+    pub fn from_parts(monotonic: tokio::time::Instant, expires_after_ms: u64) -> Self {
+        Self {
+            monotonic,
+            expires_after_ms,
+        }
+    }
+
+    /// The wall-clock Unix ms to sign into every order this run sends
+    /// (`expiresAfter`, both in the action hash and the `/exchange` body).
+    /// Constant for the whole run — a resend reuses this exact value (PM
+    /// decision), it does NOT get a fresh expiry.
+    pub fn expires_after_ms(&self) -> u64 {
+        self.expires_after_ms
+    }
+
+    /// Monotonic time remaining until the deadline. `Duration::ZERO` once it
+    /// has passed (never negative).
+    pub fn remaining(&self, now: tokio::time::Instant) -> Duration {
+        self.monotonic.saturating_duration_since(now)
+    }
+
+    /// True once the monotonic deadline has passed.
+    pub fn has_passed(&self, now: tokio::time::Instant) -> bool {
+        now >= self.monotonic
+    }
+
+    /// Re-check immediately before a place OR a resend (Issue #2 PM
+    /// decision). `Err` means: do not place, do not resend — status queries
+    /// and cancels remain allowed, but this call site must stop here.
+    pub fn check_before_send(&self, now: tokio::time::Instant) -> Result<(), HlError> {
+        if self.has_passed(now) {
+            Err(HlError::InvalidResponse(format!(
+                "execution deadline elapsed ({}ms ago); refusing to place or resend \
+                 (status queries and cancels remain allowed)",
+                now.saturating_duration_since(self.monotonic).as_millis()
+            )))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Current wall-clock time as Unix ms. Small wrapper so call sites don't
+/// repeat the `SystemTime` dance and so tests can see the one place this is
+/// read from.
+pub fn wall_clock_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+/// Maximum tolerated |local wall clock − HL server clock| before a LIVE
+/// preflight fails closed (Issue #2 PM decision). Only enforced for live
+/// (non-read-only, non-paper) runs — see `docs/DESIGN.md` "クロックずれ" and
+/// `docs/DEVELOPMENT.md` for the NTP dependency this implies operationally.
+pub const MAX_CLOCK_SKEW_MS: i64 = 5_000;
+
+/// Compare local wall-clock time against an `l2Book` response's server
+/// timestamp (Issue #2). Called ONLY at live preflight, never in read-only /
+/// paper mode — a dry run signs nothing, so a bad local clock cannot corrupt
+/// an `expiresAfter` that is never sent.
+///
+/// `expiresAfter` is a wall-clock Unix ms value trusted by BOTH the local
+/// `ExecutionDeadline` and Hyperliquid's own exchange-side enforcement of the
+/// same field. If the operator's clock is skewed against HL's by more than
+/// [`MAX_CLOCK_SKEW_MS`], the locally-computed `expiresAfter` could expire
+/// far earlier or later than intended relative to HL's own clock — silently
+/// shortening or (worse) extending the effective hard window. Failing closed
+/// here, rather than silently trusting a skewed clock, is the whole point of
+/// signing a wall-clock expiry at all.
+pub fn check_clock_skew(local_wall_now_ms: i64, server_ts_ms: i64) -> Result<(), HlError> {
+    let skew_ms = local_wall_now_ms - server_ts_ms;
+    if skew_ms.abs() > MAX_CLOCK_SKEW_MS {
+        return Err(HlError::InvalidConfig(format!(
+            "local clock is skewed {skew_ms}ms from the Hyperliquid server clock \
+             (tolerance ±{MAX_CLOCK_SKEW_MS}ms); refusing to proceed in live mode — \
+             the signed expiresAfter would not mean what this run expects it to. \
+             Check NTP sync on this host (see docs/DEVELOPMENT.md)."
+        )));
+    }
+    Ok(())
+}
+
 /// Everything the loop needs, resolved before the first slice.
 pub struct TwapPlan {
     pub symbol: Symbol,
@@ -426,13 +562,32 @@ impl FillStats {
 /// [`ValidatedMarketSnapshot::validate`] — the same policy the trigger wait
 /// loop uses — so a snapshot that clears this gate is fit to size an order or
 /// satisfy a price trigger.
+///
+/// `deadline` (Issue #2) is `None` for callers outside the execution loop
+/// (pre-flight, price-trigger polling — there is no `ExecutionDeadline` yet
+/// at those points). Inside the slice loop it is `Some`, and the retry budget
+/// is capped by whatever monotonic time remains: a book fetch must not be
+/// allowed to burn the STALE_BOOK_RETRIES × STALE_BOOK_RETRY_INTERVAL budget
+/// (up to several seconds) past a deadline that only had, say, 200ms left —
+/// that is exactly the bug this issue exists to close (a slice that started
+/// just inside the window but placed well outside it).
 pub async fn fetch_fresh_book(
     client: &dyn HlApi,
     symbol: &Symbol,
     max_age_ms: u64,
+    deadline: Option<&ExecutionDeadline>,
 ) -> Result<ValidatedMarketSnapshot, HlError> {
     let mut last_err: Option<HlError> = None;
     for attempt in 0..=STALE_BOOK_RETRIES {
+        if let Some(dl) = deadline {
+            if dl.has_passed(tokio::time::Instant::now()) {
+                return Err(HlError::InvalidResponse(format!(
+                    "execution deadline elapsed while fetching a fresh book (attempt {}); \
+                     refusing to spend further retry budget",
+                    attempt + 1
+                )));
+            }
+        }
         let book = client.fetch_l2_book(symbol).await?;
         match ValidatedMarketSnapshot::validate(&book, symbol, max_age_ms) {
             Ok(snapshot) => return Ok(snapshot),
@@ -448,7 +603,23 @@ pub async fn fetch_fresh_book(
             }
         }
         if attempt < STALE_BOOK_RETRIES {
-            tokio::time::sleep(STALE_BOOK_RETRY_INTERVAL).await;
+            let sleep_for = match deadline {
+                // Never sleep past the deadline: capping the sleep itself
+                // (rather than only checking at the top of the next
+                // iteration) means the NEXT attempt's deadline check fires
+                // promptly instead of after a full unclipped retry interval.
+                Some(dl) => {
+                    STALE_BOOK_RETRY_INTERVAL.min(dl.remaining(tokio::time::Instant::now()))
+                }
+                None => STALE_BOOK_RETRY_INTERVAL,
+            };
+            if sleep_for.is_zero() {
+                return Err(HlError::InvalidResponse(
+                    "execution deadline elapsed; refusing to spend further retry budget on a book fetch"
+                        .into(),
+                ));
+            }
+            tokio::time::sleep(sleep_for).await;
         }
     }
     Err(HlError::InvalidResponse(format!(
@@ -565,6 +736,7 @@ const RECONCILE_DELAY: Duration = Duration::from_millis(500);
 /// A zero size is a legitimate outcome (an IOC that rested and was cancelled
 /// without trading), so there is no separate "nothing happened" variant — every
 /// resolved slice flows through one accounting path.
+#[derive(Debug)]
 struct SliceOutcome {
     sz: Decimal,
     px: Decimal,
@@ -588,14 +760,28 @@ struct SliceOutcome {
 ///   FRESH nonce and send again (bounded);
 /// - if reconciliation itself keeps failing, hard-stop with the ambiguity
 ///   stated plainly. Guessing here risks a double fill, which cannot be undone.
+///
+/// `deadline` (Issue #2): re-checked immediately before EVERY place attempt
+/// in this function — the initial send and any resend after a safe-resend
+/// reconciliation. Once it has passed, no further place/resend happens; the
+/// reconciliation that is already in flight (status polling via
+/// `reconcile_by_cloid` / `recover_resting_fill`) still runs to completion,
+/// since status queries and cancels remain allowed past the deadline (PM
+/// decision) — only a NEW place or resend is forbidden.
 async fn place_slice_reconciled(
     client: &dyn HlApi,
     plan: &TwapPlan,
     intent: &OrderIntent,
+    deadline: &ExecutionDeadline,
 ) -> Result<SliceOutcome, HlError> {
+    deadline.check_before_send(tokio::time::Instant::now())?;
+
     let mut attempt = 0u32;
     loop {
-        let send_err = match client.place_order_once(intent, plan.asset_index).await {
+        let send_err = match client
+            .place_order_once(intent, plan.asset_index, deadline.expires_after_ms())
+            .await
+        {
             Ok((nonce, outcome @ PlaceOutcome::Filled { .. })) => {
                 // Issue #7: the exchange response is a trusted boundary —
                 // overfill, non-positive avgPx, and a fill outside the
@@ -649,8 +835,14 @@ async fn place_slice_reconciled(
                     px: vf.avg_px.unwrap_or(intent.px),
                 });
             }
-            // HL never received it — safe to re-sign with a fresh nonce.
+            // HL never received it — safe to re-sign with a fresh nonce,
+            // PROVIDED the execution deadline has not passed in the
+            // meantime (Issue #2): reconciliation itself can take seconds
+            // (RECONCILE_DELAY + the unknownOid streak window), so the
+            // deadline must be re-checked here, immediately before the
+            // resend, not just once at the top of this function.
             Ok(None) => {
+                deadline.check_before_send(tokio::time::Instant::now())?;
                 attempt += 1;
                 if attempt > PLACE_RESEND_LIMIT {
                     return Err(HlError::Network(format!(
@@ -768,6 +960,13 @@ async fn reconcile_by_cloid(
 /// Run the TWAP loop (§8).
 pub async fn run_twap(client: &dyn HlApi, plan: &TwapPlan) -> TwapReport {
     let start = tokio::time::Instant::now();
+    // Issue #2: the run-level ExecutionDeadline, constructed ONCE at the
+    // very start of execution so `monotonic` and `expires_after_ms` are
+    // read from the two clocks at (as close as possible to) the same
+    // instant. Every place/resend for the ENTIRE run — including the final
+    // slice — checks against this same value; a resend does NOT get a fresh
+    // expiry (PM decision).
+    let exec_deadline = ExecutionDeadline::new(start, plan.duration, wall_clock_now_ms());
     let mut stats = FillStats::default();
     let mut slices_executed = 0u32;
     let mut slices_skipped = 0u32;
@@ -778,7 +977,7 @@ pub async fn run_twap(client: &dyn HlApi, plan: &TwapPlan) -> TwapReport {
             println!("{READ_ONLY_BANNER}");
         }
 
-        let deadline = slice_deadline(start, plan.duration, slice_idx, plan.slices);
+        let slice_end = slice_deadline(start, plan.duration, slice_idx, plan.slices);
 
         // Hard window cut-off (§8, T2): never place past the requested
         // duration — the final slice included.
@@ -790,7 +989,14 @@ pub async fn run_twap(client: &dyn HlApi, plan: &TwapPlan) -> TwapReport {
         // the exemption let the LARGEST order fire the FURTHEST outside the
         // window the operator asked for. A normal run reaches its last slice
         // inside the window anyway, so removing it changes nothing there.
-        if start.elapsed() >= plan.duration {
+        //
+        // Issue #2: this check is now backed by `exec_deadline`, the same
+        // ExecutionDeadline re-checked immediately before the place call
+        // below and before any ambiguous-send resend — so a slice that
+        // passes THIS check but then loses time to a book-fetch retry or a
+        // reconciliation round-trip is caught again right before it would
+        // actually send.
+        if exec_deadline.has_passed(tokio::time::Instant::now()) {
             abort_reason = Some(format!(
                 "duration {} elapsed at slice {slice_idx}/{}",
                 humantime::format_duration(plan.duration),
@@ -799,7 +1005,14 @@ pub async fn run_twap(client: &dyn HlApi, plan: &TwapPlan) -> TwapReport {
             break;
         }
 
-        let snapshot = match fetch_fresh_book(client, &plan.symbol, plan.max_book_age_ms).await {
+        let snapshot = match fetch_fresh_book(
+            client,
+            &plan.symbol,
+            plan.max_book_age_ms,
+            Some(&exec_deadline),
+        )
+        .await
+        {
             Ok(s) => s,
             Err(e) => {
                 abort_reason = Some(format!("book fetch failed at slice {slice_idx}: {e}"));
@@ -827,7 +1040,7 @@ pub async fn run_twap(client: &dyn HlApi, plan: &TwapPlan) -> TwapReport {
             SliceDecision::SkipAhead => {
                 slices_skipped += 1;
                 tracing::info!(slice = slice_idx, "slice skipped: already at target");
-                sleep_until(deadline).await;
+                sleep_until(slice_end).await;
                 continue;
             }
             SliceDecision::SkipBelowMinNotional { sz, notional } => {
@@ -851,7 +1064,7 @@ pub async fn run_twap(client: &dyn HlApi, plan: &TwapPlan) -> TwapReport {
                         "slice below min notional; carrying to next slice"
                     );
                 }
-                sleep_until(deadline).await;
+                sleep_until(slice_end).await;
                 continue;
             }
         };
@@ -873,7 +1086,7 @@ pub async fn run_twap(client: &dyn HlApi, plan: &TwapPlan) -> TwapReport {
             // Assume a full fill so the dry run walks the same slice path.
             stats.add(order_sz, px);
             slices_executed += 1;
-            sleep_until(deadline).await;
+            sleep_until(slice_end).await;
             continue;
         }
 
@@ -895,7 +1108,7 @@ pub async fn run_twap(client: &dyn HlApi, plan: &TwapPlan) -> TwapReport {
             "placing IOC slice"
         );
 
-        match place_slice_reconciled(client, plan, &intent).await {
+        match place_slice_reconciled(client, plan, &intent, &exec_deadline).await {
             // Every fill — direct, recovered from a resting order, or
             // reconciled after an ambiguous send — is credited here EXACTLY
             // ONCE (T3/T5). There is no second accounting path.
@@ -931,7 +1144,7 @@ pub async fn run_twap(client: &dyn HlApi, plan: &TwapPlan) -> TwapReport {
             break;
         }
 
-        sleep_until(deadline).await;
+        sleep_until(slice_end).await;
     }
 
     TwapReport {
@@ -1566,9 +1779,10 @@ mod loop_tests {
                 &self,
                 i: &OrderIntent,
                 a: u32,
+                e: u64,
             ) -> Result<(u64, PlaceOutcome), HlError> {
                 self.place_times.lock().unwrap().push(self.start.elapsed());
-                let r = self.inner.place_order_once(i, a).await;
+                let r = self.inner.place_order_once(i, a, e).await;
                 tokio::time::sleep(Duration::from_secs(300)).await;
                 r
             }
@@ -1651,8 +1865,9 @@ mod loop_tests {
                 &self,
                 i: &OrderIntent,
                 a: u32,
+                e: u64,
             ) -> Result<(u64, PlaceOutcome), HlError> {
-                let r = self.inner.place_order_once(i, a).await;
+                let r = self.inner.place_order_once(i, a, e).await;
                 tokio::time::sleep(Duration::from_secs(900)).await;
                 r
             }
@@ -1705,6 +1920,339 @@ mod loop_tests {
         assert!(reason.contains("elapsed"), "{reason}");
         assert!(reason.contains("slice 2/2"), "{reason}");
         assert_eq!(report.exit_code(), 1);
+    }
+
+    // === Issue #2: ExecutionDeadline ===
+
+    #[test]
+    fn execution_deadline_check_before_send_passes_before_the_deadline() {
+        let now = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
+        let dl = ExecutionDeadline::from_parts(start + Duration::from_secs(10), 1_700_000_000_000);
+        assert!(dl.check_before_send(tokio::time::Instant::now()).is_ok());
+        assert!(!dl.has_passed(tokio::time::Instant::now()));
+        // remaining() should be close to 10s (paused-clock tests use exact
+        // instants elsewhere; here we just sanity-check the ordering holds).
+        let _ = now;
+    }
+
+    #[test]
+    fn execution_deadline_check_before_send_fails_after_the_deadline() {
+        let start = tokio::time::Instant::now();
+        // A deadline already in the past relative to "now".
+        let dl = ExecutionDeadline::from_parts(start, 1_700_000_000_000);
+        // Force "now" to be after the deadline by using a later Instant.
+        let later = start + Duration::from_millis(1);
+        assert!(dl.has_passed(later));
+        let err = dl.check_before_send(later).unwrap_err();
+        assert!(
+            format!("{err}").contains("deadline"),
+            "error should mention the deadline: {err}"
+        );
+    }
+
+    #[test]
+    fn execution_deadline_expires_after_ms_is_wall_clock_start_plus_duration() {
+        let start = tokio::time::Instant::now();
+        let dl = ExecutionDeadline::new(start, Duration::from_secs(60), 1_700_000_000_000);
+        assert_eq!(dl.expires_after_ms(), 1_700_000_060_000);
+    }
+
+    #[test]
+    fn clock_skew_within_tolerance_is_accepted() {
+        assert!(check_clock_skew(1_700_000_000_000, 1_700_000_004_000).is_ok());
+        assert!(check_clock_skew(1_700_000_000_000, 1_699_999_996_000).is_ok());
+        // Exactly at the tolerance boundary is still accepted (`>` not `>=`).
+        assert!(check_clock_skew(1_700_000_000_000, 1_700_000_005_000).is_ok());
+        assert!(check_clock_skew(1_700_000_000_000, 1_699_999_995_000).is_ok());
+    }
+
+    #[test]
+    fn clock_skew_beyond_tolerance_fails_closed() {
+        let err = check_clock_skew(1_700_000_000_000, 1_700_000_005_001).unwrap_err();
+        assert!(matches!(err, HlError::InvalidConfig(_)));
+        let msg = format!("{err}");
+        assert!(msg.contains("skew"), "{msg}");
+        assert!(msg.contains("NTP"), "{msg}");
+
+        // Negative direction (local clock is ahead) fails closed too.
+        let err2 = check_clock_skew(1_700_000_005_001, 1_700_000_000_000).unwrap_err();
+        assert!(matches!(err2, HlError::InvalidConfig(_)));
+    }
+
+    // === Issue #2 acceptance criterion 1: a book-fetch retry that crosses
+    // the deadline must place ZERO orders after the deadline ===
+
+    #[tokio::test(start_paused = true)]
+    async fn issue2_book_fetch_crossing_the_deadline_places_zero_orders_after_it() {
+        // Every book fetch is slow enough that, combined with the retry
+        // interval, the SECOND slice's book fetch starts before the deadline
+        // but cannot possibly finish an attempt before it. The reproduction
+        // from the issue body: "T+59.5s enters the final slice, then
+        // fetch_fresh_book's retry/delay burns >1s past T+60s".
+        struct SlowBookApi {
+            inner: ScriptedApi,
+            book_delay: Duration,
+        }
+
+        #[async_trait::async_trait]
+        impl HlApi for SlowBookApi {
+            async fn fetch_l2_book(&self, s: &Symbol) -> Result<OrderBook, HlError> {
+                tokio::time::sleep(self.book_delay).await;
+                self.inner.fetch_l2_book(s).await
+            }
+            async fn place_order_once(
+                &self,
+                i: &OrderIntent,
+                a: u32,
+                e: u64,
+            ) -> Result<(u64, PlaceOutcome), HlError> {
+                self.inner.place_order_once(i, a, e).await
+            }
+            async fn cancel_by_cloid(&self, i: &CancelIntent, a: u32) -> Result<(), HlError> {
+                self.inner.cancel_by_cloid(i, a).await
+            }
+            async fn fetch_order_status(
+                &self,
+                u: &Address,
+                o: OrderId,
+            ) -> Result<Option<OrderStatusFill>, HlError> {
+                self.inner.fetch_order_status(u, o).await
+            }
+            async fn fetch_order_status_by_cloid(
+                &self,
+                u: &Address,
+                c: Cloid,
+            ) -> Result<Option<OrderStatusFill>, HlError> {
+                self.inner.fetch_order_status_by_cloid(u, c).await
+            }
+        }
+
+        // 1 slice over a 10s window. The book fetch takes 30s — well past the
+        // deadline — reproducing the issue body's scenario directly: the
+        // slice enters (passes the initial hard-window check at T=0 < 10s),
+        // but the subsequent book fetch alone blows past the deadline before
+        // a place could ever be attempted.
+        let inner = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(filled(dec!(5), dec!(50)));
+        let api = SlowBookApi {
+            inner,
+            book_delay: Duration::from_secs(30),
+        };
+
+        let mut p = plan(false);
+        p.slices = 1;
+        p.per_slice = dec!(5);
+        p.total_adjusted = dec!(5);
+        p.total_requested = dec!(5);
+        p.duration = Duration::from_secs(10);
+
+        let report = run_twap(&api, &p).await;
+
+        // The load-bearing assertion: zero places occur when the book fetch
+        // alone spans past the monotonic deadline.
+        assert_eq!(
+            api.inner.place_count(),
+            0,
+            "a book fetch that cannot complete before the deadline must never reach a place"
+        );
+        let reason = report
+            .abort_reason
+            .clone()
+            .expect("a book fetch stuck past the deadline must abort, not silently succeed");
+        assert!(
+            reason.contains("book fetch failed") || reason.contains("elapsed"),
+            "{reason}"
+        );
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn issue2_fetch_fresh_book_retry_budget_is_capped_by_remaining_deadline_time() {
+        // Directly exercises fetch_fresh_book's deadline-aware retry cap
+        // (not through run_twap): an invalid book is returned every time, so
+        // fetch_fresh_book would normally retry STALE_BOOK_RETRIES times at
+        // STALE_BOOK_RETRY_INTERVAL (1s) each = ~3s. With only 200ms left on
+        // the deadline, it must give up almost immediately rather than
+        // spending the full ~3s retry budget.
+        let bad_book = OrderBook {
+            coin: "WRONG".to_string(), // fails ValidatedMarketSnapshot::validate
+            bids: vec![],
+            asks: vec![],
+            time_ms: 0,
+        };
+        let api = ScriptedApi::new().with_default_book(bad_book);
+
+        let start = tokio::time::Instant::now();
+        let dl =
+            ExecutionDeadline::from_parts(start + Duration::from_millis(200), 1_700_000_000_000);
+
+        let began = tokio::time::Instant::now();
+        let err = fetch_fresh_book(&api, &Symbol::new("HYPE"), 0, Some(&dl))
+            .await
+            .unwrap_err();
+        let took = began.elapsed();
+
+        assert!(matches!(err, HlError::InvalidResponse(_)));
+        // Must give up close to the 200ms budget, nowhere near the ~3s the
+        // full unbudgeted retry schedule would take.
+        assert!(
+            took <= Duration::from_millis(500),
+            "retry budget was not capped by the deadline: took {took:?}"
+        );
+    }
+
+    // === Issue #2 acceptance criterion 2: an ambiguous-send reconciliation
+    // that crosses the deadline must not attempt a second place; the
+    // original reconciliation (status polling) still runs to completion ===
+
+    #[tokio::test(start_paused = true)]
+    async fn issue2_ambiguous_send_crossing_deadline_does_not_resend() {
+        // Slice 1's place comes back as a transport failure (ambiguous). The
+        // RECONCILE_DELAY (500ms) plus the unknownOid streak accumulation
+        // (UNKNOWN_OID_MIN_CONSECUTIVE observations spanning
+        // UNKNOWN_OID_MIN_WINDOW = 2s) takes long enough to cross a very
+        // short deadline. Reconciliation must still run to completion
+        // (status polling is always allowed) and correctly conclude
+        // "HL never received it" — but the resend that would normally follow
+        // must NOT happen, because by the time reconciliation resolves the
+        // deadline has passed.
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(Err(HlError::Network("connection reset".into())))
+            // unknownOid streak: 3 consecutive observations spanning >= 2s
+            // (poll interval 1100ms) resolves reconciliation as "safe to
+            // resend" — except the deadline will have passed by then.
+            .push_status(Ok(None))
+            .push_status(Ok(None))
+            .push_status(Ok(None));
+
+        let plan_val = plan(false);
+        let intent = OrderIntent {
+            cloid: Cloid::new(),
+            symbol: plan_val.symbol.clone(),
+            side: plan_val.side,
+            px: dec!(50),
+            sz: dec!(5),
+            tif: Tif::Ioc,
+            reduce_only: false,
+        };
+
+        // Deadline passes well before reconciliation can complete (which
+        // takes RECONCILE_DELAY 500ms + at least 2 * 1100ms = ~2.7s), but
+        // after the INITIAL check_before_send at the top of
+        // place_slice_reconciled (which must be allowed to attempt the first
+        // send at all, matching "sent exactly once" W1 semantics).
+        let start = tokio::time::Instant::now();
+        let dl =
+            ExecutionDeadline::from_parts(start + Duration::from_millis(800), 1_700_000_000_000);
+
+        let err = place_slice_reconciled(&api, &plan_val, &intent, &dl)
+            .await
+            .unwrap_err();
+
+        // Reconciliation ran to completion (all 3 status polls were consumed
+        // — proven by place_slice_reconciled not erroring out of
+        // reconcile_by_cloid itself, but instead reaching the deadline
+        // re-check AFTER `Ok(None)` was returned).
+        assert_eq!(
+            api.place_count(),
+            1,
+            "exactly the original send — no resend after the deadline passed"
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("deadline"),
+            "the resend must be refused specifically for having crossed the \
+             deadline, not some other error: {msg}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn issue2_ambiguous_send_resend_still_happens_within_the_deadline() {
+        // Control case for the test above: same scenario, but with a
+        // deadline generous enough that reconciliation resolves safely
+        // BEFORE it passes. The resend must still happen — Issue #2 must not
+        // regress the Issue #7/W1 safe-resend policy for healthy runs.
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(Err(HlError::Network("connection reset".into())))
+            .push_status(Ok(None))
+            .push_status(Ok(None))
+            .push_status(Ok(None))
+            .push_place(filled(dec!(5), dec!(50)));
+
+        let plan_val = plan(false);
+        let intent = OrderIntent {
+            cloid: Cloid::new(),
+            symbol: plan_val.symbol.clone(),
+            side: plan_val.side,
+            px: dec!(50),
+            sz: dec!(5),
+            tif: Tif::Ioc,
+            reduce_only: false,
+        };
+
+        let start = tokio::time::Instant::now();
+        let dl = ExecutionDeadline::from_parts(start + Duration::from_secs(60), 1_700_000_000_000);
+
+        let outcome = place_slice_reconciled(&api, &plan_val, &intent, &dl)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.sz, dec!(5));
+        assert_eq!(
+            api.place_count(),
+            2,
+            "the original send plus exactly one resend"
+        );
+    }
+
+    // === Issue #2 acceptance criterion 3: expiresAfter is threaded to every
+    // place, including a resend, with the SAME run-level value ===
+
+    #[tokio::test(start_paused = true)]
+    async fn issue2_every_place_including_a_resend_uses_the_same_run_level_expires_after() {
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(Err(HlError::Network("connection reset".into())))
+            .push_status(Ok(None))
+            .push_status(Ok(None))
+            .push_status(Ok(None))
+            .push_place(filled(dec!(5), dec!(50)));
+
+        let plan_val = plan(false);
+        let intent = OrderIntent {
+            cloid: Cloid::new(),
+            symbol: plan_val.symbol.clone(),
+            side: plan_val.side,
+            px: dec!(50),
+            sz: dec!(5),
+            tif: Tif::Ioc,
+            reduce_only: false,
+        };
+
+        let start = tokio::time::Instant::now();
+        let dl = ExecutionDeadline::from_parts(start + Duration::from_secs(60), 1_700_123_456_789);
+
+        place_slice_reconciled(&api, &plan_val, &intent, &dl)
+            .await
+            .unwrap();
+
+        let places = api.place_calls();
+        assert_eq!(places.len(), 2, "original send + 1 resend");
+        for c in places {
+            if let Call::Place {
+                expires_after_ms, ..
+            } = c
+            {
+                assert_eq!(
+                    expires_after_ms, 1_700_123_456_789,
+                    "a resend must reuse the SAME run-level expiry, not a fresh one"
+                );
+            }
+        }
     }
 
     // === (b) T3/T5: resting-order recovery ===

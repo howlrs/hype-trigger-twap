@@ -4,7 +4,7 @@
 
 ```bash
 cargo build --release
-cargo test                                  # 単体 + 結合テスト (275 件)
+cargo test                                  # 単体 + 結合テスト (289 件)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
@@ -20,27 +20,27 @@ cargo fmt --check
 
 | ファイル | 行数 | 役割 |
 |---|---|---|
-| `src/main.rs` | 1042 | CLI 定義 (clap)、起動シーケンス、事前検証、終了コード |
-| `src/twap.rs` | 2518 | スライスループ、サイジング、キャッチアップ、約定照合 (`ValidatedFill` 経由)、W1 unknownOid 安全再送ポリシー、レポート |
-| `src/client.rs` | 2009 | Hyperliquid REST クライアント (`/info`, `/exchange`)、応答解析、再試行方針、`ValidatedMarketSnapshot` (板の検証境界)、`ORDER_STATUS_VOCABULARY` (status 語彙表)、`ValidatedFill` (約定の検証境界) |
-| `src/eip712.rs` | 370 | **移植物** — EIP-712 型定義、msgpack パック、action_hash |
+| `src/main.rs` | 1058 | CLI 定義 (clap)、起動シーケンス、事前検証 (Issue #2 のクロックずれ検証を含む)、終了コード |
+| `src/twap.rs` | 3068 | スライスループ、サイジング、キャッチアップ、約定照合 (`ValidatedFill` 経由)、W1 unknownOid 安全再送ポリシー、`ExecutionDeadline` / `expiresAfter` / クロックずれ検証 (Issue #2)、レポート |
+| `src/client.rs` | 2043 | Hyperliquid REST クライアント (`/info`, `/exchange`)、応答解析、再試行方針、`ValidatedMarketSnapshot` (板の検証境界)、`ORDER_STATUS_VOCABULARY` (status 語彙表)、`ValidatedFill` (約定の検証境界)、`expiresAfter` の署名・送信 (Issue #2) |
+| `src/eip712.rs` | 370 | **移植物** — EIP-712 型定義、msgpack パック、action_hash (`expires_after` 引数を含む) |
 | `src/trigger.rs` | 1041 | 価格・時間トリガーの待機ループ (`&dyn HlApi` シーム、`ValidatedMarketSnapshot` 検証込み) |
 | `src/format.rs` | 359 | 価格・数量の丸め (szDecimals、有効数字、方向制御)、テイカー指値の算出 |
-| `src/api.rs` | 292 | `HlApi` トレイト (テストシーム) と `ScriptedApi` (テスト用偽実装) |
+| `src/api.rs` | 306 | `HlApi` トレイト (テストシーム) と `ScriptedApi` (テスト用偽実装) |
 | `src/types.rs` | 292 | `Side` / `Tif` / `Cloid` / `Symbol` / `OrderBook` などのドメイン型 |
-| `src/signer.rs` | 266 | **移植物** — `Eip712AgentSigner` (alloy による署名) |
+| `src/signer.rs` | 274 | **移植物** — `Eip712AgentSigner` (alloy による署名、`expires_after` 引数を含む) |
 | `src/errors.rs` | 129 | `HlError` と `RejectionKind` (拒否メッセージの分類) |
 | `src/lib.rs` | 15 | 結合テストから内部モジュールを参照するためのライブラリターゲット |
 
-テストの内訳 (Issue #7 で `ValidatedFill` / status 語彙 / W1 再送ポリシーのテストを追加):
+テストの内訳 (Issue #2 で `ExecutionDeadline` / `expiresAfter` / クロックずれ検証のテストを追加):
 
 | ターゲット | 件数 | 内容 |
 |---|---|---|
-| `src/lib.rs` (単体) | 206 | 純関数の算術、丸め、応答解析、署名、`run_twap` のループレベルテスト、`ValidatedMarketSnapshot` / `ValidatedFill` の検証、status 語彙の全件終端性テスト、トリガーの `ScriptedApi` テスト |
+| `src/lib.rs` (単体) | 216 | 純関数の算術、丸め、応答解析、署名、`run_twap` のループレベルテスト、`ValidatedMarketSnapshot` / `ValidatedFill` の検証、status 語彙の全件終端性テスト、トリガーの `ScriptedApi` テスト、`ExecutionDeadline` / クロックずれ検証の単体テスト、期限を跨ぐ仮想時刻テスト (Issue #2) |
 | `src/main.rs` (単体) | 31 | CLI 引数の検証、`--help` の内容、起動シーケンス |
-| `tests/exchange_parse.rs` | 16 | mockito による `/exchange` 応答の解析と再試行方針 |
+| `tests/exchange_parse.rs` | 18 | mockito による `/exchange` 応答の解析と再試行方針、`expiresAfter` の body/署名一致 (Issue #2) |
 | `tests/reconcile_and_probe.rs` | 19 | 曖昧な送信の照合、`userRole` 照会、トリガーの end-to-end |
-| `tests/signing_cross_check.rs` | 3 | Python SDK 由来の 10 ベクタに対する署名検証 |
+| `tests/signing_cross_check.rs` | 3 | Python SDK 由来の 17 ベクタ (元 10 + `expiresAfter` 系 7、Issue #2) に対する署名検証 |
 | `tests/status_vocabulary_conformance.rs` | 2 | **`#[ignore]`** — 実 Hyperliquid API に対する orderStatus / meta の疎通・形状スモークテスト |
 
 ## 署名コアの扱い (重要)
@@ -49,9 +49,16 @@ cargo fmt --check
 インポートパスの書き換え、`MockSigner` の削除、秘密鍵を伏せるためのエラーメッセージと `Debug` 実装の
 変更以外、ロジックには一切手を入れていません。
 
-`tests/signing_cross_check.rs` は Hyperliquid Python SDK が生成した 10 件のベクタに対して
-署名パスを検証します (フィクスチャは `tests/fixtures/signing/known_vectors.json`、
-親リポジトリとバイト単位で同一)。
+`tests/signing_cross_check.rs` は Hyperliquid Python SDK が生成した 17 件のベクタに対して
+署名パスを検証します。うち元の 10 件 (フィクスチャは `tests/fixtures/signing/known_vectors.json`
+の先頭 10 件、親リポジトリとバイト単位で同一) は **絶対に手で編集しないこと**。
+残り 7 件は Issue #2 (`expiresAfter` の署名) で追加したベクタで、同じく
+`hyperliquid-python-sdk` の `sign_l1_action` を使って生成しています
+(ローカルの venv に `pip install hyperliquid-python-sdk eth-account msgpack` した上で、
+`scripts/gen_signing_vectors.py` と同じ流儀の生成スクリプトを実行 — dummy/order アクション ×
+mainnet/testnet に加えて cloid + vault + expiresAfter を同時に使う組み合わせと
+`expires_after=0` の境界値を含みます)。ベクタを追加する場合も、既存の 17 件を書き換えては
+いけません — 新しいベクタを末尾に追記するだけにしてください。
 
 > **このテストが失敗した場合、署名コードが壊れています。生成された注文を一切信用しないでください。**
 
@@ -115,6 +122,31 @@ pub trait HlApi {
    満たし、`avgPx` は正の値でサイド別の指値内に収まること。`orderStatus` の `remaining` は
    `0 <= remaining <= origSz` を満たすこと。いずれかを満たさない応答は握りつぶさず即座に hard-stop
    すること (クランプ厳禁)
+9. **`ExecutionDeadline` は送信の直前に再確認する** (Issue #2) — ループ先頭で一度確認するだけでは
+   板取得や照合ポーリングの `await` 中に期限を越えるケースを取りこぼす。初回発注と resend の
+   両方の直前で再確認すること。期限後も `orderStatus` 照会と cancel は許可し続けること
+10. **`expiresAfter` は body と署名で必ず同じ値を使う** (Issue #2) — `/exchange` リクエストボディの
+    `expiresAfter` フィールドと、署名対象の action hash に渡す `expires_after` 引数は、
+    どのコードパスでも同一の値でなければならない。resend も run 開始時に決まった値を再利用し、
+    新しい期限を発行しないこと
+
+### NTP 依存とクロックずれの fail-closed ルール (Issue #2)
+
+`expiresAfter` は wall-clock (Unix ms) を signed action hash に埋め込む値なので、実行ホストの
+システムクロックが Hyperliquid のサーバー時刻から大きくずれていると、ローカルが意図した期限と
+HL が実際に enforce する期限が一致しなくなります。これは「多少ずれても安全側に倒れる」類の
+問題ではありません — ローカルの時計が遅れていれば意図より早く HL 側が失効させ、進んでいれば
+意図より長く有効な注文を残してしまいます。
+
+このツールは live モードの起動時に `/info l2Book` のサーバータイムスタンプとローカル時刻を
+比較し、差が `MAX_CLOCK_SKEW_MS` (5000ms、`src/twap.rs`) を超えていれば **起動そのものを
+拒否します** (fail-closed)。read-only では検証しません — 何も署名しないため実害がないからです。
+
+**運用者への要求**: 実行ホストは NTP (chrony / systemd-timesyncd 等) でシステムクロックを
+同期しておいてください。多くのクラウド VM は既定で有効です。自前のホストで動かす場合、
+`timedatectl status` や `chronyc tracking` で同期状態を確認してから live モードを起動して
+ください。クロックずれで起動が拒否された場合、まず NTP デーモンが動いているか、時刻同期の
+オフセットが妥当かを確認してから再実行してください。
 
 ## orderStatus ステータス表の更新手順 (Issue #7)
 

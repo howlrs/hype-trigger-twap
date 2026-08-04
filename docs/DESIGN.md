@@ -176,6 +176,74 @@ target_at_slice(i) = per_slice × i     (最終スライスは adjusted 合計�
 なります。期限に達した実行は停止し、未執行分を報告します。通常の実行では最終スライスは
 ウィンドウ内に収まります。
 
+### 執行期限の二重防御: `ExecutionDeadline` (ローカル) と `expiresAfter` (取引所側) (Issue #2)
+
+上記の不変条件は、以前はスライス開始時に一度だけ確認されていました。しかしその後に板取得や
+再送の照合を `await` するため、期限直前に開始したスライスが、板取得の timeout/retry や
+曖昧送信の照合中に期限を越えたあとで（catch-up により最大化した可能性のある）注文を送信
+できてしまう抜け道がありました。この抜け道を塞ぐため、責務の異なる 2 つの時計を導入しています。
+
+**`ExecutionDeadline` (ローカル・monotonic)** — `src/twap.rs`。`run_twap` の開始時に
+`tokio::time::Instant` ベースで一度だけ構築され、place/reconcile/resend の各層まで渡されます。
+
+- **必ず「送信の直前」に再確認します**: 初回発注の直前、および曖昧送信 (transport failure)
+  後の再送の直前の 2 箇所。期限確認をループ先頭で一度行うだけでは、その後の `await`
+  (板取得の再試行、`reconcile_by_cloid` の照合ポーリング) の間に期限を越えても検出できません。
+- **期限後も許可される操作**: `orderStatus` 照会・cancel は期限後も継続して呼べます (すでに
+  発注済みの注文の後始末は止めてはいけないため)。**禁止されるのは新規の place と resend のみ**
+  です。
+- **板取得・再試行の予算も期限で打ち切ります**: `fetch_fresh_book` に `ExecutionDeadline` を
+  渡すと、残り時間が `STALE_BOOK_RETRY_INTERVAL` (1秒) より短い場合は再試行の sleep 自体を
+  短縮し、残り時間がゼロならその場で打ち切ります。期限まで 200ms しか残っていない状況で
+  再試行予算いっぱい (最大 3 回 × 1秒 = 3秒) を消費させないためです。
+- monotonic clock を使う理由: wall-clock の NTP 補正やサスペンドの影響を受けず、
+  「送ってよいか」というローカルな意思決定を狂わせないため。
+
+**`expiresAfter` (wall-clock・取引所側)** — `src/client.rs` / `src/eip712.rs` /
+`src/signer.rs`。`ExecutionDeadline` の構築時に、同じ瞬間の wall-clock (Unix ms) から
+`start + duration` に相当する絶対時刻を計算し、run の実行中ずっと**同じ値**を使い続けます。
+
+- この値は `/exchange` リクエストボディの `expiresAfter` フィールドと、署名対象の EIP-712
+  action hash (`action_hash(..., expires_after)`) の**両方に同じ値で**渡されます —
+  片方だけ設定してももう片方が一致しなければ、HL 側の署名検証に矛盾が生じます。
+  (`tests/exchange_parse.rs` の `place_request_body_carries_the_same_expires_after_used_for_signing`
+  がこの一致を mockito 経由で検証しています。)
+- 最終スライスや resend を含む、run が送るすべての注文が同じ `expires_after_ms` を使います。
+  resend は「新しい期限」を得るのではなく、run 開始時に決まった同じ値を再利用します。
+- 目的: ローカルの `ExecutionDeadline` チェックをすり抜けるバグがあっても、HL 自身の
+  `expiresAfter` enforcement が独立した第二の防御になります。二重防御であり、
+  どちらか一方に依存しない設計です。
+- `cancelByCloid` は `expiresAfter` を付けません (`None`) — cancel は期限後も許可される操作
+  なので、cancel 自体が期限切れになってはいけないためです。
+
+**責務のまとめ**:
+
+| 概念 | 時計 | 役割 | 期限後の扱い |
+|---|---|---|---|
+| `ExecutionDeadline` | monotonic (`tokio::time::Instant`) | ローカルな「送信してよいか」の判定 | place/resend 禁止、status 照会/cancel は継続可 |
+| `expiresAfter` | wall-clock (Unix ms) | HL 側の独立した expiry enforcement | HL が自身の時計で判定 (ローカルとは独立) |
+
+これは既存の `--expire-after` フラグ (Issue #8、待機フェーズの打ち切り) とは**別の概念**です。
+`--expire-after` はトリガー待機中 — まだ 1 枚も発注していない段階 — の打ち切りであるのに対し、
+`ExecutionDeadline` はトリガー発火後、スライスが実際に送信されるフェーズの期限です。混同しない
+でください。
+
+### クロックずれの検証 (Issue #2)
+
+`expiresAfter` は wall-clock (Unix ms) に依存するため、実行ホストの時計が Hyperliquid の
+サーバー時計とずれていると、ローカルが意図した期限と HL が実際に enforce する期限が食い違います。
+これを防ぐため、**live モード (read-only ではない実運用) の起動時のみ**、`/info l2Book`
+レスポンスのサーバータイムスタンプとローカル wall-clock を比較します。
+
+- 許容範囲: `|ローカル時刻 − サーバー時刻| <= 5000ms` (`MAX_CLOCK_SKEW_MS`、`src/twap.rs`)。
+- 超過時は **fail-closed** — 起動を中止し、注文は一切送信しません。エラーメッセージで
+  NTP 同期の確認を促します。
+- read-only / paper モードでは検証しません。何も署名しないため、ローカル時計が狂っていても
+  `expiresAfter` が実際に送信されることはなく、実害がないためです。
+- **運用上の前提**: 実行ホストは NTP でシステムクロックを同期しておく必要があります。
+  クラウド VM (AWS/GCP 等) では既定で有効なことが多いですが、自前のホストで動かす場合は
+  `timedatectl` 等で NTP 同期の状態を確認してください (詳細は `docs/DEVELOPMENT.md`)。
+
 ### 板の検証: `ValidatedMarketSnapshot`
 
 `/info l2Book` の生レスポンスは、価格トリガーのポーリング・pre-flight サイジング・
