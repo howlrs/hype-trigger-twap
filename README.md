@@ -309,6 +309,11 @@ the shortfall; a normal run reaches its last slice inside the window anyway.
 - **One symbol per process.** No portfolio logic, no existing-position
   awareness (`reduce_only` is never set), no HIP-3 `dex:SYMBOL` prefixes.
 - **Taker only.** Every slice crosses the spread and pays taker fees.
+- **Single-host single-writer only.** A local advisory lock (keyed by
+  `network + agent address`) makes a second live process for the same agent
+  on the SAME host fail fast, before any order. It has no visibility across
+  hosts — use one dedicated API wallet per trading process; see
+  docs/OPERATIONS.md for the multi-process/multi-host safety boundary.
 
 ## Roadmap
 
