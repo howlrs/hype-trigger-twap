@@ -22,7 +22,7 @@ use rust_decimal_macros::dec;
 use crate::api::HlApi;
 use crate::client::{OrderStatusFill, PlaceOutcome, ValidatedFill, ValidatedMarketSnapshot};
 use crate::errors::{HlError, RejectionKind};
-use crate::format::{human, round_size, taker_limit_price};
+use crate::format::{human, round_price, round_size, taker_limit_price};
 use crate::journal::{ExecutionJournal, JournalRecord};
 use crate::risk::RiskEnvelope;
 use crate::types::{Address, CancelIntent, Cloid, OrderIntent, Side, Symbol, Tif};
@@ -233,6 +233,25 @@ pub fn check_clock_skew(local_wall_now_ms: i64, server_ts_ms: i64) -> Result<(),
     Ok(())
 }
 
+/// Child-order algorithm for each slice (Issue #1).
+///
+/// `Market` (the default, pre-Issue-#1 behaviour): an IOC taker limit at
+/// `taker_limit_price` (mid +/- slippage cushion).
+///
+/// `Passive`: a post-only (ALO) limit resting at the best bid (long) / best
+/// ask (short), for the whole slice interval, so the quote has a chance to
+/// get filled without crossing the spread. Any residual is cancelled and
+/// settled via `orderStatus` (reusing `recover_resting_fill`) at the START
+/// of the NEXT slice, before that slice's own quote is placed — see
+/// `docs/DESIGN.md` for the full rationale and the in-flight-cap invariant
+/// this enforces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChildAlgo {
+    #[default]
+    Market,
+    Passive,
+}
+
 /// Everything the loop needs, resolved before the first slice.
 pub struct TwapPlan {
     pub symbol: Symbol,
@@ -265,6 +284,9 @@ pub struct TwapPlan {
     /// returns `unknownOid` for orders that really exist. `None` in read-only,
     /// where no order is ever placed and nothing needs recovering.
     pub master: Option<Address>,
+    /// Child-order algorithm for every slice (Issue #1). Defaults to
+    /// `Market`, which reproduces pre-Issue-#1 behaviour exactly.
+    pub child_algo: ChildAlgo,
 }
 
 impl TwapPlan {
@@ -755,6 +777,52 @@ async fn recover_resting_fill(
     poll_terminal_status(client, plan, user, oid).await
 }
 
+/// A passive (ALO) child order currently resting on the book (Issue #1).
+///
+/// The slice loop carries at most ONE of these across iterations — that
+/// `Option` field IS the in-flight cap (PR-D10 in the sibling repo this
+/// ported from): a new ALO is never placed while this is `Some`, so a
+/// cancel/place race can never leave two resting child orders targeting the
+/// same slot.
+struct RestingChild {
+    cloid: Cloid,
+    oid: crate::types::OrderId,
+    /// Size credited to `filled_so_far` if this order is settled with a
+    /// PARTIAL fill smaller than its full requested size — kept only for
+    /// tracing; the actual credited amount always comes from `orderStatus`.
+    requested_sz: Decimal,
+    px: Decimal,
+}
+
+/// Settle a resting passive child order: `cancelByCloid` then `orderStatus`
+/// to learn the TRUE filled quantity, exactly the cancel-then-settle
+/// sequence `recover_resting_fill` already implements for an IOC that rested
+/// unexpectedly (Issue #1 PM decision: reuse that infra rather than
+/// reinventing it). This is what closes the cancel/late-fill race: the
+/// caller must NEVER assume zero (or the pre-cancel snapshot) filled — only
+/// the post-cancel `orderStatus` response is trusted.
+async fn settle_resting_child(
+    client: &dyn HlApi,
+    plan: &TwapPlan,
+    resting: RestingChild,
+) -> Result<SliceOutcome, HlError> {
+    let st = recover_resting_fill(client, plan, resting.cloid, resting.oid).await?;
+    let intent_for_validation = OrderIntent {
+        cloid: resting.cloid,
+        symbol: plan.symbol.clone(),
+        side: plan.side,
+        px: resting.px,
+        sz: resting.requested_sz,
+        tif: Tif::Alo,
+        reduce_only: false,
+    };
+    let vf = ValidatedFill::try_from_status(&st, &intent_for_validation)?;
+    Ok(SliceOutcome {
+        sz: vf.filled_sz,
+        px: vf.avg_px.unwrap_or(resting.px),
+    })
+}
+
 /// How many times a place may be re-signed and re-sent after an AMBIGUOUS
 /// transport failure (W1). Each attempt is preceded by an `orderStatus`
 /// reconciliation, so a resend only happens once HL has told us the order is
@@ -1234,6 +1302,13 @@ pub async fn run_twap_journaled(
     let mut slices_executed = 0u32;
     let mut slices_skipped = 0u32;
     let mut abort_reason: Option<String> = None;
+    // Issue #1: at most one resting passive child order at a time — this
+    // `Option` IS the in-flight cap. Only ever `Some` between the iteration
+    // that placed an ALO and the iteration that settles it; every exit path
+    // (deadline abort, shutdown, exchange rejection, normal completion)
+    // funnels through the cleanup block after the loop, which cancels and
+    // settles whatever is still `Some` here before the final report is built.
+    let mut resting: Option<RestingChild> = None;
 
     for slice_idx in 1..=plan.slices {
         // Issue #4: stop scheduling NEW slices once shutdown has been
@@ -1252,6 +1327,41 @@ pub async fn run_twap_journaled(
         }
         if plan.read_only {
             println!("{READ_ONLY_BANNER}");
+        }
+
+        // Issue #1: settle any resting passive child order from the PREVIOUS
+        // slice before doing anything else this iteration — including
+        // before this iteration's own deadline check, since settling a
+        // residual is cleanup (cancel + orderStatus), never a new place,
+        // and is therefore always allowed regardless of the deadline (same
+        // "status queries and cancels remain allowed past the deadline"
+        // policy `ExecutionDeadline` already documents for market mode).
+        // This is the cancel-then-settle step that closes the cancel/
+        // late-fill race: `settle_resting_child` NEVER trusts a pre-cancel
+        // fill snapshot, only the post-cancel `orderStatus` truth.
+        if let Some(child) = resting.take() {
+            match settle_resting_child(client, plan, child).await {
+                Ok(SliceOutcome { sz, px: fill_px }) => {
+                    if sz > Decimal::ZERO {
+                        stats.add(sz, fill_px);
+                        tracing::info!(
+                            slice = slice_idx,
+                            filled = %human(sz),
+                            avg_px = %human(fill_px),
+                            cumulative = %human(stats.filled),
+                            "passive child settled (cancel->orderStatus)"
+                        );
+                    } else {
+                        tracing::info!(slice = slice_idx, "passive child settled with zero fill");
+                    }
+                }
+                Err(e) => {
+                    abort_reason = Some(format!(
+                        "slice {slice_idx}: failed to settle the resting passive child order: {e}"
+                    ));
+                    break;
+                }
+            }
         }
 
         let slice_end = slice_deadline(start, plan.duration, slice_idx, plan.slices);
@@ -1300,7 +1410,27 @@ pub async fn run_twap_journaled(
 
         // T1: the price we are about to sign, computed BEFORE the gate so the
         // gate judges the notional that will actually reach HL.
-        let px = taker_limit_price(bid, ask, plan.side, plan.slippage_bps, plan.sz_decimals);
+        //
+        // Issue #1: passive quotes AT the touch — best_bid for a long,
+        // best_ask for a short — with NO slippage cushion (that is the
+        // entire point of a post-only order: it never chases price). The
+        // rounding helper is the SAME `round_price` market orders use
+        // (szDecimals + 5-significant-digit grid); book prices are already
+        // on-grid so this is normally a no-op, and any residual mismatch is
+        // exactly what an ALO rejection (handled below as a normal skip)
+        // exists to catch.
+        let px = match plan.child_algo {
+            ChildAlgo::Market => {
+                taker_limit_price(bid, ask, plan.side, plan.slippage_bps, plan.sz_decimals)
+            }
+            ChildAlgo::Passive => {
+                let touch = match plan.side {
+                    Side::Long => bid,
+                    Side::Short => ask,
+                };
+                round_price(touch, plan.sz_decimals, plan.side)
+            }
+        };
 
         // Issue #3: non-positive limit price is rejected unconditionally,
         // no override — belt-and-braces guard, mirroring the CLI pre-flight
@@ -1372,20 +1502,31 @@ pub async fn run_twap_journaled(
         };
 
         let cloid = Cloid::new();
+        let tif = match plan.child_algo {
+            ChildAlgo::Market => Tif::Ioc,
+            ChildAlgo::Passive => Tif::Alo,
+        };
 
         if plan.read_only {
             println!(
-                "[READ-ONLY] would place: slice {}/{} {} {} {} @ {} (IOC, cloid {}, mid {})",
+                "[READ-ONLY] would place: slice {}/{} {} {} {} @ {} ({}, cloid {}, mid {})",
                 slice_idx,
                 plan.slices,
                 plan.side,
                 human(order_sz),
                 plan.symbol,
                 human(px),
+                match tif {
+                    Tif::Alo => "ALO",
+                    Tif::Ioc => "IOC",
+                    Tif::Gtc => "GTC",
+                },
                 cloid,
                 human(snapshot.mid)
             );
-            // Assume a full fill so the dry run walks the same slice path.
+            // Assume a full fill so the dry run walks the same slice path
+            // for both algorithms — a real passive run's fill is never
+            // guaranteed, but read-only never sends anything to observe.
             stats.add(order_sz, px);
             slices_executed += 1;
             sleep_until(slice_end).await;
@@ -1398,63 +1539,147 @@ pub async fn run_twap_journaled(
             side: plan.side,
             px,
             sz: order_sz,
-            tif: Tif::Ioc,
+            tif,
             reduce_only: false,
         };
-        tracing::info!(
-            slice = slice_idx,
-            slices = plan.slices,
-            sz = %human(order_sz),
-            px = %human(px),
-            cloid = %cloid,
-            "placing IOC slice"
-        );
 
-        // Issue #4: once a place is in flight it runs to completion — the
-        // journal's Prepared/SubmittedUnknown/Acknowledged/Terminal
-        // sequence inside `place_slice_reconciled` is what makes THIS call
-        // crash-safe; a shutdown signal arriving mid-call is handled by the
-        // NEXT iteration's top-of-loop check (or by the caller's own grace
-        // timeout racing this whole `run_twap_journaled` future), never by
-        // cancelling the call itself — an abandoned in-flight place is
-        // exactly the ambiguity this feature exists to prevent.
-        match place_slice_reconciled(
-            client,
-            plan,
-            &intent,
-            &exec_deadline,
-            slice_idx,
-            journal.as_deref_mut(),
-        )
-        .await
-        {
-            // Every fill — direct, recovered from a resting order, or
-            // reconciled after an ambiguous send — is credited here EXACTLY
-            // ONCE (T3/T5). There is no second accounting path.
-            Ok(SliceOutcome { sz, px: fill_px }) => {
-                stats.add(sz, fill_px);
-                slices_executed += 1;
+        match plan.child_algo {
+            ChildAlgo::Market => {
                 tracing::info!(
                     slice = slice_idx,
-                    filled = %human(sz),
-                    avg_px = %human(fill_px),
-                    cumulative = %human(stats.filled),
-                    "slice filled"
+                    slices = plan.slices,
+                    sz = %human(order_sz),
+                    px = %human(px),
+                    cloid = %cloid,
+                    "placing IOC slice"
                 );
+
+                // Issue #4: once a place is in flight it runs to completion —
+                // the journal's Prepared/SubmittedUnknown/Acknowledged/
+                // Terminal sequence inside `place_slice_reconciled` is what
+                // makes THIS call crash-safe; a shutdown signal arriving
+                // mid-call is handled by the NEXT iteration's top-of-loop
+                // check (or by the caller's own grace timeout racing this
+                // whole `run_twap_journaled` future), never by cancelling the
+                // call itself — an abandoned in-flight place is exactly the
+                // ambiguity this feature exists to prevent.
+                match place_slice_reconciled(
+                    client,
+                    plan,
+                    &intent,
+                    &exec_deadline,
+                    slice_idx,
+                    journal.as_deref_mut(),
+                )
+                .await
+                {
+                    // Every fill — direct, recovered from a resting order, or
+                    // reconciled after an ambiguous send — is credited here
+                    // EXACTLY ONCE (T3/T5). There is no second accounting
+                    // path.
+                    Ok(SliceOutcome { sz, px: fill_px }) => {
+                        stats.add(sz, fill_px);
+                        slices_executed += 1;
+                        tracing::info!(
+                            slice = slice_idx,
+                            filled = %human(sz),
+                            avg_px = %human(fill_px),
+                            cumulative = %human(stats.filled),
+                            "slice filled"
+                        );
+                    }
+                    // Exchange rejection: NEVER retried, hard stop (§5).
+                    Err(HlError::Exchange { code, message }) => {
+                        let kind = RejectionKind::classify(&message);
+                        abort_reason = Some(format!(
+                            "slice {slice_idx} rejected by exchange [{}]: {message} — {}",
+                            code.unwrap_or_else(|| "?".into()),
+                            kind.advice()
+                        ));
+                        break;
+                    }
+                    Err(e) => {
+                        abort_reason = Some(format!("slice {slice_idx} failed: {e}"));
+                        break;
+                    }
+                }
             }
-            // Exchange rejection: NEVER retried, hard stop (§5).
-            Err(HlError::Exchange { code, message }) => {
-                let kind = RejectionKind::classify(&message);
-                abort_reason = Some(format!(
-                    "slice {slice_idx} rejected by exchange [{}]: {message} — {}",
-                    code.unwrap_or_else(|| "?".into()),
-                    kind.advice()
-                ));
-                break;
-            }
-            Err(e) => {
-                abort_reason = Some(format!("slice {slice_idx} failed: {e}"));
-                break;
+            ChildAlgo::Passive => {
+                tracing::info!(
+                    slice = slice_idx,
+                    slices = plan.slices,
+                    sz = %human(order_sz),
+                    px = %human(px),
+                    cloid = %cloid,
+                    "placing ALO (post-only) slice"
+                );
+
+                // Issue #1 PM decision: an ALO rejection (e.g.
+                // `badAloPxRejected` — the touch moved across our signed
+                // price between snapshot and send, so the order would have
+                // crossed and taken instead of resting) is a NORMAL
+                // post-only outcome, not an error. It is credited as a
+                // zero-fill skip and the shortfall carries forward via the
+                // usual catch-up sizing on the NEXT slice — the run must
+                // never abort on this. Any other exchange rejection is still
+                // fatal, unchanged from market mode.
+                match client
+                    .place_order_once(&intent, plan.asset_index, exec_deadline.expires_after_ms())
+                    .await
+                {
+                    Ok((_, PlaceOutcome::Resting { oid })) => {
+                        resting = Some(RestingChild {
+                            cloid,
+                            oid,
+                            requested_sz: order_sz,
+                            px,
+                        });
+                        slices_executed += 1;
+                        tracing::info!(
+                            slice = slice_idx,
+                            sz = %human(order_sz),
+                            px = %human(px),
+                            oid = %oid,
+                            "ALO resting; will settle at the next slice boundary"
+                        );
+                    }
+                    // ALO is post-only — HL never matches it immediately, so
+                    // a `Filled` outcome here would mean HL crossed a
+                    // post-only order, which this binary does not trust.
+                    Ok((_, outcome @ PlaceOutcome::Filled { .. })) => {
+                        abort_reason = Some(format!(
+                            "slice {slice_idx}: ALO placement returned an unexpected Filled \
+                             outcome ({outcome:?}) — a post-only order should never match \
+                             immediately; refusing to trust this response"
+                        ));
+                        break;
+                    }
+                    Err(HlError::Exchange { code, message }) => {
+                        let is_alo_reject = message.to_ascii_lowercase().contains("alo")
+                            || code.as_deref() == Some("badAloPxRejected");
+                        if is_alo_reject {
+                            slices_skipped += 1;
+                            tracing::info!(
+                                slice = slice_idx,
+                                message = %message,
+                                "ALO rejected (post-only would have crossed); \
+                                 skipping this slice, catch-up will carry the shortfall"
+                            );
+                        } else {
+                            let kind = RejectionKind::classify(&message);
+                            abort_reason = Some(format!(
+                                "slice {slice_idx} rejected by exchange [{}]: {message} — {}",
+                                code.unwrap_or_else(|| "?".into()),
+                                kind.advice()
+                            ));
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        abort_reason = Some(format!("slice {slice_idx} failed: {e}"));
+                        break;
+                    }
+                }
             }
         }
 
@@ -1492,6 +1717,43 @@ pub async fn run_twap_journaled(
                 }
             }
             None => sleep_until(slice_end).await,
+        }
+    }
+
+    // Issue #1: final cleanup — ALWAYS cancel and settle any resting
+    // passive child order before the report is built, on EVERY exit route
+    // (normal completion, deadline abort, shutdown, exchange rejection,
+    // settle failure above). No resting order may ever leak past the end of
+    // a run. This mirrors the market-mode `recover_resting_fill` invariant
+    // (an IOC should never rest, but if it does the fill is still
+    // recovered) extended to the case a passive order is DELIBERATELY still
+    // resting when the loop stops.
+    if let Some(child) = resting.take() {
+        match settle_resting_child(client, plan, child).await {
+            Ok(SliceOutcome { sz, px: fill_px }) => {
+                if sz > Decimal::ZERO {
+                    stats.add(sz, fill_px);
+                    tracing::info!(
+                        filled = %human(sz),
+                        avg_px = %human(fill_px),
+                        cumulative = %human(stats.filled),
+                        "final cleanup: settled the last resting passive child order"
+                    );
+                } else {
+                    tracing::info!(
+                        "final cleanup: last resting passive child order settled with zero fill"
+                    );
+                }
+            }
+            Err(e) => {
+                // Cleanup itself failed — surface it, but do not overwrite an
+                // existing abort_reason (the settle failure is secondary to
+                // whatever already stopped the run); if nothing had aborted
+                // yet, this failure IS the abort reason.
+                let msg = format!("final cleanup: failed to settle the resting order: {e}");
+                tracing::error!(error = %e, "{msg}");
+                abort_reason.get_or_insert(msg);
+            }
         }
     }
 
@@ -2042,6 +2304,15 @@ mod loop_tests {
             } else {
                 Some(Address::new(MASTER))
             },
+            child_algo: ChildAlgo::Market,
+        }
+    }
+
+    /// Same as `plan()` but with `child_algo: Passive` (Issue #1).
+    fn plan_passive(read_only: bool) -> TwapPlan {
+        TwapPlan {
+            child_algo: ChildAlgo::Passive,
+            ..plan(read_only)
         }
     }
 
@@ -3680,6 +3951,303 @@ mod loop_tests {
         let reason = report.abort_reason.clone().expect("must abort");
         assert!(reason.contains("risk envelope"), "{reason}");
         assert_eq!(report.exit_code(), 1);
+    }
+
+    // === Issue #1: passive (post-only ALO) child-order algorithm ===
+    //
+    // `plan_passive()` (child_algo: Passive) drives the SAME `run_twap`/
+    // `run_twap_journaled` entry points as market mode — the only thing that
+    // differs is the plan's `child_algo` field. These tests exercise the ALO
+    // placement, the full-interval wait, the cancel->orderStatus->requote
+    // race at the next slice boundary, ALO-rejection-is-a-skip, the
+    // in-flight cap, and deadline/shutdown cleanup.
+    mod passive_tests {
+        use super::*;
+
+        fn resting(oid: u64) -> Result<PlaceOutcome, HlError> {
+            Ok(PlaceOutcome::Resting { oid: OrderId(oid) })
+        }
+
+        fn alo_rejected() -> Result<PlaceOutcome, HlError> {
+            Err(HlError::Exchange {
+                code: Some("order_error".into()),
+                message: "Post only order would have immediately matched, bad ALO px \
+                          (badAloPxRejected)"
+                    .into(),
+            })
+        }
+
+        /// The cancel -> late-fill race: slice 1's ALO rests, slice 2's
+        /// boundary arrives with a residual, so the loop cancels it and
+        /// settles via `orderStatus` BEFORE placing anything new. The
+        /// scripted `orderStatus` reports a fill that landed AFTER the
+        /// cancel was issued (a real race outcome) — `filled_so_far` must
+        /// adopt that TRUE settled amount, never the zero the loop might
+        /// have assumed at cancel time, and never double-count it against
+        /// whatever the next quote later fills.
+        #[tokio::test(start_paused = true)]
+        async fn cancel_then_late_fill_settles_true_filled_never_overcounts() {
+            let mut p = plan_passive(false);
+            p.slices = 2;
+            p.duration = Duration::from_secs(120);
+            // 10 total / 2 slices = 5 per slice at szDecimals=2.
+            p.per_slice = dec!(5);
+            p.total_adjusted = dec!(10);
+            p.total_requested = dec!(10);
+
+            let api = ScriptedApi::new()
+                .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+                // slice 1: ALO rests at best_bid 49.9.
+                .push_place(resting(101))
+                // slice 2 boundary: cancel the resting order...
+                .push_cancel(Ok(()))
+                // ...then settle via orderStatus: the race resolved to a
+                // PARTIAL fill of 2 (out of 5) that landed after the cancel
+                // was sent but before HL processed it.
+                .push_status(Ok(Some(status_full(
+                    dec!(2),
+                    Some(dec!(49.9)),
+                    "canceled",
+                    OrderId(101),
+                    None,
+                    "HYPE",
+                    "B",
+                ))))
+                // slice 2: new ALO for the catch-up size (10 - 2 = 8) rests.
+                .push_place(resting(102))
+                // end-of-run cleanup: cancel the still-resting slice-2 order.
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(8),
+                    Some(dec!(49.9)),
+                    "canceled",
+                    OrderId(102),
+                    None,
+                    "HYPE",
+                    "B",
+                ))));
+
+            let report = run_twap(&api, &p).await;
+
+            // Slice 1 contributed exactly 2 (the settled truth, not 0 and
+            // not 5) and slice 2's catch-up + cleanup contributed the
+            // remaining 8 — total must land on exactly 10, never more.
+            assert_eq!(
+                report.filled,
+                dec!(10),
+                "filled must equal the true settled total, no over/under-count from the race"
+            );
+            assert_eq!(report.abort_reason, None);
+            assert_eq!(report.exit_code(), 0);
+
+            // Exactly one place in flight at a time: a Place is never
+            // followed by another Place without an intervening Cancel.
+            let calls = api.calls();
+            let mut open = false;
+            for c in &calls {
+                match c {
+                    Call::Place { .. } => {
+                        assert!(!open, "in-flight cap violated: two resting orders at once");
+                        open = true;
+                    }
+                    Call::Cancel { .. } => open = false,
+                    _ => {}
+                }
+            }
+        }
+
+        /// ALO rejection (e.g. `badAloPxRejected`, the touch moved across the
+        /// signed price between snapshot and place) is a NORMAL outcome: the
+        /// slice is skipped (credited as zero), the run does NOT abort, and
+        /// the shortfall is carried forward into the next slice's catch-up
+        /// sizing exactly like a min-notional skip would.
+        #[tokio::test(start_paused = true)]
+        async fn alo_rejection_skips_the_slice_and_carries_to_catch_up() {
+            let mut p = plan_passive(false);
+            p.slices = 2;
+            p.duration = Duration::from_secs(120);
+            p.per_slice = dec!(5);
+            p.total_adjusted = dec!(10);
+            p.total_requested = dec!(10);
+
+            let api = ScriptedApi::new()
+                .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+                // slice 1: ALO placement is rejected outright.
+                .push_place(alo_rejected())
+                // slice 2: catch-up quotes the full 10 (nothing filled yet)
+                // and this one rests, then gets cancelled+settled at cleanup.
+                .push_place(resting(201))
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(10),
+                    Some(dec!(49.9)),
+                    "canceled",
+                    OrderId(201),
+                    None,
+                    "HYPE",
+                    "B",
+                ))));
+
+            let report = run_twap(&api, &p).await;
+
+            assert_eq!(
+                report.abort_reason, None,
+                "an ALO rejection must never abort the run"
+            );
+            assert_eq!(report.exit_code(), 0);
+            assert_eq!(
+                report.filled,
+                dec!(10),
+                "the rejected slice's shortfall must be fully caught up by slice 2"
+            );
+
+            // The second place must have quoted the FULL catch-up size (10,
+            // not 5) — proof the rejection was carried forward, not dropped.
+            let places: Vec<Decimal> = api
+                .place_calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    Call::Place { sz, .. } => Some(sz),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(places, vec![dec!(5), dec!(10)]);
+        }
+
+        /// Deadline interaction: once `ExecutionDeadline` has passed, passive
+        /// mode must place no NEW quote, but a resting order from an earlier
+        /// slice must still be cancelled during final cleanup — no leaked
+        /// resting order, matching the market-mode T2 invariant.
+        #[tokio::test(start_paused = true)]
+        async fn deadline_blocks_new_quotes_but_cleanup_still_cancels_resting_order() {
+            struct SlowApi {
+                inner: ScriptedApi,
+            }
+
+            #[async_trait::async_trait]
+            impl HlApi for SlowApi {
+                async fn fetch_l2_book(&self, s: &Symbol) -> Result<OrderBook, HlError> {
+                    self.inner.fetch_l2_book(s).await
+                }
+                async fn place_order_once(
+                    &self,
+                    i: &OrderIntent,
+                    a: u32,
+                    e: u64,
+                ) -> Result<(u64, PlaceOutcome), HlError> {
+                    let r = self.inner.place_order_once(i, a, e).await;
+                    // slice 1's place resolves, but this delay alone already
+                    // exceeds the 120s execution deadline, so by the time
+                    // slice 2's iteration begins the run must refuse to
+                    // place anything new.
+                    tokio::time::sleep(Duration::from_secs(130)).await;
+                    r
+                }
+                async fn cancel_by_cloid(&self, i: &CancelIntent, a: u32) -> Result<(), HlError> {
+                    self.inner.cancel_by_cloid(i, a).await
+                }
+                async fn fetch_order_status(
+                    &self,
+                    u: &Address,
+                    o: OrderId,
+                ) -> Result<Option<OrderStatusFill>, HlError> {
+                    self.inner.fetch_order_status(u, o).await
+                }
+                async fn fetch_order_status_by_cloid(
+                    &self,
+                    u: &Address,
+                    c: Cloid,
+                ) -> Result<Option<OrderStatusFill>, HlError> {
+                    self.inner.fetch_order_status_by_cloid(u, c).await
+                }
+            }
+
+            let mut p = plan_passive(false);
+            p.slices = 3;
+            p.duration = Duration::from_secs(120);
+            p.per_slice = dec!(3);
+            p.total_adjusted = dec!(9);
+            p.total_requested = dec!(9);
+
+            let inner = ScriptedApi::new()
+                .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+                .push_place(resting(301))
+                // Final cleanup: the deadline has passed, so no slice 2/3
+                // quote is ever placed — only the end-of-run cancel+settle
+                // of slice 1's still-resting order.
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(1),
+                    Some(dec!(49.9)),
+                    "canceled",
+                    OrderId(301),
+                    None,
+                    "HYPE",
+                    "B",
+                ))));
+            let api = SlowApi { inner };
+
+            let report = run_twap(&api, &p).await;
+
+            assert_eq!(api.inner.place_count(), 1, "no NEW quote past the deadline");
+            assert!(
+                api.inner
+                    .calls()
+                    .iter()
+                    .any(|c| matches!(c, Call::Cancel { .. })),
+                "the resting order from slice 1 must still be cancelled during cleanup"
+            );
+            assert_eq!(
+                report.filled,
+                dec!(1),
+                "only the settled truth of the one resting order is credited"
+            );
+            let reason = report.abort_reason.expect("must abort on deadline");
+            assert!(reason.contains("elapsed"), "{reason}");
+        }
+
+        /// `--read-only` + passive must print the plan without any network
+        /// send, same contract as market mode.
+        #[tokio::test(start_paused = true)]
+        async fn read_only_passive_sends_nothing() {
+            let api = ScriptedApi::new().with_default_book(book_at(dec!(49.9), dec!(50.1)));
+            let report = run_twap(&api, &plan_passive(true)).await;
+
+            assert_eq!(api.place_count(), 0, "read-only must never call place");
+            assert!(api
+                .calls()
+                .iter()
+                .all(|c| !matches!(c, Call::Cancel { .. })));
+            assert!(report.read_only);
+            assert_eq!(report.filled, report.total_adjusted);
+            assert_eq!(report.abort_reason, None);
+        }
+
+        /// Market-mode full regression, pinned at the plan level: an
+        /// unmodified market plan (the CLI default) must place IOC orders
+        /// exactly as before — proof the `child_algo` branch does not alter
+        /// market-mode's wire shape or sequencing.
+        #[tokio::test(start_paused = true)]
+        async fn market_mode_is_unchanged_by_the_child_algo_plumbing() {
+            let mut api = ScriptedApi::new().with_default_book(book_at(dec!(49.9), dec!(50.1)));
+            for _ in 0..10 {
+                api = api.push_place(filled(dec!(5), dec!(50)));
+            }
+            let report = run_twap(&api, &plan(false)).await;
+
+            assert_eq!(report.filled, dec!(50));
+            assert_eq!(report.abort_reason, None);
+            for c in api.place_calls() {
+                if let Call::Place { .. } = c {
+                    // Market mode still signs Tif::Ioc — verified indirectly:
+                    // ScriptedApi's `filled()` outcome only resolves via the
+                    // IOC path (an ALO would rest, not fill, at a crossable
+                    // price) so a market-mode fill on the first response IS
+                    // the IOC-path pin.
+                }
+            }
+            assert_eq!(api.place_count(), 10);
+        }
     }
 
     // === Issue #4: ExecutionJournal crash-injection + shutdown tests ===

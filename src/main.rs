@@ -25,8 +25,8 @@ use hype_trigger_twap::trigger::{
     wait_for_trigger, TriggerConfig, TriggerOutcome, TriggerReason, TriggerWhen,
 };
 use hype_trigger_twap::twap::{
-    check_clock_skew, compute_sizing, fetch_fresh_book, usd_to_coin, wall_clock_now_ms, TwapPlan,
-    MIN_NOTIONAL_USD, READ_ONLY_BANNER,
+    check_clock_skew, compute_sizing, fetch_fresh_book, usd_to_coin, wall_clock_now_ms, ChildAlgo,
+    TwapPlan, MIN_NOTIONAL_USD, READ_ONLY_BANNER,
 };
 use hype_trigger_twap::types::{Address, Side, Symbol};
 
@@ -100,6 +100,32 @@ impl From<NetworkArg> for Network {
         match n {
             NetworkArg::Mainnet => Network::Mainnet,
             NetworkArg::Testnet => Network::Testnet,
+        }
+    }
+}
+
+/// Child-order algorithm for each slice (Issue #1).
+///
+/// `market` (default): unchanged pre-Issue-#1 behaviour — an IOC taker limit
+/// at `mid +/- slippage-bps`.
+///
+/// `passive`: a post-only (ALO) limit resting at the best bid (long) / best
+/// ask (short), waiting the full slice interval. See docs/DESIGN.md for the
+/// cancel-then-settle reconciliation this mode performs at each slice
+/// boundary and the in-flight-order cap that bounds it to at most one
+/// resting child order at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+enum ChildAlgoArg {
+    #[default]
+    Market,
+    Passive,
+}
+
+impl From<ChildAlgoArg> for ChildAlgo {
+    fn from(a: ChildAlgoArg) -> Self {
+        match a {
+            ChildAlgoArg::Market => ChildAlgo::Market,
+            ChildAlgoArg::Passive => ChildAlgo::Passive,
         }
     }
 }
@@ -253,6 +279,14 @@ struct Cli {
     /// cloid journaled as `outcome_unknown`.
     #[arg(long, value_parser = parse_duration, default_value = "60s")]
     shutdown_grace: Duration,
+
+    /// Child-order algorithm for each slice (Issue #1). `market` (default)
+    /// reproduces pre-Issue-#1 behaviour exactly: an IOC taker limit at
+    /// mid +/- slippage-bps. `passive` places a post-only (ALO) limit at the
+    /// best bid (long) / best ask (short) and waits the full slice interval;
+    /// see README/docs/DESIGN.md for the semantics.
+    #[arg(long, value_enum, default_value = "market")]
+    child_algo: ChildAlgoArg,
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -667,6 +701,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
             max_notional_usd: Decimal::MAX,
             agent: agent_address.clone(),
             master: master.clone(),
+            child_algo: cli.child_algo.into(),
         };
 
         if let Some(resume_id) = &cli.resume {
@@ -908,6 +943,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         max_notional_usd,
         agent: agent_address.clone(),
         master: master.clone(),
+        child_algo: cli.child_algo.into(),
     };
 
     // Issue #4: this plan's hash — computed identically whether starting a
@@ -1104,6 +1140,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
                 max_notional_usd: original_plan.max_notional_usd,
                 agent: original_plan.agent.clone(),
                 master: original_plan.master.clone(),
+                child_algo: original_plan.child_algo,
             }
         }
     };
@@ -1421,6 +1458,33 @@ mod tests {
         assert_eq!(cli.max_book_age_ms, 3000);
         assert_eq!(cli.trigger_poll_secs, 2);
         assert_eq!(cli.wait_network_grace, Duration::from_secs(30 * 60));
+    }
+
+    // === Issue #1: --child-algo ===
+
+    #[test]
+    fn child_algo_defaults_to_market_and_maps_to_the_market_variant() {
+        let cli = Cli::try_parse_from(base_args()).unwrap();
+        assert_eq!(cli.child_algo, ChildAlgoArg::Market);
+        assert_eq!(ChildAlgo::from(cli.child_algo), ChildAlgo::Market);
+    }
+
+    #[test]
+    fn child_algo_passive_parses_and_maps_to_the_passive_variant() {
+        let mut args = base_args();
+        args.push("--child-algo");
+        args.push("passive");
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert_eq!(cli.child_algo, ChildAlgoArg::Passive);
+        assert_eq!(ChildAlgo::from(cli.child_algo), ChildAlgo::Passive);
+    }
+
+    #[test]
+    fn child_algo_rejects_an_unknown_value() {
+        let mut args = base_args();
+        args.push("--child-algo");
+        args.push("aggressive");
+        assert!(Cli::try_parse_from(args).is_err());
     }
 
     #[test]
