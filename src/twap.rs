@@ -1284,14 +1284,47 @@ pub async fn run_twap(client: &dyn HlApi, plan: &TwapPlan) -> TwapReport {
 /// run never leaves a live order unresolved AND never double-places (the
 /// cloid is resolved to `Terminal` here; nothing on this codepath ever
 /// calls `place_order_once`).
+/// A2 fix: `reconcile_unresolved_cloid` needs the ORIGINAL intent (px, sz)
+/// it was journaled under (the `Prepared` record) in order to run
+/// `ValidatedFill::try_from_status` — the same overfill/bounds check every
+/// other fill in this codebase goes through (Issue #7) — rather than
+/// crediting a raw `orderStatus` response with only `cross_check` (identity,
+/// no bounds). Built by the caller from the `Prepared` record it already
+/// reads to recover `slice_idx` (see `main.rs::reconcile_incomplete_run`).
+pub struct PreparedIntent {
+    pub symbol: Symbol,
+    pub side: Side,
+    pub px: Decimal,
+    pub sz: Decimal,
+}
+
+impl PreparedIntent {
+    fn as_order_intent(&self, cloid: Cloid) -> OrderIntent {
+        OrderIntent {
+            cloid,
+            symbol: self.symbol.clone(),
+            side: self.side,
+            px: self.px,
+            sz: self.sz,
+            // Unused by ValidatedFill::validate (only cloid/symbol/side/px/sz
+            // are read); Tif::Alo is broadest-compatible for either child
+            // algo's original Prepared record.
+            tif: Tif::Alo,
+            reduce_only: false,
+        }
+    }
+}
+
 pub async fn reconcile_unresolved_cloid(
     client: &dyn HlApi,
     plan: &TwapPlan,
     cloid: Cloid,
     slice_idx: u32,
+    prepared: &PreparedIntent,
     journal: &mut ExecutionJournal,
 ) -> Result<(), HlError> {
     let user = plan.status_user()?;
+    let intent = prepared.as_order_intent(cloid);
 
     // Single probe: is this cloid currently live/non-terminal (resting)?
     // Market-mode IOC orders can never observably be in this state by the
@@ -1308,13 +1341,17 @@ pub async fn reconcile_unresolved_cloid(
             );
             let settled = recover_resting_fill(client, plan, cloid, st.oid).await?;
             settled.cross_check(plan.symbol.as_str(), &plan.side, Some(cloid))?;
+            // A2 fix: bounds-validate (0<=filled<=intent.sz, avg_px>0 when
+            // filled>0) against the ORIGINAL Prepared intent before crediting
+            // — cross_check alone only proves identity, not sane magnitude.
+            let vf = ValidatedFill::try_from_status(&settled, &intent)?;
             journal_terminal(
                 Some(journal),
                 slice_idx,
                 cloid,
                 &settled.status,
-                settled.filled_sz,
-                settled.avg_px,
+                vf.filled_sz,
+                vf.avg_px,
             )?;
             return Ok(());
         }
@@ -1322,13 +1359,17 @@ pub async fn reconcile_unresolved_cloid(
 
     match reconcile_by_cloid(client, plan, user, cloid).await {
         Ok(Some(st)) => {
+            // A2 fix: same bounds validation for the reconcile_by_cloid
+            // fallthrough branch — this is the ambiguous-send resolution
+            // path most likely to see an anomalous post-crash response.
+            let vf = ValidatedFill::try_from_status(&st, &intent)?;
             journal_terminal(
                 Some(journal),
                 slice_idx,
                 cloid,
                 &st.status,
-                st.filled_sz,
-                st.avg_px,
+                vf.filled_sz,
+                vf.avg_px,
             )?;
             Ok(())
         }
@@ -1752,6 +1793,20 @@ pub async fn run_twap_journaled(
                         ));
                         break;
                     }
+                }
+
+                // A1 fix: re-check the ExecutionDeadline immediately before
+                // the send, same guarantee `place_slice_reconciled` gives
+                // market mode via its own `check_before_send` call. Without
+                // this, a book fetch that consumes nearly the whole
+                // remaining deadline (bounded by `fetch_fresh_book`'s own
+                // internal timeout, Issue #2 finding 2) could return
+                // successfully just under the wire and fall straight through
+                // to this send with the deadline already elapsed, relying
+                // only on exchange-side `expiresAfter` as a backstop.
+                if let Err(e) = exec_deadline.check_before_send(tokio::time::Instant::now()) {
+                    abort_reason = Some(format!("slice {slice_idx}: {e}"));
+                    break;
                 }
 
                 // Issue #1 PM decision: an ALO rejection (e.g.
@@ -4574,6 +4629,103 @@ mod loop_tests {
             assert_eq!(report.abort_reason, None);
         }
 
+        /// A1 fix: the passive (ALO) placement call must re-check
+        /// `ExecutionDeadline::check_before_send` immediately before the send,
+        /// same as `place_slice_reconciled` does for market mode. Without
+        /// this gate, a post-only order can still be signed and sent after
+        /// the monotonic deadline has passed, relying only on exchange-side
+        /// `expiresAfter` as a backstop.
+        ///
+        /// The reachable gap: `fetch_fresh_book` bounds its own in-flight
+        /// call to the deadline's REMAINING time via `tokio::time::timeout`
+        /// (Issue #2 finding 2) — so a book fetch that takes almost exactly
+        /// the remaining budget returns successfully just under the wire,
+        /// with the deadline now elapsed by the time control returns to the
+        /// slice loop. The top-of-loop `exec_deadline.has_passed` check
+        /// already ran (and passed) BEFORE this fetch. Market mode is safe
+        /// because `place_slice_reconciled` re-checks `check_before_send`
+        /// immediately before its send; the passive branch has no such
+        /// re-check, so it sails straight through to `place_order_once`
+        /// after the deadline has already elapsed.
+        #[tokio::test(start_paused = true)]
+        async fn a1_passive_placement_is_gated_by_check_before_send_immediately_before_the_send() {
+            struct SlowBookApi {
+                inner: ScriptedApi,
+                book_delay: Duration,
+            }
+
+            #[async_trait::async_trait]
+            impl HlApi for SlowBookApi {
+                async fn fetch_l2_book(&self, s: &Symbol) -> Result<OrderBook, HlError> {
+                    tokio::time::sleep(self.book_delay).await;
+                    self.inner.fetch_l2_book(s).await
+                }
+                async fn place_order_once(
+                    &self,
+                    i: &OrderIntent,
+                    a: u32,
+                    e: u64,
+                ) -> Result<(u64, PlaceOutcome), HlError> {
+                    self.inner.place_order_once(i, a, e).await
+                }
+                async fn cancel_by_cloid(&self, i: &CancelIntent, a: u32) -> Result<(), HlError> {
+                    self.inner.cancel_by_cloid(i, a).await
+                }
+                async fn fetch_order_status(
+                    &self,
+                    u: &Address,
+                    o: OrderId,
+                ) -> Result<Option<OrderStatusFill>, HlError> {
+                    self.inner.fetch_order_status(u, o).await
+                }
+                async fn fetch_order_status_by_cloid(
+                    &self,
+                    u: &Address,
+                    c: Cloid,
+                ) -> Result<Option<OrderStatusFill>, HlError> {
+                    self.inner.fetch_order_status_by_cloid(u, c).await
+                }
+            }
+
+            let mut inner = ScriptedApi::new().with_default_book(book_at(dec!(49.9), dec!(50.1)));
+            inner = inner.push_place(Ok(PlaceOutcome::Resting { oid: OrderId(101) }));
+
+            // Window is 1 second; the book fetch itself takes exactly the
+            // full window, so `fetch_fresh_book`'s internal
+            // `tokio::time::timeout(remaining, ...)` races the fetch against
+            // the SAME instant the deadline elapses. With a paused clock,
+            // ties go to whichever future is polled/ready first once time is
+            // advanced to that instant, and tokio's timeout wakes on `>=`
+            // deadline just like `has_passed` — so the fetch resolves
+            // successfully at (not before) the moment the deadline has
+            // already elapsed, reproducing the reachable "just under the
+            // wire" gap while remaining deterministic under `start_paused`.
+            let api = SlowBookApi {
+                inner,
+                book_delay: Duration::from_secs(1),
+            };
+
+            let mut p = plan_passive(false);
+            p.duration = Duration::from_secs(1);
+            p.slices = 1;
+            let report = run_twap(&api, &p).await;
+
+            assert_eq!(
+                api.inner.place_count(),
+                0,
+                "the passive send must be gated by check_before_send immediately \
+                 before place_order_once — a book fetch that consumes nearly the \
+                 whole deadline must not be followed by a send after it elapsed"
+            );
+            let reason = report
+                .abort_reason
+                .expect("must abort once the deadline has elapsed before the passive send");
+            assert!(
+                reason.contains("deadline"),
+                "expected a deadline-related abort reason, got: {reason}"
+            );
+        }
+
         /// Market-mode full regression, pinned at the plan level: an
         /// unmodified market plan (the CLI default) must place IOC orders
         /// exactly as before — proof the `child_algo` branch does not alter
@@ -5215,9 +5367,22 @@ mod loop_tests {
 
             let mut journal =
                 ExecutionJournal::open_existing(tmp.path(), "run-passive-resume").unwrap();
-            reconcile_unresolved_cloid(&reconcile_api, &p, resting_cloid, 1, &mut journal)
-                .await
-                .expect("reconciling a live passive resting order must succeed");
+            let prepared = PreparedIntent {
+                symbol: Symbol::new("HYPE"),
+                side: Side::Long,
+                px: dec!(49.9),
+                sz: dec!(3),
+            };
+            reconcile_unresolved_cloid(
+                &reconcile_api,
+                &p,
+                resting_cloid,
+                1,
+                &prepared,
+                &mut journal,
+            )
+            .await
+            .expect("reconciling a live passive resting order must succeed");
 
             // (a) the resting order was actively cancelled and settled —
             // proven via the call log, not just the outcome.
@@ -5316,6 +5481,185 @@ mod loop_tests {
             let final_summary = summarize(&final_records);
             assert!(final_summary.unresolved_cloids().is_empty());
             assert_eq!(final_summary.total_filled(), dec!(6));
+        }
+
+        // === A2: reconcile_unresolved_cloid must validate the fill it
+        // credits (ValidatedFill::try_from_status bounds: 0 <= filled_sz <=
+        // intent.sz, avg_px > 0 when filled_sz > 0), not just cross_check
+        // (identity only), against the ORIGINAL Prepared intent for the
+        // cloid — same trusted-boundary treatment `place_slice_reconciled`
+        // and `settle_resting_child` give every other fill in this codebase
+        // (Issue #7). Before this fix, an anomalous post-crash orderStatus
+        // response reporting MORE filled than was ever requested would be
+        // credited verbatim into the journal's Terminal record and flow into
+        // `RunSummary::total_filled()` / `--resume`'s remainder sizing.
+
+        /// recover_resting_fill branch (the live/resting probe path):
+        /// requested size 3, but the post-cancel terminal poll reports an
+        /// impossible 5 filled. Must hard-stop, not credit 5.
+        #[tokio::test(start_paused = true)]
+        async fn a2_resume_hard_stops_on_an_overfill_from_the_resting_probe_branch() {
+            let tmp = TempDir::new();
+            let cloid = Cloid::new();
+
+            {
+                let mut journal = ExecutionJournal::start(
+                    tmp.path(),
+                    "run-a2-overfill-resting".into(),
+                    test_header(),
+                )
+                .unwrap();
+                journal
+                    .record(&JournalRecord::Prepared {
+                        slice_idx: 1,
+                        cloid,
+                        nonce: None,
+                        symbol: Symbol::new("HYPE"),
+                        side: Side::Long,
+                        px: "49.9".into(),
+                        sz: "3".into(),
+                    })
+                    .unwrap();
+                journal
+                    .record(&JournalRecord::Acknowledged {
+                        slice_idx: 1,
+                        cloid,
+                        oid: Some(999),
+                        status: "resting".into(),
+                    })
+                    .unwrap();
+            }
+
+            let p = plan_passive(false);
+            let api = ScriptedApi::new()
+                // Still LIVE on the resume probe -> routes into
+                // recover_resting_fill (cancel + poll_terminal_status).
+                .push_status(Ok(Some(status_full(
+                    dec!(0),
+                    None,
+                    "open",
+                    OrderId(999),
+                    Some(cloid),
+                    "HYPE",
+                    "B",
+                ))))
+                .push_cancel(Ok(()))
+                // Impossible: 5 filled against a requested size of 3.
+                .push_status(Ok(Some(status_full(
+                    dec!(5),
+                    Some(dec!(49.9)),
+                    "canceled",
+                    OrderId(999),
+                    Some(cloid),
+                    "HYPE",
+                    "B",
+                ))));
+
+            let mut journal =
+                ExecutionJournal::open_existing(tmp.path(), "run-a2-overfill-resting").unwrap();
+            let prepared = PreparedIntent {
+                symbol: Symbol::new("HYPE"),
+                side: Side::Long,
+                px: dec!(49.9),
+                sz: dec!(3),
+            };
+            let err = reconcile_unresolved_cloid(&api, &p, cloid, 1, &prepared, &mut journal)
+                .await
+                .expect_err("an overfill reported during resume reconciliation must hard-stop");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("overfill") || msg.contains("exceeds intent size"),
+                "expected an overfill/bounds validation error, got: {msg}"
+            );
+
+            // Must NOT have been credited into the journal.
+            let records =
+                ExecutionJournal::read_all(tmp.path(), "run-a2-overfill-resting").unwrap();
+            let summary = summarize(&records);
+            assert_eq!(
+                summary.total_filled(),
+                Decimal::ZERO,
+                "the invalid overfill must never reach the journal's credited total"
+            );
+        }
+
+        /// reconcile_by_cloid fallthrough branch (the terminal/not-found
+        /// probe path): requested size 3, but the terminal orderStatus
+        /// response reports an impossible 5 filled. Must hard-stop, not
+        /// credit 5.
+        #[tokio::test(start_paused = true)]
+        async fn a2_resume_hard_stops_on_an_overfill_from_the_reconcile_by_cloid_branch() {
+            let tmp = TempDir::new();
+            let cloid = Cloid::new();
+
+            {
+                let mut journal = ExecutionJournal::start(
+                    tmp.path(),
+                    "run-a2-overfill-fallthrough".into(),
+                    test_header(),
+                )
+                .unwrap();
+                journal
+                    .record(&JournalRecord::Prepared {
+                        slice_idx: 1,
+                        cloid,
+                        nonce: None,
+                        symbol: Symbol::new("HYPE"),
+                        side: Side::Long,
+                        px: "49.9".into(),
+                        sz: "3".into(),
+                    })
+                    .unwrap();
+                journal
+                    .record(&JournalRecord::SubmittedUnknown {
+                        slice_idx: 1,
+                        cloid,
+                    })
+                    .unwrap();
+            }
+
+            let p = plan(false); // market mode: reconcile_by_cloid fallthrough
+            let api = ScriptedApi::new()
+                // First probe (fetch_order_status_by_cloid): not found live
+                // -> falls through to reconcile_by_cloid.
+                .push_status(Ok(None))
+                // reconcile_by_cloid's own probe: terminal, but with an
+                // impossible 5 filled against a requested size of 3.
+                .push_status(Ok(Some(status_full(
+                    dec!(5),
+                    Some(dec!(50)),
+                    "filled",
+                    OrderId(999),
+                    Some(cloid),
+                    "HYPE",
+                    "B",
+                ))));
+
+            let mut journal =
+                ExecutionJournal::open_existing(tmp.path(), "run-a2-overfill-fallthrough").unwrap();
+            let prepared = PreparedIntent {
+                symbol: Symbol::new("HYPE"),
+                side: Side::Long,
+                px: dec!(49.9),
+                sz: dec!(3),
+            };
+            let err = reconcile_unresolved_cloid(&api, &p, cloid, 1, &prepared, &mut journal)
+                .await
+                .expect_err("an overfill reported via reconcile_by_cloid must hard-stop");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("overfill") || msg.contains("exceeds intent size"),
+                "expected an overfill/bounds validation error, got: {msg}"
+            );
+
+            let records =
+                ExecutionJournal::read_all(tmp.path(), "run-a2-overfill-fallthrough").unwrap();
+            let summary = summarize(&records);
+            assert_eq!(
+                summary.total_filled(),
+                Decimal::ZERO,
+                "the invalid overfill must never reach the journal's credited total"
+            );
         }
     }
 }

@@ -1337,10 +1337,55 @@ async fn reconcile_incomplete_run(
             })
             .collect();
 
+    // A2: `reconcile_unresolved_cloid` validates every fill it credits
+    // (`ValidatedFill::try_from_status`, bounds: 0<=filled<=intent.sz,
+    // avg_px>0 when filled>0) against the ORIGINAL Prepared intent for its
+    // cloid — the same trusted-boundary treatment every other fill in this
+    // codebase gets (Issue #7). Build that map alongside slice_idx's, from
+    // the SAME `Prepared` records (every cloid reconciled here was, by
+    // construction, journaled with one — see the note above).
+    let prepared_by_cloid: std::collections::HashMap<
+        hype_trigger_twap::types::Cloid,
+        hype_trigger_twap::twap::PreparedIntent,
+    > = records
+        .iter()
+        .filter_map(|r| match r {
+            hype_trigger_twap::journal::JournalRecord::Prepared {
+                cloid,
+                symbol,
+                side,
+                px,
+                sz,
+                ..
+            } => {
+                let px: Decimal = px.parse().ok()?;
+                let sz: Decimal = sz.parse().ok()?;
+                Some((
+                    *cloid,
+                    hype_trigger_twap::twap::PreparedIntent {
+                        symbol: symbol.clone(),
+                        side: *side,
+                        px,
+                        sz,
+                    },
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+
     for cloid in summary.unresolved_cloids() {
         let slice_idx = slice_idx_by_cloid.get(&cloid).copied().unwrap_or(0);
+        let prepared = prepared_by_cloid.get(&cloid).ok_or_else(|| {
+            format!(
+                "cannot reconcile cloid {cloid}: no Prepared record found in this run's own \
+                 journal — the journal is malformed (every cloid reachable via \
+                 unresolved_cloids() must have been journaled with a Prepared record before \
+                 the send that made it unresolved)"
+            )
+        })?;
         hype_trigger_twap::twap::reconcile_unresolved_cloid(
-            client, plan, cloid, slice_idx, journal,
+            client, plan, cloid, slice_idx, prepared, journal,
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -3418,6 +3463,16 @@ mod tests {
                 },
             )
             .unwrap();
+            j.record(&hype_trigger_twap::journal::JournalRecord::Prepared {
+                slice_idx: 1,
+                cloid: prior_cloid,
+                nonce: None,
+                symbol: hype_trigger_twap::types::Symbol::new("HYPE"),
+                side: hype_trigger_twap::types::Side::Long,
+                px: "50".into(),
+                sz: "1".into(),
+            })
+            .unwrap();
             j.record(
                 &hype_trigger_twap::journal::JournalRecord::SubmittedUnknown {
                     slice_idx: 1,
@@ -3496,6 +3551,16 @@ mod tests {
                     started_at_unix_ms: 0,
                 },
             )
+            .unwrap();
+            j.record(&hype_trigger_twap::journal::JournalRecord::Prepared {
+                slice_idx: 1,
+                cloid: prior_cloid,
+                nonce: None,
+                symbol: hype_trigger_twap::types::Symbol::new("HYPE"),
+                side: hype_trigger_twap::types::Side::Long,
+                px: "50".into(),
+                sz: "1".into(),
+            })
             .unwrap();
             j.record(
                 &hype_trigger_twap::journal::JournalRecord::SubmittedUnknown {
