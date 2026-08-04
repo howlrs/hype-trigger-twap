@@ -280,6 +280,84 @@ target_at_slice(i) = per_slice × i     (最終スライスは adjusted 合計�
 扱います。軽度のクロックずれを許容するためです。これを超える未来タイムスタンプは、クロックずれ
 ではなく不正なレスポンスの可能性が高いため、`--max-book-age-ms` の値に関わらず拒否します。
 
+### 子注文アルゴリズム: market / passive (Issue #1)
+
+`TwapPlan.child_algo` (`--child-algo market|passive`、既定 `market`) は、
+各スライスが実際にどう発注されるかを切り替える。市場価格・丸め・
+risk gate (`RiskEnvelope::check_notional_cap` / `validate_limit_price`)・
+`ExecutionDeadline` チェック・catch-up サイジング (`decide_slice` /
+`slice_order_size` / `target_at_slice`) はどちらのアルゴリズムでも
+**完全に共通のコードパス**を通る。分岐するのは「どんな `Tif` でいくらの
+価格に発注するか」と「発注後にどう扱うか」だけであり、`child_algo` の
+有無によって既存のサイジング・ガードのロジックが複製・分岐することはない。
+
+#### market (既定)
+
+`Tif::Ioc`、`taker_limit_price` (mid ± `slippage_bps`) で発注し、
+`place_slice_reconciled` が即座に結果を確定させる (直接約定 / resting からの
+回収 / 曖昧送信の照合、いずれも T3/T5 の一箇所でのみ計上)。0.1.0 からの
+挙動を変えない。
+
+#### passive
+
+`Tif::Alo` を使い、価格は `round_price` で snap した best_bid (long) /
+best_ask (short) — market と**同じ丸め関数**を使うが、slippage cushion は
+乗せない (post-only の意味上、taker 方向に寄せる理由がないため)。
+
+**状態管理**: ループは `resting: Option<RestingChild>` を 1 個だけ保持する。
+`RestingChild { cloid, oid, requested_sz, px }` が `Some` になるのは ALO が
+`Resting` で返ってきた直後のみで、次にこの変数が読まれる箇所は 2 つしかない
+— (a) 次のスライスのループ先頭、(b) ループ脱出後の最終クリーンアップ。
+**この `Option` 自体が in-flight cap の実装であり**、新しい ALO は
+`resting` が `None` のときにしか送信されない。姉妹リポジトリで確認された
+「cancel と place の競合で target を超過する」不具合 (PR-D10) は、
+2 件目の resting 注文が同時に存在しうる設計だったために起きたもので、
+本実装はその設計を構造的に排除している。
+
+**cancel→settle (レース対策)**: 前スライスの ALO がまだ resting のまま
+次のスライス境界に到達すると、ループは何よりも先に
+`settle_resting_child` を呼ぶ (この呼び出しはその回の `ExecutionDeadline`
+チェックより前に行われる — cancel/orderStatus は「期限後も許可される操作」
+という既存ポリシーの延長)。`settle_resting_child` は market モードの
+resting-IOC 回収経路と**同じ関数** `recover_resting_fill` を呼び出す:
+
+```
+cancelByCloid(cloid)  // 失敗しても致命的ではない — 次の orderStatus が真実を語る
+poll_terminal_status(oid)  // 終端ステータスが返るまでリトライ
+```
+
+cancel を送った直後に約定がすり抜けて着地する race が起きても、
+`filled_so_far` に加算される量は**必ず cancel 後の `orderStatus` が
+返した値**であり、cancel 送信時点のスナップショットや「resting していた
+から未約定とみなす」という仮定を一切使わない。これにより過大計上
+(over-count) も過小計上 (under-count) も起こり得ない。確定した約定量は
+既存の `ValidatedFill::try_from_status` を通して検証され (overfill・
+非正 avgPx・limit を跨いだ約定はすべて拒否)、その後で次のスライスの
+catch-up サイジングに合流する。
+
+**ALO 拒否は正常系**: `place_order_once` が `HlError::Exchange` を返し、
+メッセージに `alo` を含む (例: `badAloPxRejected`) 場合、それは板を跨いで
+taker になってしまう post-only 拒否であり、**エラーとして扱わない**。
+そのスライスはゼロ約定の skip として `slices_skipped` に計上され、
+実行は中断せずに次のスライスへ進む。不足分は `target_at_slice` が
+累積目標であることから自動的に catch-up される — 最低名目金額未満の
+skip と全く同じ繰り越しメカニズムを再利用している。ALO 以外の拒否
+(証拠金不足など) は market モードと同様に致命的で、実行を中断する。
+
+**期限とシャットダウンでのクリーンアップ**: `ExecutionDeadline` が経過した
+後は新規の ALO を一切送らない (market と同じ "place/resend 禁止、
+status 照会/cancel は継続可" ポリシー)。ループを抜けた直後
+(正常終了・期限経過・shutdown 要求・例外的な abort のいずれであっても、
+`run_twap_journaled` に `return` 文は存在せず全経路が `break` で
+ループを抜けるため、この後処理は無条件に到達する) に、
+`resting` がまだ `Some` であれば同じ `settle_resting_child` で
+cancel→確定させてから最終レポートを組み立てる。これにより
+「resting のまま板に注文が残る」リークは構造的に発生しない。
+
+**スコープ外**: スライス内での即時 re-quote (touch が動いた瞬間の
+cancel→再quote) は実装していない。再quote はスライス境界でのみ発生する
+(効果測定後に別途検討する設計判断)。
+
 ## エラー処理
 
 最も重要な区別は次の 3 つです。
