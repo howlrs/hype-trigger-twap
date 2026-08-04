@@ -21,9 +21,14 @@ hype-twap --symbol HYPE --side long --usd 1500 --duration 30m
 
 ### 本番実行 (即時開始)
 
+`--read-only false` (本番実行) では `--max-notional-usd` が **必須**です (Issue #3、
+0.1.0 からの破壊的変更)。指定しないと起動時に拒否されます。詳細は
+[「risk envelope (Issue #3)」](#risk-envelope-issue-3) を参照してください。
+
 ```bash
 export HL_AGENT_PK=0x<64桁の16進数>
-hype-twap --symbol HYPE --side long --usd 1500 --duration 30m --read-only false
+hype-twap --symbol HYPE --side long --usd 1500 --duration 30m \
+  --max-notional-usd 2000 --read-only false
 ```
 
 ### 価格トリガー + タイムアウト
@@ -32,14 +37,16 @@ HYPE が $40 に到達したら開始。ただし 2 時間待っても到達し�
 
 ```bash
 hype-twap --symbol HYPE --side long --size 50 --duration 1h \
-  --trigger-price 40 --trigger-when above --start-after 2h --read-only false
+  --trigger-price 40 --trigger-when above --start-after 2h \
+  --max-notional-usd 3000 --read-only false
 ```
 
 ### ショート (testnet、20 スライス / 2 時間)
 
 ```bash
 hype-twap --symbol ETH --side short --usd 5000 --duration 2h --slices 20 \
-  --trigger-price 3000 --trigger-when below --network testnet --read-only false
+  --trigger-price 3000 --trigger-when below --network testnet \
+  --max-notional-usd 6000 --read-only false
 ```
 
 ## フラグ一覧
@@ -57,7 +64,10 @@ hype-twap --symbol ETH --side short --usd 5000 --duration 2h --slices 20 \
 | `--start-after` | 期間 | なし | 指定時間の経過で発火。価格トリガーとは OR 条件 (先に成立した方が勝ち) |
 | `--read-only` | `true` \| `false` | **`true`** | `true` は署名も送信も行いません |
 | `--network` | `mainnet` \| `testnet` | `mainnet` | API エンドポイントと EIP-712 の `Agent.source` を同時に切り替えます (不整合が起きない設計) |
-| `--slippage-bps` | 数値 | `20` | IOC 指値に乗せるスリッページ余裕 (ベーシスポイント) |
+| `--slippage-bps` | 数値 | `20` | IOC 指値に乗せるスリッページ余裕 (ベーシスポイント)。**10000 bps 以上、または非正の指値になる値は無条件で拒否** (override 不可)。**1000 bps 超は `--allow-high-slippage` が必須** |
+| `--allow-high-slippage` | フラグ | `false` | **unsafe override**。`--slippage-bps` が 1000 bps を超える場合に必須。10000 bps 以上の無条件拒否には効果なし |
+| `--max-notional-usd` | 数値 (USD) | なし | `--read-only false` (本番) では**必須** (Issue #3、破壊的変更)。1 スライスが超えてはならない最大 USD 名目額。`--usd` は要求額そのもの、`--size` は保守的な指値で概算した名目額として事前検証し、さらに各スライス送信直前に実際の指値で再検証します。`--read-only` では不要 (何も送信しないため) |
+| `--allow-custom-endpoints` | フラグ | `false` | **unsafe override**。本番実行時に `HL_INFO_URL` / `HL_EXCHANGE_URL` の上書きを許可します。指定しても **https:// 以外の URL は拒否**されます (ローカルホストの mock サーバーを使うテスト経路のみ例外) |
 | `--max-book-age-ms` | 整数 | `3000` | この時間より古い板スナップショットを拒否します。`0` は**鮮度チェックのみ**を無効化するもので、銘柄一致・正値・非交差・並び順といった意味検証と、未来方向 2秒固定の許容 (future-skew) は `0` でも常に適用されます |
 | `--trigger-poll-secs` | 整数 | `2` | トリガー待ち中の板ポーリング間隔 (秒) |
 | `--wait-network-grace` | 期間 (`30m`, `1h`) | `30m` | トリガー待ち中の連続ポーリング失敗 (通信エラーまたは空板) を許容する継続時間。最初の失敗時刻からの経過で判定し、1 回でも成功すればリセットします。`0` は不可 |
@@ -72,8 +82,8 @@ hype-twap --symbol ETH --side short --usd 5000 --duration 2h --slices 20 \
 | `HL_AGENT_PK` | `--read-only false` のときのみ | Agent (API ウォレット) の秘密鍵。`0x` + 64 桁の16進数。**フラグでは受け取りません** — シェル履歴や `ps` 出力に残らないためです。`secrecy::SecretString` で保持し、エラーメッセージや `Debug` 出力を含め一切ログに出しません |
 | `HL_AGENT_ADDRESS` | 任意 | **Agent (API ウォレット) のアドレス** — マスターアカウントではありません。設定した場合は `HL_AGENT_PK` から導出したアドレスと照合し、不一致なら起動を中止します |
 | `HL_MASTER_ADDRESS` | 任意 | Agent が属するマスターアカウント。本番実行時は `userRole` 照会で自動解決されるため設定不要です。設定した場合は Hyperliquid の応答と照合し、不一致なら起動を中止します |
-| `HL_INFO_URL` | 任意 | `/info` エンドポイントの上書き (テスト用) |
-| `HL_EXCHANGE_URL` | 任意 | `/exchange` エンドポイントの上書き (テスト用) |
+| `HL_INFO_URL` | 任意 | `/info` エンドポイントの上書き (テスト用)。**本番実行では既定で拒否**され、`--allow-custom-endpoints` (かつ https://) が必要です (Issue #3) |
+| `HL_EXCHANGE_URL` | 任意 | `/exchange` エンドポイントの上書き (テスト用)。`HL_INFO_URL` と同じ本番時の制限を受けます |
 | `RUST_LOG` | 任意 | ログフィルタ。既定は `info` |
 
 `--help` にも同じ内容が表示されます。
@@ -129,6 +139,36 @@ exit code:       0
 - 丸め落ちがある場合は `status` が `complete (against the adjusted target)` となり、
   `NOTE: rounding dropped ... at pre-flight` の行が追加されます
 - 部分約定で終わった場合は `WARNING: partial fill — X of Y unexecuted` が出ます
+
+## risk envelope (Issue #3)
+
+本番実行 (`--read-only false`) には損失上限のガードレールがあります。すべて
+`/exchange` への最初の送信より前 (ネットワークアクセスより前) に検証され、
+違反すると exit code 非ゼロで即座に停止します。ポリシーの定数は `src/risk.rs`
+に一元化されており、CLI 検証とスライスループの双方がここを参照します
+(重複した magic number は存在しません)。
+
+- **スリッページ上限**: `--slippage-bps` が **10000 bps 以上**、または計算後の
+  指値が **非正**になる場合は無条件で拒否されます (override 不可)。
+  **1000 bps 超**は `--allow-high-slippage` の明示が必須です。
+- **名目額上限**: 本番実行には `--max-notional-usd` が**必須**です
+  (0.1.0 からの破壊的変更)。`--usd` は要求額そのもの、`--size` は
+  トリガー時点の板から計算した保守的な指値で概算した名目額として、事前に
+  検証されます。さらに**各スライス送信の直前にも**、そのスライスで実際に
+  署名する指値を使って再検証します — 執行中に板が動いても上限は常に有効です。
+- **エンドポイント上書きの制限**: 本番実行で `HL_INFO_URL` / `HL_EXCHANGE_URL`
+  を設定していると、既定で起動を拒否します。`--allow-custom-endpoints` を
+  指定した場合のみ上書きを許可しますが、その場合も **https:// の URL のみ**
+  受け付けます (ローカルホストの `http://127.0.0.1` / `http://localhost` は
+  自動テスト用の例外として許可されますが、実運用でこの例外が使われることは
+  想定されていません)。
+- **送信前サマリ**: 実行開始前に一度だけ、解決済みの network/エンドポイント・
+  symbol・side・target・slippage・名目額上限をまとめた1行 (`Pre-send summary: ...`)
+  が出力されます。
+
+`--read-only` (既定) ではこれらのガードは適用されません — 何も送信しないため、
+`--max-notional-usd` も不要です。ただしスリッページ上限とエンドポイント制限は
+`--read-only` でも一部評価されます (`--slippage-bps` の妥当性検証はモード共通)。
 
 ## 終了コード
 

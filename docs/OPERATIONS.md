@@ -40,7 +40,22 @@ export HL_AGENT_PK=$(pass show hyperliquid/agent-pk)
 任意で `HL_AGENT_ADDRESS` を設定しておくと、秘密鍵から導出したアドレスと照合され、
 鍵の取り違えを起動時に検出できます。
 
-### 3. 証拠金の確認
+### 3. 名目額上限の決定 (`--max-notional-usd`, Issue #3)
+
+`--read-only false` (本番実行) では `--max-notional-usd` の指定が**必須**です
+(0.1.0 からの破壊的変更)。1 スライスが超えてはならない最大 USD 名目額を、
+想定する `--usd` / `--size` と `--slices` から逆算して設定してください。
+上限は各スライス送信の直前に、そのスライスの実際の指値で再検証されます。
+
+同様に `--slippage-bps` が 1000 bps を超える場合は `--allow-high-slippage` の
+明示が必要です (10000 bps 以上は override 不可で無条件拒否)。詳細は
+[USAGE.md の risk envelope 節](USAGE.md#risk-envelope-issue-3) を参照してください。
+
+`HL_INFO_URL` / `HL_EXCHANGE_URL` を設定した状態で本番実行すると、既定では
+起動を拒否します。テスト目的で意図的に上書きする場合のみ
+`--allow-custom-endpoints` を指定してください (https:// のみ許可)。
+
+### 4. 証拠金の確認
 
 証拠金の判定は**取引所の応答を真値**とする方針です。事前チェックは行いません。
 
@@ -73,7 +88,8 @@ Agent 署名注文に対する `orderStatus` の実挙動が唯一の未検証�
 
 ```bash
 export HL_AGENT_PK=$(pass show hyperliquid/agent-pk)
-hype-twap --symbol HYPE --side long --usd 50 --duration 5m --slices 2 --read-only false
+hype-twap --symbol HYPE --side long --usd 50 --duration 5m --slices 2 \
+  --max-notional-usd 60 --read-only false
 ```
 
 失敗する場合も「安全側に停止する」設計ですが、実際の資金で挙動を確認してから
@@ -85,7 +101,8 @@ hype-twap --symbol HYPE --side long --usd 50 --duration 5m --slices 2 --read-onl
 
 ```bash
 hype-twap --symbol HYPE --side long --usd 1500 --duration 30m \
-  --trigger-price 40 --trigger-when above --start-after 2h --read-only false
+  --trigger-price 40 --trigger-when above --start-after 2h \
+  --max-notional-usd 2000 --read-only false
 ```
 
 ## 実行中の監視
@@ -131,6 +148,24 @@ hype-twap ... --read-only false 2>&1 | tee twap-$(date +%Y%m%d-%H%M%S).log
 
 1 スライスあたりの名目金額が Hyperliquid の最低額を下回っています。
 `--usd` / `--size` を増やすか、`--slices` を減らしてください。
+
+### `live mode requires --max-notional-usd` で起動しない
+
+`--read-only false` (本番実行) には `--max-notional-usd` の指定が必須です
+(Issue #3、0.1.0 からの破壊的変更)。想定する名目額に見合った上限を指定してください。
+
+### `--slippage-bps ... exceeds the warn threshold ...` で起動しない
+
+`--slippage-bps` が 1000 bps を超えています。意図的な設定であれば
+`--allow-high-slippage` を追加してください。10000 bps 以上は無条件で拒否され、
+override はできません — タイプミスの可能性を疑ってください。
+
+### `live mode + custom endpoint override (...) is rejected by default` で起動しない
+
+`HL_INFO_URL` / `HL_EXCHANGE_URL` を設定した状態で本番実行しています。
+意図的なテスト目的であれば `--allow-custom-endpoints` を追加してください
+(https:// の URL のみ許可されます)。本番運用でこれらの環境変数を設定する
+状況は通常ありません — 環境変数の設定ミスの可能性を疑ってください。
 
 ### 実行中に `insufficient margin` で停止した
 

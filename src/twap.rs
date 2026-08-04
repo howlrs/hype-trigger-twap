@@ -23,6 +23,7 @@ use crate::api::HlApi;
 use crate::client::{OrderStatusFill, PlaceOutcome, ValidatedFill, ValidatedMarketSnapshot};
 use crate::errors::{HlError, RejectionKind};
 use crate::format::{human, round_size, taker_limit_price};
+use crate::risk::RiskEnvelope;
 use crate::types::{Address, CancelIntent, Cloid, OrderIntent, Side, Symbol, Tif};
 
 /// HL's practical minimum order notional in USD (§8).
@@ -248,6 +249,13 @@ pub struct TwapPlan {
     pub slippage_bps: Decimal,
     pub max_book_age_ms: u64,
     pub read_only: bool,
+    /// Issue #3: the notional cap resolved before the run started —
+    /// required in live mode, `Decimal::MAX` (effectively unbounded) in
+    /// read-only. Re-checked before EVERY slice against that slice's actual
+    /// order price, via [`RiskEnvelope::check_notional_cap`] — the SAME
+    /// function (and constants module) the CLI pre-flight check uses, so the
+    /// policy cannot drift between the two call sites.
+    pub max_notional_usd: Decimal,
     /// Agent (API wallet) address — the key that signs. `None` in read-only.
     pub agent: Option<Address>,
     /// MASTER account address, resolved by the `userRole` probe at startup
@@ -1051,6 +1059,31 @@ pub async fn run_twap(client: &dyn HlApi, plan: &TwapPlan) -> TwapReport {
         // gate judges the notional that will actually reach HL.
         let px = taker_limit_price(bid, ask, plan.side, plan.slippage_bps, plan.sz_decimals);
 
+        // Issue #3: non-positive limit price is rejected unconditionally,
+        // no override — belt-and-braces guard, mirroring the CLI pre-flight
+        // check with the SAME risk module.
+        if let Err(e) =
+            RiskEnvelope::validate_limit_price(px, plan.side, plan.slippage_bps, bid, ask)
+        {
+            abort_reason = Some(format!(
+                "slice {slice_idx}: risk envelope rejected the computed limit price: {e}"
+            ));
+            break;
+        }
+
+        // Issue #3: re-check the notional cap before EACH slice using the
+        // ACTUAL order px for that slice (book prices move between slices),
+        // not the estimate used at CLI pre-flight time.
+        let slice_notional_estimate = plan.per_slice * px;
+        if let Err(e) =
+            RiskEnvelope::check_notional_cap(slice_notional_estimate, plan.max_notional_usd)
+        {
+            abort_reason = Some(format!(
+                "slice {slice_idx}: risk envelope rejected the notional: {e}"
+            ));
+            break;
+        }
+
         let decision = decide_slice(
             slice_idx,
             plan.slices,
@@ -1702,6 +1735,9 @@ mod loop_tests {
             // Disabled: these tests pin sequencing, not freshness.
             max_book_age_ms: 0,
             read_only,
+            // Generous default so pre-existing tests (small notionals, ~$5-500)
+            // are unaffected; Issue #3 boundary tests override this explicitly.
+            max_notional_usd: dec!(1_000_000),
             agent: Some(Address::new(AGENT)),
             master: if read_only {
                 None
@@ -3167,6 +3203,184 @@ mod loop_tests {
         assert_eq!(report.filled, Decimal::ZERO);
         let reason = report.abort_reason.clone().expect("must hard-stop");
         assert!(reason.contains("coin mismatch"), "{reason}");
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    // === Issue #3: per-slice notional cap re-check, long/short x usd/size ===
+    //
+    // Book fixed at bid=49.9 / ask=50.1 for all four scenarios below.
+    // slippage_bps=20 (the plan() default) puts:
+    //   long px  = ask * 1.002, rounded up   = 50.2002 -> 50.201 (szDecimals=2)
+    //   short px = bid * 0.998, rounded down = 49.8002 -> 49.8  (szDecimals=2)
+    // Each scenario sets `per_slice` (single slice) so that
+    // `per_slice * order_px` sits just under/over `max_notional_usd`, then
+    // asserts accept (order placed, no abort) vs reject (abort before any
+    // `/exchange` call — `api.place_count() == 0`).
+    //
+    // "usd" vs "size" scenarios differ only in how the operator originally
+    // specified the notional (main.rs resolves both into a coin `per_slice`
+    // before the plan is built) — the loop's re-check logic itself does not
+    // distinguish them, so all four exercise the identical `check_notional_cap`
+    // call site with different `per_slice`/`max_notional_usd` pairs, matching
+    // how each origin would concretely land on this boundary.
+
+    fn plan_with_cap(side: Side, per_slice: Decimal, max_notional_usd: Decimal) -> TwapPlan {
+        let mut p = plan(false);
+        p.side = side;
+        p.slices = 1;
+        p.per_slice = per_slice;
+        p.total_adjusted = per_slice;
+        p.total_requested = per_slice;
+        p.max_notional_usd = max_notional_usd;
+        p
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notional_cap_long_usd_just_under_cap_is_accepted() {
+        // long px = 50.201; per_slice sized so notional is just under $10000.
+        let per_slice = dec!(199); // 199 * 50.201 = 9989.999
+        let plan = plan_with_cap(Side::Long, per_slice, dec!(10000));
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(filled(per_slice, dec!(50.201)));
+
+        let report = run_twap(&api, &plan).await;
+
+        assert_eq!(api.place_count(), 1, "order must be placed");
+        assert!(report.abort_reason.is_none(), "{:?}", report.abort_reason);
+        assert_eq!(report.filled, per_slice);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notional_cap_long_usd_just_over_cap_is_rejected() {
+        // long px = 50.201; per_slice sized so notional is just over $10000.
+        let per_slice = dec!(200); // 200 * 50.201 = 10040.2
+        let plan = plan_with_cap(Side::Long, per_slice, dec!(10000));
+        let api = ScriptedApi::new().with_default_book(book_at(dec!(49.9), dec!(50.1)));
+
+        let report = run_twap(&api, &plan).await;
+
+        assert_eq!(
+            api.place_count(),
+            0,
+            "notional cap must reject before any /exchange call"
+        );
+        let reason = report.abort_reason.clone().expect("must abort");
+        assert!(reason.contains("notional"), "{reason}");
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notional_cap_long_size_just_under_cap_is_accepted() {
+        // Same math as the usd case — "size"-origin plans reach the loop
+        // through the identical TwapPlan shape, so this exercises the same
+        // call site with a size-derived per_slice.
+        let per_slice = dec!(99.5); // 99.5 * 50.201 = 4994.9995
+        let plan = plan_with_cap(Side::Long, per_slice, dec!(5000));
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(filled(per_slice, dec!(50.201)));
+
+        let report = run_twap(&api, &plan).await;
+
+        assert_eq!(api.place_count(), 1, "order must be placed");
+        assert!(report.abort_reason.is_none(), "{:?}", report.abort_reason);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notional_cap_long_size_just_over_cap_is_rejected() {
+        let per_slice = dec!(100); // 100 * 50.201 = 5020.1
+        let plan = plan_with_cap(Side::Long, per_slice, dec!(5000));
+        let api = ScriptedApi::new().with_default_book(book_at(dec!(49.9), dec!(50.1)));
+
+        let report = run_twap(&api, &plan).await;
+
+        assert_eq!(api.place_count(), 0, "must reject before /exchange");
+        let reason = report.abort_reason.expect("must abort");
+        assert!(reason.contains("notional"), "{reason}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notional_cap_short_usd_just_under_cap_is_accepted() {
+        // short px = 49.8; per_slice sized so notional is just under $10000.
+        let per_slice = dec!(200); // 200 * 49.8 = 9960
+        let plan = plan_with_cap(Side::Short, per_slice, dec!(10000));
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(filled(per_slice, dec!(49.8)));
+
+        let report = run_twap(&api, &plan).await;
+
+        assert_eq!(api.place_count(), 1, "order must be placed");
+        assert!(report.abort_reason.is_none(), "{:?}", report.abort_reason);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notional_cap_short_usd_just_over_cap_is_rejected() {
+        let per_slice = dec!(201); // 201 * 49.8 = 10009.8
+        let plan = plan_with_cap(Side::Short, per_slice, dec!(10000));
+        let api = ScriptedApi::new().with_default_book(book_at(dec!(49.9), dec!(50.1)));
+
+        let report = run_twap(&api, &plan).await;
+
+        assert_eq!(api.place_count(), 0, "must reject before /exchange");
+        let reason = report.abort_reason.expect("must abort");
+        assert!(reason.contains("notional"), "{reason}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notional_cap_short_size_just_under_cap_is_accepted() {
+        let per_slice = dec!(100); // 100 * 49.8 = 4980
+        let plan = plan_with_cap(Side::Short, per_slice, dec!(5000));
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(filled(per_slice, dec!(49.8)));
+
+        let report = run_twap(&api, &plan).await;
+
+        assert_eq!(api.place_count(), 1, "order must be placed");
+        assert!(report.abort_reason.is_none(), "{:?}", report.abort_reason);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notional_cap_short_size_just_over_cap_is_rejected() {
+        let per_slice = dec!(101); // 101 * 49.8 = 5029.8
+        let plan = plan_with_cap(Side::Short, per_slice, dec!(5000));
+        let api = ScriptedApi::new().with_default_book(book_at(dec!(49.9), dec!(50.1)));
+
+        let report = run_twap(&api, &plan).await;
+
+        assert_eq!(api.place_count(), 0, "must reject before /exchange");
+        let reason = report.abort_reason.expect("must abort");
+        assert!(reason.contains("notional"), "{reason}");
+    }
+
+    // === Issue #3: non-positive limit price rejected unconditionally ===
+    //
+    // slippage_bps at/above SLIPPAGE_HARD_CAP_BPS would already be rejected
+    // at CLI pre-flight (src/main.rs / src/risk.rs), so this test drives the
+    // slice-loop's OWN belt-and-braces check directly by constructing a plan
+    // whose slippage, while under the CLI's hard cap, is high enough at this
+    // specific bid to floor the short limit price to zero or below — proving
+    // the loop does not blindly trust a slippage value that passed CLI
+    // validation against a DIFFERENT (trigger-time) book.
+    #[tokio::test(start_paused = true)]
+    async fn non_positive_short_limit_price_hard_stops_before_any_exchange_call() {
+        let mut plan = plan_with_cap(Side::Short, dec!(5), dec!(1_000_000));
+        // bid=0.01: short px = 0.01 * (1 - bps/1e4). At slippage=9999bps
+        // (just under the 10000 hard cap) this floors to <= 0.
+        plan.slippage_bps = dec!(9999);
+        let api = ScriptedApi::new().with_default_book(book_at(dec!(0.01), dec!(0.02)));
+
+        let report = run_twap(&api, &plan).await;
+
+        assert_eq!(
+            api.place_count(),
+            0,
+            "non-positive limit price must reject before any /exchange call"
+        );
+        let reason = report.abort_reason.clone().expect("must abort");
+        assert!(reason.contains("risk envelope"), "{reason}");
         assert_eq!(report.exit_code(), 1);
     }
 }

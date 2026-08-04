@@ -9,6 +9,7 @@ pub mod client;
 pub mod eip712;
 pub mod errors;
 pub mod format;
+pub mod risk;
 pub mod signer;
 pub mod trigger;
 pub mod twap;
