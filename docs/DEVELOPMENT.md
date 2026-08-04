@@ -20,8 +20,8 @@ cargo fmt --check
 
 | ファイル | 行数 | 役割 |
 |---|---|---|
-| `src/main.rs` | 1058 | CLI 定義 (clap)、起動シーケンス、事前検証 (Issue #2 のクロックずれ検証を含む)、終了コード |
-| `src/twap.rs` | 3068 | スライスループ、サイジング、キャッチアップ、約定照合 (`ValidatedFill` 経由)、W1 unknownOid 安全再送ポリシー、`ExecutionDeadline` / `expiresAfter` / クロックずれ検証 (Issue #2)、レポート |
+| `src/main.rs` | 1288 | CLI 定義 (clap)、起動シーケンス、トリガー発火直後のクロックずれ検証 (Issue #2、Finding 3 でこの位置に移動)、終了コード |
+| `src/twap.rs` | 3172 | スライスループ、サイジング、キャッチアップ、約定照合 (`ValidatedFill` 経由)、W1 unknownOid 安全再送ポリシー、`ExecutionDeadline` / `expiresAfter` / クロックずれ検証 (Issue #2)、板取得を残り期限でタイムアウトするラッパー (Issue #2 Finding 2)、レポート |
 | `src/client.rs` | 2043 | Hyperliquid REST クライアント (`/info`, `/exchange`)、応答解析、再試行方針、`ValidatedMarketSnapshot` (板の検証境界)、`ORDER_STATUS_VOCABULARY` (status 語彙表)、`ValidatedFill` (約定の検証境界)、`expiresAfter` の署名・送信 (Issue #2) |
 | `src/eip712.rs` | 370 | **移植物** — EIP-712 型定義、msgpack パック、action_hash (`expires_after` 引数を含む) |
 | `src/trigger.rs` | 1041 | 価格・時間トリガーの待機ループ (`&dyn HlApi` シーム、`ValidatedMarketSnapshot` 検証込み) |
@@ -32,12 +32,14 @@ cargo fmt --check
 | `src/errors.rs` | 129 | `HlError` と `RejectionKind` (拒否メッセージの分類) |
 | `src/lib.rs` | 15 | 結合テストから内部モジュールを参照するためのライブラリターゲット |
 
-テストの内訳 (Issue #2 で `ExecutionDeadline` / `expiresAfter` / クロックずれ検証のテストを追加):
+テストの内訳 (Issue #2 で `ExecutionDeadline` / `expiresAfter` / クロックずれ検証のテストを追加。
+レビュー修正 (Finding 1-3) で署名ベクタ生成スクリプトの実体化、板取得のタイムアウトラップ、
+クロックずれ検証の再配置に対するテストをさらに追加):
 
 | ターゲット | 件数 | 内容 |
 |---|---|---|
-| `src/lib.rs` (単体) | 216 | 純関数の算術、丸め、応答解析、署名、`run_twap` のループレベルテスト、`ValidatedMarketSnapshot` / `ValidatedFill` の検証、status 語彙の全件終端性テスト、トリガーの `ScriptedApi` テスト、`ExecutionDeadline` / クロックずれ検証の単体テスト、期限を跨ぐ仮想時刻テスト (Issue #2) |
-| `src/main.rs` (単体) | 31 | CLI 引数の検証、`--help` の内容、起動シーケンス |
+| `src/lib.rs` (単体) | 217 | 純関数の算術、丸め、応答解析、署名、`run_twap` のループレベルテスト、`ValidatedMarketSnapshot` / `ValidatedFill` の検証、status 語彙の全件終端性テスト、トリガーの `ScriptedApi` テスト、`ExecutionDeadline` / クロックずれ検証の単体テスト、期限を跨ぐ仮想時刻テスト (Issue #2)、単一の板取得が残り期限でタイムアウトされることを証明するテスト (Finding 2) |
+| `src/main.rs` (単体) | 33 | CLI 引数の検証、`--help` の内容、起動シーケンス、live time-only トリガーがデッドラインまでネットワークを叩かないことの回帰テスト、クロックずれ検証がトリガー発火直後に fail-closed することの call-site テスト (Finding 3) |
 | `tests/exchange_parse.rs` | 18 | mockito による `/exchange` 応答の解析と再試行方針、`expiresAfter` の body/署名一致 (Issue #2) |
 | `tests/reconcile_and_probe.rs` | 19 | 曖昧な送信の照合、`userRole` 照会、トリガーの end-to-end |
 | `tests/signing_cross_check.rs` | 3 | Python SDK 由来の 17 ベクタ (元 10 + `expiresAfter` 系 7、Issue #2) に対する署名検証 |
@@ -53,12 +55,37 @@ cargo fmt --check
 署名パスを検証します。うち元の 10 件 (フィクスチャは `tests/fixtures/signing/known_vectors.json`
 の先頭 10 件、親リポジトリとバイト単位で同一) は **絶対に手で編集しないこと**。
 残り 7 件は Issue #2 (`expiresAfter` の署名) で追加したベクタで、同じく
-`hyperliquid-python-sdk` の `sign_l1_action` を使って生成しています
-(ローカルの venv に `pip install hyperliquid-python-sdk eth-account msgpack` した上で、
-`scripts/gen_signing_vectors.py` と同じ流儀の生成スクリプトを実行 — dummy/order アクション ×
-mainnet/testnet に加えて cloid + vault + expiresAfter を同時に使う組み合わせと
-`expires_after=0` の境界値を含みます)。ベクタを追加する場合も、既存の 17 件を書き換えては
-いけません — 新しいベクタを末尾に追記するだけにしてください。
+`hyperliquid-python-sdk` の `sign_l1_action` を使って生成しています。
+
+**生成スクリプトはこのリポジトリに実在します**: `scripts/gen_signing_vectors.py`
+(親リポジトリ `diff-old-new/scripts/gen_signing_vectors.py` の元 10 件を変更せず移植し、
+新規 7 件の `emit()` 呼び出しを追加したもの)。
+
+- **ピン留め SDK バージョン**: `hyperliquid-python-sdk==0.23.0`
+  (`pip show hyperliquid-python-sdk` で確認済み)
+- **venv の再現手順**:
+  ```bash
+  python3 -m venv .venv
+  source .venv/bin/activate
+  pip install hyperliquid-python-sdk==0.23.0 eth-account msgpack
+  ```
+- **実行コマンド** (フィクスチャの再生成 + 突合):
+  ```bash
+  python3 scripts/gen_signing_vectors.py > /tmp/generated_vectors.json
+  diff /tmp/generated_vectors.json tests/fixtures/signing/known_vectors.json
+  ```
+  差分が出なければ 17 件全てがバイト単位で一致している。元 10 件・新規 7 件のいずれも、
+  独立に (このリポジトリの Rust 実装を一切経由せず) Python SDK から再生成できることを
+  確認済み — 循環参照ではない正当なクロスチェックであることの根拠。
+
+新規 7 件のカバレッジ: dummy アクション × mainnet/testnet の `expires_after` 単純ケース、
+`run_twap` が実際に署名する形の IOC 注文、cloid + vault + expiresAfter を同時に使う組み合わせ
+(`action_hash` 末尾の vault フラグバイトと expires フラグバイトの順序バグを検出する狙い)、
+`expires_after=0` の境界値 (フラグバイト自体は出力されるが値がゼロというケースを、
+`expires_after=None` (フラグ自体を省略) と区別する)。
+
+ベクタを追加する場合も、既存の 17 件を書き換えてはいけません — `scripts/gen_signing_vectors.py`
+に新しい `emit(...)` 呼び出しを追記し、生成結果をフィクスチャ末尾に追記するだけにしてください。
 
 > **このテストが失敗した場合、署名コードが壊れています。生成された注文を一切信用しないでください。**
 
@@ -124,7 +151,13 @@ pub trait HlApi {
    すること (クランプ厳禁)
 9. **`ExecutionDeadline` は送信の直前に再確認する** (Issue #2) — ループ先頭で一度確認するだけでは
    板取得や照合ポーリングの `await` 中に期限を越えるケースを取りこぼす。初回発注と resend の
-   両方の直前で再確認すること。期限後も `orderStatus` 照会と cancel は許可し続けること
+   両方の直前で再確認すること。期限後も `orderStatus` 照会と cancel は許可し続けること。
+   さらに、**単一の板取得呼び出しそのものも残り期限で打ち切ること** (Finding 3, レビュー修正) —
+   試行と試行の間の期限チェックだけでは、1 回の `fetch_l2_book` 呼び出し自体が
+   `HTTP_TIMEOUT` (10s) いっぱいまで期限を越えて in-flight のままになりうる。
+   `fetch_fresh_book` は `deadline` が `Some` のとき、その呼び出しを
+   `tokio::time::timeout(remaining, ...)` で包み、タイムアウトを通常の再試行ではなく
+   即座の期限中止として扱う (再試行ループに戻さない)
 10. **`expiresAfter` は body と署名で必ず同じ値を使う** (Issue #2) — `/exchange` リクエストボディの
     `expiresAfter` フィールドと、署名対象の action hash に渡す `expires_after` 引数は、
     どのコードパスでも同一の値でなければならない。resend も run 開始時に決まった値を再利用し、
@@ -138,9 +171,24 @@ HL が実際に enforce する期限が一致しなくなります。これは�
 問題ではありません — ローカルの時計が遅れていれば意図より早く HL 側が失効させ、進んでいれば
 意図より長く有効な注文を残してしまいます。
 
-このツールは live モードの起動時に `/info l2Book` のサーバータイムスタンプとローカル時刻を
-比較し、差が `MAX_CLOCK_SKEW_MS` (5000ms、`src/twap.rs`) を超えていれば **起動そのものを
-拒否します** (fail-closed)。read-only では検証しません — 何も署名しないため実害がないからです。
+このツールは live モードで、**トリガー発火直後** (`main.rs`、`"Triggered: ..."` ログの後、
+サイジング用スナップショットを取得した直後で、スライスループが始まる前) に、そのスナップショット
+の `server_ts_ms` とローカル時刻を比較し、差が `MAX_CLOCK_SKEW_MS` (5000ms、`src/twap.rs`)
+を超えていれば **その run を fail-closed で中止します** (1 枚も発注する前に)。read-only では
+検証しません — 何も署名しないため実害がないからです。
+
+**チェック位置について (Finding 3, レビュー修正)**: 初期実装 (コミット `9986b46`) では
+このチェックをトリガー待機の**前**に置き、専用の `l2Book` 呼び出しで判定していました。
+しかしこれは `--start-after` のみ (価格条件なし) のトリガーが「期限が来るまで一切
+ネットワークを叩かない」という不変条件 (Issue #6/#8。`trigger.rs` の
+`time_only_trigger_fires_after_deadline_without_network` が保証する契約) を破っていたため、
+トリガー発火後・既に取得済みのスナップショットを再利用する形に修正しました。専用の
+`l2Book` 呼び出しは追加で発生しません。回帰防止として `src/main.rs` の
+`issue2_live_time_only_trigger_makes_no_network_call_before_its_deadline` (time-only トリガーが
+デッドラインまでネットワークを叩かないことを証明) と
+`issue2_live_skew_beyond_tolerance_fails_closed_at_execution_entry_not_prewait`
+(スキュー超過がトリガー発火後・place 前に fail-closed することを証明、かつ l2Book 呼び出しが
+1 回だけであることを `expect(1)` で担保) を追加しています。
 
 **運用者への要求**: 実行ホストは NTP (chrony / systemd-timesyncd 等) でシステムクロックを
 同期しておいてください。多くのクラウド VM は既定で有効です。自前のホストで動かす場合、
