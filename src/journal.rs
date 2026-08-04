@@ -281,7 +281,16 @@ impl ExecutionJournal {
         let run_dir = Self::run_dir(state_root, &run_id);
         std::fs::create_dir_all(&run_dir)?;
         let path = run_dir.join("journal.jsonl");
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        // B5: `create_new` (exclusive create) rather than `create + append`
+        // — a run_id collision (uuid v7 makes this astronomically unlikely,
+        // but cheap to guard) would otherwise silently append a second
+        // Header onto an existing journal instead of erroring. `--resume`
+        // uses `open_existing` (below), a separate path, so this does not
+        // affect the normal resume flow.
+        let file = OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(&path)?;
         let mut journal = Self {
             file,
             run_id,
@@ -324,23 +333,51 @@ impl ExecutionJournal {
     }
 
     /// Read every record currently in a run's journal, in file order.
+    ///
+    /// B4: tolerant of a torn FINAL line — the normal crash shape (the
+    /// process died mid-`write_all`/before the trailing newline of the
+    /// LAST record it was appending). All lines up to and including the
+    /// last one that parses successfully are returned; a torn last line is
+    /// silently dropped rather than erroring, exactly like standard JSONL
+    /// crash-recovery semantics. Any parse failure on a line that is NOT
+    /// the last one is still a hard error (a genuinely corrupt journal, not
+    /// a crash-torn tail), and a file that yields NO parseable records at
+    /// all (e.g. not even a valid `Header`) is likewise a hard error — see
+    /// `find_incomplete_run`, whose caller (`main.rs`, live startup) must
+    /// fail closed on that case rather than silently treat the run as
+    /// absent. This distinction is documented in `docs/OPERATIONS.md`.
     pub fn read_all(state_root: &Path, run_id: &str) -> Result<Vec<JournalRecord>, JournalError> {
         let path = Self::journal_path(state_root, run_id);
         let f = File::open(&path)?;
         let reader = BufReader::new(f);
+        let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
         let mut out = Vec::new();
-        for (idx, line) in reader.lines().enumerate() {
-            let line = line?;
+        for (idx, line) in lines.iter().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
-            let rec: JournalRecord =
-                serde_json::from_str(&line).map_err(|e| JournalError::Parse {
-                    path: path.clone(),
-                    line: idx + 1,
-                    source: e,
-                })?;
-            out.push(rec);
+            match serde_json::from_str::<JournalRecord>(line) {
+                Ok(rec) => out.push(rec),
+                Err(e) => {
+                    let is_last_nonblank = lines[idx + 1..].iter().all(|l| l.trim().is_empty());
+                    // Torn final line IS the normal crash-mid-append shape
+                    // ONLY when at least one record (starting with the
+                    // Header) already parsed successfully before it — a
+                    // file that fails to parse its very FIRST record (no
+                    // header, nothing) is not "a run that crashed mid
+                    // append," it is unreadable from the start, and must
+                    // hard-error rather than be silently treated as an
+                    // empty/absent run.
+                    if is_last_nonblank && !out.is_empty() {
+                        break;
+                    }
+                    return Err(JournalError::Parse {
+                        path,
+                        line: idx + 1,
+                        source: e,
+                    });
+                }
+            }
         }
         Ok(out)
     }
@@ -520,10 +557,26 @@ pub fn find_incomplete_run(
             Ok(s) => s,
             Err(_) => continue,
         };
-        let records = match ExecutionJournal::read_all(state_root, &run_id) {
-            Ok(r) => r,
-            Err(_) => continue, // unreadable/partial journal: skip, don't crash startup
-        };
+        // B4: an unparseable/corrupt journal must fail-closed live startup,
+        // not be silently skipped — corruption is MOST likely right after a
+        // crash, which is exactly when the incomplete-run gate exists to
+        // catch a still-unresolved run before a new live run can start
+        // alongside it. `ExecutionJournal::read_all` already tolerates the
+        // NORMAL crash shape (a torn final line with valid prior records),
+        // so any error surfacing here is a genuine corruption, not a
+        // standard crash artifact.
+        let records = ExecutionJournal::read_all(state_root, &run_id).map_err(|e| {
+            tracing::error!(
+                run_id = %run_id,
+                error = %e,
+                "found a journal file that could not be parsed at all while scanning for an \
+                 incomplete run — refusing to start a new live run until this is resolved. \
+                 See docs/OPERATIONS.md for the recovery runbook (inspect the file by hand; \
+                 if it is truly unrecoverable, move it aside so this run_id no longer blocks \
+                 startup, understanding that whatever it recorded is then unaccounted for)."
+            );
+            e
+        })?;
         let summary = summarize(&records);
         let Some(header) = &summary.header else {
             continue;
@@ -715,6 +768,43 @@ mod tests {
         assert_eq!(records.len(), 3);
         assert!(matches!(records[0], JournalRecord::Header(_)));
         assert!(matches!(records[2], JournalRecord::Abandoned { .. }));
+    }
+
+    // === B5: ExecutionJournal::start must not silently append a second
+    // Header onto an existing journal for a colliding run_id ===
+
+    #[test]
+    fn start_rejects_a_colliding_run_id_instead_of_appending_a_second_header() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut j1 =
+            ExecutionJournal::start(root, "run-collide".into(), header("run-collide")).unwrap();
+        j1.record(&JournalRecord::SubmittedUnknown {
+            slice_idx: 1,
+            cloid: Cloid::new(),
+        })
+        .unwrap();
+        drop(j1);
+
+        // Same run_id, started again (uuid v7 collision is astronomically
+        // unlikely, but this must still be a clear error rather than a
+        // silently corrupted two-Header journal).
+        let second = ExecutionJournal::start(root, "run-collide".into(), header("run-collide"));
+        assert!(
+            second.is_err(),
+            "starting a journal for a run_id that already has a journal file must error, not \
+             silently append a second Header onto the existing file"
+        );
+
+        // The original journal must be untouched — still exactly its 2
+        // original records, no second Header appended.
+        let records = ExecutionJournal::read_all(root, "run-collide").unwrap();
+        assert_eq!(
+            records.len(),
+            2,
+            "a failed start() must not have appended anything to the existing journal"
+        );
+        assert!(matches!(records[0], JournalRecord::Header(_)));
     }
 
     // === No secrets, ever ===
@@ -989,6 +1079,98 @@ mod tests {
         let root = tmp.path().join("never-created");
         let found = find_incomplete_run(&root, "testnet", None).unwrap();
         assert_eq!(found, None);
+    }
+
+    // === B4: a corrupt/unreadable journal must fail-closed at live startup,
+    // not silently disarm the incomplete-run gate ===
+    //
+    // Corruption is MOST likely right after a crash -- exactly the moment
+    // the incomplete-run gate exists to protect. Silently skipping an
+    // unparseable journal (`Err(_) => continue`) means a new live run can
+    // start and double-execute alongside whatever the corrupted run was
+    // doing. IMPORTANT nuance: a journal whose LAST line is torn (crash
+    // mid-append) but whose PRIOR lines all parse is the NORMAL crash shape
+    // (standard JSONL crash recovery) and must still be found as
+    // incomplete via its prior records -- only a file that yields NO
+    // parseable header/records at all is a hard error.
+
+    #[test]
+    fn find_incomplete_run_hard_errors_on_a_journal_with_no_parseable_records_at_all() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let run_dir = root.join("runs").join("run-garbage");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        // Truncated mid-record + garbage: not even a valid Header line.
+        std::fs::write(
+            run_dir.join("journal.jsonl"),
+            b"{\"kind\":\"Header\",\"run_id\":\"run-garb\x00\x01\x02not json at all",
+        )
+        .unwrap();
+
+        let result = find_incomplete_run(root, "testnet", Some(&Address::new("0xagent")));
+        assert!(
+            result.is_err(),
+            "a journal with zero parseable records must hard-error live startup, not be \
+             silently skipped: {result:?}"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("run-garbage") || msg.contains("journal.jsonl"),
+            "the error must point at the offending file: {msg}"
+        );
+    }
+
+    #[test]
+    fn find_incomplete_run_still_detects_a_journal_whose_only_torn_line_is_the_last_one() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let agent = Address::new("0xagent");
+        let cloid = Cloid::new();
+
+        // Build a normal, valid journal first...
+        {
+            let mut j = ExecutionJournal::start(
+                root,
+                "run-torn".into(),
+                RunHeader {
+                    run_id: "run-torn".into(),
+                    network: "testnet".into(),
+                    agent: Some(agent.clone()),
+                    master: Some(Address::new("0xmaster")),
+                    symbol: Symbol::new("HYPE"),
+                    side: Side::Long,
+                    slices: 10,
+                    plan_hash: "hash1".into(),
+                    started_at_unix_ms: 0,
+                },
+            )
+            .unwrap();
+            j.record(&JournalRecord::SubmittedUnknown {
+                slice_idx: 1,
+                cloid,
+            })
+            .unwrap();
+        }
+
+        // ...then append a torn final line, simulating a crash mid-append
+        // (partial JSON, no trailing newline).
+        let path = ExecutionJournal::journal_path(root, "run-torn");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        use std::io::Write as _;
+        write!(f, "{{\"kind\":\"Acknowledged\",\"slice_idx\":1,\"cloi").unwrap();
+        f.sync_data().unwrap();
+        drop(f);
+
+        // The prior (complete) lines must still be parsed and this run must
+        // still be found as incomplete -- the torn tail must NOT be treated
+        // as total corruption.
+        let found = find_incomplete_run(root, "testnet", Some(&agent))
+            .expect("a torn FINAL line with valid prior records must not hard-error")
+            .expect("the run must still be detected as incomplete from its prior records");
+        assert_eq!(found, "run-torn");
     }
 
     // === Read-only regression: no state dir, no journal file ===
