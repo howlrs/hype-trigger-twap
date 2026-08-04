@@ -73,6 +73,10 @@ hype-twap --symbol ETH --side short --usd 5000 --duration 2h --slices 20 \
 | `--wait-network-grace` | 期間 (`30m`, `1h`) | `30m` | トリガー待ち中の連続ポーリング失敗 (通信エラーまたは空板) を許容する継続時間。最初の失敗時刻からの経過で判定し、1 回でも成功すればリセットします。`0` は不可 |
 | `--expire-after` | 期間 | なし | 期間内にどのトリガーも発火しなければ、何も発注せずに終了します (exit code 3)。`--start-after` (フォールバック**開始**) とは異なり、こちらは打ち切り。同一 tick ではトリガーが優先。`0` は不可。`--start-after` 併用時は `expire_after > start_after` が必須。トリガー未指定 (即時開始) との併用は不可 |
 | `--child-algo` | `market` \| `passive` | `market` | スライスごとの子注文アルゴリズム。`market` (既定・従来と同一挙動) は IOC 成行相当の指値を送信します。`passive` は板の反対側を跨がない ALO (post-only) 指値をベスト bid/ask に置きます。詳細は後述の「passive (post-only) モード」を参照 |
+| `--state-dir` | パス | なし (`$XDG_STATE_HOME/hype-twap`、未設定なら `~/.local/state/hype-twap`) | 実行状態 (ジャーナル / ロック / nonce HWM) を保存するルートディレクトリ (Issue #4)。`--read-only` の実行はここに一切触れません — ディレクトリもジャーナルも作成されません |
+| `--resume` | 文字列 (run id) | なし | 指定した run id の未完了 run を再開します (Issue #4)。その run のジャーナルに記録された submitted/unknown な cloid をすべて `orderStatus` で照合してから実行を継続します。既にジャーナルに記録済みの約定は再送されません。`--abandon-incomplete-run` とは排他です |
+| `--abandon-incomplete-run` | フラグ | `false` | 同一 network+agent で検出された未完了 run を強制的に照合 (`orderStatus`) したうえで放棄し、**続行はしません** (Issue #4)。`--resume` とは排他です |
+| `--shutdown-grace` | 期間 (`30m`, `1h`) | `60s` | SIGINT/SIGTERM を受けてから、進行中の注文の照合・確認済み resting 注文のキャンセルに費やせる猶予時間 (Issue #4)。超過すると、未解決の cloid を `outcome_unknown` としてジャーナルに記録したうえで非ゼロ終了します |
 
 `--size` と `--usd` はどちらか一方が必須です。両方指定または両方省略はエラーになります。
 

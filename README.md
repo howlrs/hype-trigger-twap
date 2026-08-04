@@ -71,6 +71,14 @@ hype-twap --symbol ETH --side short --usd 5000 --duration 2h --slices 20 \
 | `--trigger-poll-secs` | u64 | `2` | Poll interval while waiting for the trigger. |
 | `--expire-after` | humantime | none | Terminate the wait, placing **nothing**, if no trigger condition fires within this duration. See "Trigger semantics" below. |
 | `--child-algo` | `market` \| `passive` | `market` | Per-slice order algorithm. `market` (default, unchanged behaviour) sends an IOC taker limit. `passive` sends a post-only (ALO) limit resting at the best bid/ask instead. See "Child-order algorithms" below. |
+| `--max-notional-usd` | decimal (USD) | none | **MANDATORY when `--read-only false`** (breaking change from 0.1.0). The maximum USD notional any single slice may target; re-checked before every slice as a cumulative run-level envelope (already-filled notional + this slice's notional), never per-slice in isolation. Not required in read-only mode. |
+| `--allow-high-slippage` | bool | `false` | Unsafe override: allow `--slippage-bps` above the 1000 bps warn threshold. Does **not** lift the unconditional ≥10000 bps hard cap or the non-positive-limit-price rejection. |
+| `--allow-custom-endpoints` | bool | `false` | Unsafe override: allow `HL_INFO_URL` / `HL_EXCHANGE_URL` to be overridden in **live** mode. The override URL must be `https://` unless it is loopback (`127.0.0.1`/`localhost`, no userinfo) — used only by the test seam. Has no effect in read-only mode. |
+| `--wait-network-grace` | humantime | `30m` | How long a consecutive trigger-poll failure streak (network error or empty book) may run before the wait hard-stops. Timed from the first failure in the streak, resets on any successful poll. |
+| `--state-dir` | path | `$XDG_STATE_HOME/hype-twap` or `~/.local/state/hype-twap` | Root directory for run-state persistence (journal/lock/nonce-HWM). A read-only run never touches this. |
+| `--resume` | string (run id) | none | Resume a specific incomplete run by its run id. Every submitted/unknown cloid in that run's journal is reconciled via `orderStatus` before continuing. Mutually exclusive with `--abandon-incomplete-run`. |
+| `--abandon-incomplete-run` | bool | `false` | Force-reconcile the incomplete run detected for this network+agent and mark it abandoned, WITHOUT continuing it. |
+| `--shutdown-grace` | humantime | `60s` | How long a SIGINT/SIGTERM shutdown may spend reconciling in-flight orders and cancelling confirmed resting ones before giving up. |
 
 ## Environment variables
 
@@ -339,6 +347,8 @@ the shortfall; a normal run reaches its last slice inside the window anyway.
 |---|---|
 | `0` | Completed. A partial fill that ran to the end of its window also exits `0`, with a warning in the report. |
 | `1` | Aborted — exchange rejection, persistent stale book, unrecoverable fill ambiguity, or a startup/validation failure. |
+| `2` | Usage error — invalid/missing CLI flags, caught by argument parsing before any network call (standard `clap` convention). |
+| `3` | Expired — `--expire-after` elapsed with no trigger condition ever firing; nothing was placed. See "`--expire-after`" above. |
 
 ## Known limitations
 
@@ -366,7 +376,12 @@ the shortfall; a normal run reaches its last slice inside the window anyway.
   just falls back to the generic "exchange rejected" wording.
 - **One symbol per process.** No portfolio logic, no existing-position
   awareness (`reduce_only` is never set), no HIP-3 `dex:SYMBOL` prefixes.
-- **Taker only.** Every slice crosses the spread and pays taker fees.
+- **Taker by default; passive is opt-in.** `--child-algo market` (the
+  default) crosses the spread and pays taker fees on every slice.
+  `--child-algo passive` posts at the touch instead (see "Child-order
+  algorithms" above) but does not re-quote mid-slice or fall back to a
+  taker sweep — a slice that never fills is simply skipped and its
+  shortfall carries into the next slice.
 - **Single-host single-writer only.** A local advisory lock (keyed by
   `network + agent address`) makes a second live process for the same agent
   on the SAME host fail fast, before any order. It has no visibility across
@@ -375,10 +390,14 @@ the shortfall; a normal run reaches its last slice inside the window anyway.
 
 ## Roadmap
 
-**P1: passive best bid/ask following.** Post ALO (post-only) child orders at the
-touch and re-quote as the book moves, falling back to a taker sweep only when a
-slice is running out of time. This trades fill certainty for maker rebates and
-is the single biggest cost improvement available to this tool.
+**Shipped: passive (post-only) child orders.** `--child-algo passive` posts
+an ALO limit at the touch (best bid for a long, best ask for a short) and
+holds it for the full slice interval — see "Child-order algorithms" above.
+This is deliberately **boundary-only**: it does not re-quote mid-slice as the
+book moves, and it does not fall back to a taker sweep if the slice interval
+elapses unfilled (the shortfall carries to the next slice instead). Mid-slice
+re-quoting and a time-boxed taker-sweep fallback remain open follow-up work,
+not yet implemented.
 
 Also out of scope for now: WebSocket fills, multi-symbol execution, and
 existing-position awareness. (Run resume/persistence — previously listed
