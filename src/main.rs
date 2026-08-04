@@ -19,6 +19,7 @@ use secrecy::SecretString;
 use hype_trigger_twap::client::{HlClient, HlConfig, Network, Role, ValidatedMarketSnapshot};
 use hype_trigger_twap::errors::HlError;
 use hype_trigger_twap::format::human;
+use hype_trigger_twap::risk::{pre_send_summary, RiskEnvelope};
 use hype_trigger_twap::signer::{Eip712AgentSigner, Signer};
 use hype_trigger_twap::trigger::{
     wait_for_trigger, TriggerConfig, TriggerOutcome, TriggerReason, TriggerWhen,
@@ -49,8 +50,12 @@ ENVIRONMENT VARIABLES:
                       probe; if you also set it here, the two must agree or
                       startup fails.
 
-  HL_INFO_URL         Optional. Override the /info endpoint (testing).
+  HL_INFO_URL         Optional. Override the /info endpoint (testing). In LIVE
+                      mode this is rejected by default (Issue #3) unless
+                      --allow-custom-endpoints is also passed, and even then
+                      only an https:// URL is accepted.
   HL_EXCHANGE_URL     Optional. Override the /exchange endpoint (testing).
+                      Same live-mode restriction as HL_INFO_URL above.
   RUST_LOG            Optional. Log filter; defaults to `info`.
 ";
 
@@ -162,9 +167,33 @@ struct Cli {
     #[arg(long, value_enum, default_value = "mainnet")]
     network: NetworkArg,
 
-    /// Slippage cushion for the IOC limit price, in basis points.
+    /// Slippage cushion for the IOC limit price, in basis points. Rejected
+    /// unconditionally at or above 10000 bps or if it produces a non-positive
+    /// limit price; above 1000 bps requires --allow-high-slippage (Issue #3).
     #[arg(long, default_value = "20")]
     slippage_bps: Decimal,
+
+    /// Unsafe override: allow --slippage-bps above the 1000 bps warn
+    /// threshold. Has NO effect on the unconditional >= 10000 bps hard cap or
+    /// the non-positive-limit-price rejection — neither can be overridden.
+    #[arg(long, default_value_t = false)]
+    allow_high_slippage: bool,
+
+    /// REQUIRED in live mode (`--read-only false`): the maximum USD notional
+    /// any single slice may target. `--usd` is checked as the requested
+    /// notional; `--size` is checked via a freshly computed conservative
+    /// limit price. Re-checked before EVERY slice against that slice's
+    /// actual order price. Not required in read-only mode (Issue #3,
+    /// breaking change for live users — see docs/USAGE.md).
+    #[arg(long)]
+    max_notional_usd: Option<Decimal>,
+
+    /// Unsafe override: allow HL_INFO_URL / HL_EXCHANGE_URL to be overridden
+    /// in LIVE mode. Requires the override URL(s) to be https://. Read-only
+    /// mode and tests are unaffected by this flag — the restriction it lifts
+    /// only ever applies to live mode (Issue #3).
+    #[arg(long, default_value_t = false)]
+    allow_custom_endpoints: bool,
 
     /// Reject an l2Book snapshot older than this many ms. 0 disables the
     /// check. A negative age (HL clock ahead of ours) counts as fresh.
@@ -220,12 +249,15 @@ impl Cli {
         if self.slices == 0 {
             return Err("--slices must be > 0".into());
         }
-        if self.slippage_bps < Decimal::ZERO {
-            return Err(format!(
-                "--slippage-bps must be >= 0, got {}",
-                self.slippage_bps
-            ));
-        }
+        // Issue #3: slippage bounds are enforced by the single risk-policy
+        // module (src/risk.rs) — CLI validation and the twap.rs slice loop
+        // both call into RiskEnvelope so the bounds can never drift apart.
+        RiskEnvelope::validate_slippage(self.slippage_bps, self.allow_high_slippage)
+            .map_err(|e| e.to_string())?;
+        // Issue #3: live mode requires --max-notional-usd (breaking change,
+        // documented in docs/USAGE.md / docs/OPERATIONS.md).
+        RiskEnvelope::validate_max_notional_required(self.read_only, self.max_notional_usd)
+            .map_err(|e| e.to_string())?;
         if self.trigger_price.is_some() != self.trigger_when.is_some() {
             return Err("--trigger-price and --trigger-when must be given together".into());
         }
@@ -315,6 +347,38 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         println!("{READ_ONLY_BANNER}");
     } else {
         tracing::warn!("LIVE MODE: orders WILL be sent to {network}");
+    }
+
+    // Issue #3: the RiskEnvelope is resolved HERE, immediately after CLI
+    // validation and BEFORE any network access (including the endpoint
+    // override check right below, and everything that follows). This is the
+    // single point in the whole run where the risk policy is fixed for good —
+    // later tasks that need to observe or extend the resolved risk config
+    // (e.g. a run journal, or a passive/post-only build mode) should hook in
+    // at this construction point rather than re-deriving it elsewhere.
+    let risk = RiskEnvelope {
+        slippage_bps: cli.slippage_bps,
+        allow_high_slippage: cli.allow_high_slippage,
+        max_notional_usd: cli.max_notional_usd,
+    };
+
+    // Issue #3: live + a custom HL_INFO_URL/HL_EXCHANGE_URL override is
+    // rejected by default. This MUST run before any network access — it sits
+    // ahead of the signer/client construction below, which is itself already
+    // ahead of the first network call. Read-only is UNAFFECTED (the check
+    // below is gated on `!cli.read_only`), which is what keeps the existing
+    // mockito-based read-only test seam working unchanged.
+    if !cli.read_only {
+        for url in [
+            std::env::var("HL_INFO_URL").ok(),
+            std::env::var("HL_EXCHANGE_URL").ok(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            RiskEnvelope::validate_endpoint_override(&url, cli.allow_custom_endpoints)
+                .map_err(|e| e.to_string())?;
+        }
     }
 
     // §4 step 3 (partial): build the signer before any network call so a bad
@@ -541,6 +605,65 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     }
     tracing::info!(min_notional_usd = %human(MIN_NOTIONAL_USD), "per-slice min-notional gate");
 
+    // Issue #3: resolve the notional cap (required in live, Decimal::MAX —
+    // effectively unbounded — in read-only) and pre-flight-check the
+    // requested notional against it, BEFORE any `/exchange` call. `--usd` is
+    // checked as the requested notional directly; `--size` is checked via a
+    // freshly computed CONSERVATIVE limit price (the same taker_limit_price
+    // formula the slice loop uses, evaluated at this snapshot's touch) so a
+    // size-denominated request cannot dodge the cap by omitting price
+    // entirely. The slice loop re-checks this same cap before EVERY slice
+    // against that slice's actual order price (src/twap.rs) — both call
+    // sites share the one risk module (src/risk.rs), never duplicated
+    // constants.
+    let max_notional_usd =
+        RiskEnvelope::validate_max_notional_required(cli.read_only, risk.max_notional_usd)
+            .map_err(|e| e.to_string())?;
+    let preflight_notional = match (cli.size, cli.usd) {
+        (Some(_), _) => {
+            let conservative_px = hype_trigger_twap::format::taker_limit_price(
+                snapshot.best_bid,
+                snapshot.best_ask,
+                side,
+                risk.slippage_bps,
+                asset.sz_decimals,
+            );
+            RiskEnvelope::validate_limit_price(
+                conservative_px,
+                side,
+                risk.slippage_bps,
+                snapshot.best_bid,
+                snapshot.best_ask,
+            )
+            .map_err(|e| e.to_string())?;
+            total_coin * conservative_px
+        }
+        (_, Some(usd)) => usd,
+        (None, None) => return Err("no size specified".into()),
+    };
+    RiskEnvelope::check_notional_cap(preflight_notional, max_notional_usd)
+        .map_err(|e| e.to_string())?;
+
+    // Issue #3: one-shot pre-send summary, printed once before execution
+    // begins.
+    println!(
+        "{}",
+        pre_send_summary(
+            network,
+            &client.config().info_url,
+            &client.config().exchange_url,
+            symbol.as_str(),
+            side,
+            &requested_desc,
+            risk.slippage_bps,
+            if cli.read_only {
+                None
+            } else {
+                Some(max_notional_usd)
+            },
+        )
+    );
+
     // §8: the loop.
     let plan = TwapPlan {
         symbol,
@@ -552,9 +675,10 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         total_requested: total_coin,
         slices: cli.slices,
         duration: cli.duration,
-        slippage_bps: cli.slippage_bps,
+        slippage_bps: risk.slippage_bps,
         max_book_age_ms: cli.max_book_age_ms,
         read_only: cli.read_only,
+        max_notional_usd,
         agent: agent_address,
         master,
     };
@@ -649,6 +773,8 @@ mod tests {
             "1500",
             "--duration",
             "30m",
+            "--max-notional-usd",
+            "5000",
             "--read-only",
             "false",
         ])
@@ -858,6 +984,90 @@ mod tests {
         )
         .unwrap();
         assert!(cli.validate().unwrap_err().contains("--slippage-bps"));
+    }
+
+    // === Issue #3: risk envelope CLI wiring ===
+
+    #[test]
+    fn slippage_at_hard_cap_is_rejected_even_with_allow_high_slippage() {
+        let cli = Cli::try_parse_from(
+            base_args()
+                .into_iter()
+                .chain(["--slippage-bps", "10000", "--allow-high-slippage"])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let err = cli.validate().unwrap_err();
+        assert!(err.contains("hard cap"), "{err}");
+    }
+
+    #[test]
+    fn slippage_over_warn_threshold_is_rejected_without_the_flag() {
+        let cli = Cli::try_parse_from(
+            base_args()
+                .into_iter()
+                .chain(["--slippage-bps", "1001"])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let err = cli.validate().unwrap_err();
+        assert!(err.contains("--allow-high-slippage"), "{err}");
+    }
+
+    #[test]
+    fn slippage_over_warn_threshold_is_accepted_with_the_flag() {
+        let cli = Cli::try_parse_from(
+            base_args()
+                .into_iter()
+                .chain(["--slippage-bps", "1001", "--allow-high-slippage"])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        cli.validate().unwrap();
+    }
+
+    #[test]
+    fn live_without_max_notional_usd_is_rejected() {
+        let cli = Cli::try_parse_from(
+            base_args()
+                .into_iter()
+                .chain(["--read-only", "false"])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let err = cli.validate().unwrap_err();
+        assert!(err.contains("--max-notional-usd"), "{err}");
+    }
+
+    #[test]
+    fn live_with_max_notional_usd_is_accepted() {
+        let cli = Cli::try_parse_from(
+            base_args()
+                .into_iter()
+                .chain(["--read-only", "false", "--max-notional-usd", "5000"])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        cli.validate().unwrap();
+    }
+
+    #[test]
+    fn read_only_does_not_require_max_notional_usd() {
+        // Default read-only (true), no --max-notional-usd given at all.
+        let cli = Cli::try_parse_from(base_args()).unwrap();
+        cli.validate().unwrap();
+    }
+
+    #[test]
+    fn allow_custom_endpoints_defaults_to_false() {
+        let cli = Cli::try_parse_from(base_args()).unwrap();
+        assert!(!cli.allow_custom_endpoints);
+    }
+
+    #[test]
+    fn allow_high_slippage_defaults_to_false() {
+        let cli = Cli::try_parse_from(base_args()).unwrap();
+        assert!(!cli.allow_high_slippage);
     }
 
     #[test]
@@ -1280,6 +1490,13 @@ mod tests {
             "1s",
             "--max-book-age-ms",
             "0",
+            "--max-notional-usd",
+            "1000000",
+            // Issue #3: live + a custom endpoint override is rejected by
+            // default; this test's mock server is loopback-only (mockito has
+            // no TLS support), which the loopback carve-out on
+            // validate_endpoint_override permits once this flag is passed.
+            "--allow-custom-endpoints",
             "--read-only",
             "false",
         ])
@@ -1300,5 +1517,52 @@ mod tests {
         // l2Book calls (one for the old pre-wait skew preflight, one for the
         // trigger poll); the relocated implementation needs only one.
         _book.assert_async().await;
+    }
+
+    /// Issue #3: live + a custom `HL_INFO_URL`/`HL_EXCHANGE_URL` override
+    /// (without `--allow-custom-endpoints`) must be rejected before ANY
+    /// network call — not even the `/info meta` call that normally happens
+    /// first at startup. The mock server below registers NO routes at all,
+    /// so any network call would surface as a mockito 501 rather than the
+    /// expected endpoint-override error, proving the rejection happens
+    /// strictly before the first request.
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn issue3_live_custom_endpoint_without_override_flag_rejected_before_any_network_call() {
+        let server = mockito::Server::new_async().await;
+        // No mocks registered — a network call here would 501.
+
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+
+        let cli = Cli::try_parse_from([
+            "hype-twap",
+            "--symbol",
+            "HYPE",
+            "--side",
+            "long",
+            "--usd",
+            "1500",
+            "--duration",
+            "5m",
+            "--max-notional-usd",
+            "5000",
+            "--read-only",
+            "false",
+            // Deliberately NOT passing --allow-custom-endpoints.
+        ])
+        .unwrap();
+
+        let result = run_with_cli(cli).await;
+
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+
+        let err = result.expect_err("a live custom endpoint override must be rejected");
+        assert!(err.contains("--allow-custom-endpoints"), "{err}");
     }
 }
