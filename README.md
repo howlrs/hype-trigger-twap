@@ -290,10 +290,16 @@ the shortfall; a normal run reaches its last slice inside the window anyway.
 
 ## Known limitations
 
-- **No state persistence.** If the process dies mid-run there is no resume:
-  the already-filled portion stays filled and the remainder is simply not
-  executed. Recovery is manual — check your fills before re-running, or you
-  will double up.
+- **Crash/restart recovery requires `--resume`.** A live run journals every
+  order intent (fsynced, before the network send) to
+  `$XDG_STATE_HOME/hype-twap` (or `~/.local/state/hype-twap`, or
+  `--state-dir`). If the process dies mid-run, restarting the SAME command
+  refuses to start until you either pass `--resume <run-id>` (reconciles
+  every in-flight order via `orderStatus`, then continues — no
+  double-placement) or `--abandon-incomplete-run` (force-reconciles and
+  stops, without continuing). See docs/OPERATIONS.md for the runbook.
+  SIGINT/SIGTERM are handled the same way: in-flight orders are reconciled
+  and confirmed resting orders are cancelled before the process exits.
 - **Wall-clock dependent.** Nonces and book-freshness checks assume a
   reasonably accurate system clock; run NTP. (A book timestamp *ahead* of local
   time is treated as fresh, so mild skew is tolerated.)
@@ -311,8 +317,9 @@ touch and re-quote as the book moves, falling back to a taker sweep only when a
 slice is running out of time. This trades fill certainty for maker rebates and
 is the single biggest cost improvement available to this tool.
 
-Also out of scope for now: WebSocket fills, run resume/persistence,
-multi-symbol execution, and existing-position awareness.
+Also out of scope for now: WebSocket fills, multi-symbol execution, and
+existing-position awareness. (Run resume/persistence — previously listed
+here — shipped: see "Known limitations" above and docs/OPERATIONS.md.)
 
 ## Development
 

@@ -120,11 +120,168 @@ hype-twap ... --read-only false 2>&1 | tee twap-$(date +%Y%m%d-%H%M%S).log
 
 ### 中断したい場合
 
-`Ctrl-C` でプロセスを終了します。IOC 注文は約定しなければ自動的に取り消されるため、
-板に注文が残り続けることは通常ありません。ただし、**中断した時点までの約定は残ります**。
+`Ctrl-C` (SIGINT) または `SIGTERM` でプロセスに中断を要求します。
+即座には終了しません — 以下の graceful shutdown 手順を踏みます。
 
-再実行する前に、必ず Hyperliquid 上の建玉と約定履歴を確認してください。
-状態の永続化がないため、そのまま再実行すると同じ量を重ねて執行することになります。
+1. 新しいスライスの発注を止める (次のスライスの送信直前でチェックされます)。
+2. 送信済みで結果が未確定 (in-flight) の注文があれば `orderStatus` で照合する。
+   本ツールが送信するのは常に IOC です。IOC は約定しなければ取引所側で
+   即時キャンセルされる注文形式ですが、ごく稀に取引所からの応答が
+   `resting` (板に乗った) として返ることがあり、その場合は本ツールが
+   `cancelByCloid` を送ってから `orderStatus` で最終的な約定数量を
+   確認します。この確認・キャンセル処理はシグナルの有無に関わらず
+   既存の送信ロジックの一部として常に行われるため、シグナル到着時に
+   in-flight だったスライスは、その処理が完了するまで待ってから
+   次のステップに進みます。
+3. 最終レポートをジャーナルに永続化してから終了する。
+
+この一連の処理は `--shutdown-grace` (既定 60 秒) 以内に完了させます。
+超過した場合は、未解決の注文を `outcome_unknown` としてジャーナルに記録した上で、
+**非ゼロ終了コード**でプロセスを終了します — この場合は次項の crash/restart
+手順に従ってください。
+
+状態は `--state-dir` (既定 `$XDG_STATE_HOME/hype-twap` またはなければ
+`~/.local/state/hype-twap`) 以下にジャーナルとして永続化されているため、
+中断後の再実行は手動の建玉確認に頼らず `--resume` で安全に継続できます。
+詳細は次項を参照してください。
+
+## クラッシュ・再起動時の手順 (Issue #4)
+
+**この節は本番実行 (`--read-only false`) にのみ関係します。** `--read-only`
+(既定) はジャーナルを一切書き込まないため、再開の概念自体がありません。
+
+### 何が起きているか
+
+本番実行は、注文を送信する**前**に intent (symbol / side / 価格 / 数量 /
+cloid) を `<state-dir>/runs/<run-id>/journal.jsonl` に `fsync` 付きで
+追記してから `/exchange` へ POST します。応答を受け取ったら、その結果
+(約定・resting・エラー) も追記されます。つまりプロセスが
+
+- POST 送信前にクラッシュした場合 → ジャーナルには intent だけが残り、
+  実際には送信されていません。
+- POST 送信後・応答受信前にクラッシュした場合 → ジャーナルには
+  「結果不明 (SubmittedUnknown)」として残ります。実際には HL が受理済みの
+  可能性があります。
+- resting 注文の確認後にクラッシュした場合 → ジャーナルには確認済みの
+  状態が残ります。
+
+いずれの場合も、**同じコマンドをそのまま再実行することはできません**。
+同じ network + agent の組み合わせで未完了 (incomplete) のジャーナルが
+見つかると、本ツールは新規の重複実行を拒否して起動時に停止します。
+
+```text
+an incomplete run (<run-id>) exists for this network+agent (state dir: ...);
+refusing to start a new overlapping live run. Pass --resume <run-id> to
+continue it, or --abandon-incomplete-run to force-reconcile and abandon it
+(nothing further from that run will be executed).
+```
+
+### 手順 1: `--resume` で再開する (推奨)
+
+エラーメッセージに表示された `<run-id>` を使い、**元と同じコマンドライン**に
+`--resume <run-id>` を追加して再実行します。
+
+```bash
+hype-twap --symbol HYPE --side long --usd 1500 --duration 30m \
+  --max-notional-usd 5000 --read-only false \
+  --resume <run-id>
+```
+
+起動すると、そのジャーナルに記録されている未解決 (submitted/unknown) な
+cloid をすべて `orderStatus` で照合してから、通常の実行フローを継続します。
+すでにジャーナルに約定として記録されている分は再送されず、二重発注は
+起こりません。
+
+### 手順 2: 続行せず放棄する場合 — `--abandon-incomplete-run`
+
+その run を再開せず打ち切りたい場合は `--abandon-incomplete-run` を指定します。
+`<run-id>` は不要です — 対象は起動時に検出された、その network + agent の
+未完了 run から自動的に特定されます。
+
+```bash
+hype-twap --symbol HYPE --side long --usd 1500 --duration 30m \
+  --max-notional-usd 5000 --read-only false \
+  --abandon-incomplete-run
+```
+
+**このフラグは照合を省略しません。** 内部的には `--resume` と同じ
+`orderStatus` による強制照合を先に行い、結果をジャーナルに記録してから
+run を `Abandoned` としてクローズします。「照合すらせず握りつぶす」手段は
+意図的に用意していません。残りの未執行分量は実行されず、放棄したことを
+示すメッセージが表示されて終了コード `0` で終わります。
+
+### `--resume` と実行内容が食い違う場合
+
+食い違いには 2 種類あり、それぞれ検出タイミングが異なります。
+
+- **`<run-id>` 自体が一致しない場合**: `--resume <run-id>` に渡した ID が
+  状態ディレクトリ上の未完了 run と一致しないと、`orderStatus` による
+  照合を始める前に即座にエラーで停止します。エラーメッセージに表示された
+  正しい `<run-id>` を使ってください。
+- **`<run-id>` は正しいが、他のパラメータ (`--usd`/`--size`/`--duration`/
+  `--slices`/`--slippage-bps`/`--max-notional-usd` など) が元の実行と
+  異なる場合**: `--resume` 限定のチェックです。run の未解決 cloid の
+  `orderStatus` 照合を終えたあと (照合は安全のため常に先に行われ、
+  パラメータの食い違いでスキップされることはありません)、サイズ算出後に
+  元の run のジャーナルへ記録された `plan_hash` と比較し、一致しなければ
+  エラーで停止します。この場合も `orderStatus` 照合の結果はジャーナルに
+  残ったままなので、**元と同じパラメータで `--resume` をやり直す**か、
+  続行するつもりがないなら `--abandon-incomplete-run` を使ってください。
+  パラメータを意図的に変えて残りを続行する手段は用意していません —
+  途中からスケジュールを変えて再解釈させることは事故のもとだからです。
+  なお `--abandon-incomplete-run` はこの `plan_hash` チェックを行いません
+  — run を閉じるだけなので、渡した `--usd`/`--duration` 等がどんな値でも
+  (照合完了後に) 正常に `Abandoned` としてクローズできます。
+
+### 状態ディレクトリの場所を変える
+
+複数の環境 (例: 複数ホスト、複数エージェント) で状態ディレクトリを
+分離したい場合は `--state-dir <path>` を明示してください。
+既定値は `$XDG_STATE_HOME/hype-twap`、`$XDG_STATE_HOME` 未設定なら
+`~/.local/state/hype-twap` です。
+
+### 手動での実死活検証 (kill テスト) について
+
+自動テストでは実プロセスを kill する代わりに、モック API + テスト用の
+シグナルチャネルでクラッシュ地点を再現しています (詳細は開発者向けドキュメント参照)。
+運用担当者が手動で実プロセスの挙動を検証したい場合は、testnet 上で
+**2 パターン**を分けて確認することを推奨します —
+「シグナルによる graceful shutdown」と「本当のクラッシュ (SIGKILL)」は
+挙動もジャーナルの終端状態も異なるため、混同しないでください。
+
+**パターン A: graceful shutdown (`SIGTERM`/`Ctrl-C`)**
+
+1. testnet かつ少額 (`--max-notional-usd` を小さく) で本番実行を開始する。
+2. スライスが 1 〜 2 回発注されたところで `kill -SIGTERM <pid>` (または
+   `Ctrl-C`) を送る。
+3. プロセスが `--shutdown-grace` 以内に自発的に終了し、最終レポートと
+   終了コードが表示されることを確認する。
+4. `<state-dir>/runs/<run-id>/journal.jsonl` を `cat` し、最後のレコードが
+   `FinalReport` で終わっていることを確認する — graceful shutdown は
+   in-flight の注文を照合してから終わるため、`SubmittedUnknown` のまま
+   宙ぶらりんの cloid は残らないはずです (もし残っていれば
+   `--shutdown-grace` を超過したケースなので、次のパターン B と同じ手順で
+   復旧してください)。
+5. Hyperliquid 上の実際の約定・建玉と、ジャーナル上の `filled_sz` の合計が
+   一致することを確認する。
+
+**パターン B: 本当のクラッシュ (`kill -9` / SIGKILL)**
+
+graceful shutdown を経由しないプロセス消滅 (電源断、OOM kill、`kill -9`
+など) を再現します。
+
+1. testnet かつ少額で本番実行を開始する。
+2. スライスが 1 〜 2 回発注されたところで `kill -9 <pid>` を送る —
+   シグナルハンドラは一切実行されず、プロセスは即座に消滅します。
+3. `<state-dir>/runs/<run-id>/journal.jsonl` を `cat` し、`FinalReport` が
+   **存在しない**こと (途中の `Prepared`/`SubmittedUnknown`/`Acknowledged`
+   のいずれかで終わっていること) を確認する。
+4. 同じコマンドをそのまま (フラグなしで) 再実行し、incomplete-run の
+   エラーで正しく拒否されることを確認する。
+5. `--resume <run-id>` で再実行し、未解決だった cloid が `orderStatus` で
+   照合された上で残数量だけが執行されることを確認する。
+6. Hyperliquid 上の実際の約定・建玉と、ジャーナル上の `filled_sz` の合計が
+   一致することを確認する (パターン A の手順5と同じ最終確認)。
 
 ## トラブルシューティング
 
@@ -197,9 +354,10 @@ override はできません — タイプミスの可能性を疑ってくださ
 
 ## 既知の制約
 
-- **状態の永続化がありません。** プロセスが途中で終了した場合、再開はできません。
-  約定済みの分はそのまま残り、残りは単に執行されません。復旧は手動です —
-  再実行する前に約定を確認しないと、重複して執行することになります
+- **crash/restart の再開は `--resume` が前提です。** ジャーナルは注文送信の
+  「前」に intent を fsync するため二重発注は防げますが、自動での続行は
+  行いません — 「クラッシュ・再起動時の手順」節の通り、`--resume` または
+  `--abandon-incomplete-run` を明示的に指定する必要があります
 - **システム時刻に依存します。** nonce と板の鮮度チェックは、ある程度正確なシステム時刻を
   前提としています。NTP を動かしてください (板のタイムスタンプがローカル時刻より未来の場合は
   新鮮として扱うため、軽度のずれは許容されます)
@@ -220,5 +378,5 @@ override はできません — タイプミスの可能性を疑ってくださ
 追加します。実装方針と受け入れ条件は
 [issue #1](https://github.com/howlrs/hype-trigger-twap/issues/1) に記載しています。
 
-当面スコープ外: WebSocket による約定取得、実行の再開・永続化、複数銘柄の同時執行、
-既存ポジションの考慮。
+当面スコープ外: WebSocket による約定取得、複数銘柄の同時執行、既存ポジションの考慮。
+(実行の再開・永続化は対応済みです — 「クラッシュ・再起動時の手順」を参照してください)
