@@ -423,29 +423,113 @@ pub struct OrderStatusFill {
     pub avg_px: Option<Decimal>,
     /// Raw HL status string ("filled", "open", "canceled", ...).
     pub status: String,
+    /// Fields the response carries about the order itself (Issue #7), so a
+    /// caller who also holds the query's expectations (the oid/cloid it
+    /// asked about, and the intent's coin/side) can cross-check the response
+    /// actually describes that order rather than adopting a mismatched one on
+    /// trust. See [`OrderStatusFill::cross_check`].
+    pub oid: OrderId,
+    pub cloid: Option<crate::types::Cloid>,
+    pub coin: String,
+    /// Raw HL side letter: `"B"` (buy/long) or `"A"` (ask/short).
+    pub side: String,
 }
 
-/// HL order statuses that mean "this order will never fill again" (T3).
+impl OrderStatusFill {
+    /// Verify the response actually describes the order the caller queried
+    /// for (Issue #7).
+    ///
+    /// `orderStatus` is keyed on an oid-or-cloid the caller already knows, so
+    /// this is not "trust but verify" against an independent source — it is a
+    /// defence against a client bug, a proxy/cache serving the wrong id, or a
+    /// future HL API change that silently reinterprets the query. All of
+    /// `expected_coin` and `expected_side` are checked against the response;
+    /// `expected_cloid` is checked only when the response carries a cloid at
+    /// all (a plain-oid query and orderStatus's own `cloid: null` case both
+    /// leave the field unset, which is not itself a mismatch).
+    pub fn cross_check(
+        &self,
+        expected_coin: &str,
+        expected_side: &crate::types::Side,
+        expected_cloid: Option<crate::types::Cloid>,
+    ) -> Result<(), HlError> {
+        if self.coin != expected_coin {
+            return Err(HlError::InvalidResponse(format!(
+                "orderStatus cross-check: coin mismatch (expected {expected_coin}, got {})",
+                self.coin
+            )));
+        }
+        let expected_side_wire = match expected_side {
+            crate::types::Side::Long => "B",
+            crate::types::Side::Short => "A",
+        };
+        if self.side != expected_side_wire {
+            return Err(HlError::InvalidResponse(format!(
+                "orderStatus cross-check: side mismatch (expected {expected_side_wire}, got {})",
+                self.side
+            )));
+        }
+        if let (Some(expected), Some(got)) = (expected_cloid, self.cloid) {
+            if expected != got {
+                return Err(HlError::InvalidResponse(format!(
+                    "orderStatus cross-check: cloid mismatch (expected {expected}, got {got})"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Complete official Hyperliquid `orderStatus` vocabulary (Issue #7), each
+/// entry classified terminal or non-terminal.
 ///
-/// Only a terminal status may be adopted as the FINAL filled quantity. A
-/// non-terminal status ("open", "triggered", or anything HL adds later) is a
-/// snapshot of an order that can still fill in the next millisecond — treating
-/// it as final under-counts the fill and makes every later slice over-order.
-/// Written with the single-L American spelling; `is_terminal` normalises the
-/// doubled-L variant before comparing, because HL is not consistent about it.
-const TERMINAL_ORDER_STATUSES: &[&str] = &[
-    "filled",
-    "canceled",
-    "marginCanceled",
-    "rejected",
-    "reduceOnlyCanceled",
-    "liquidatedCanceled",
-    "vaultWithdrawalCanceled",
-    "openInterestCapCanceled",
-    "selfTradeCanceled",
-    "siblingFilledCanceled",
-    "delistedCanceled",
-    "scheduledCancel",
+/// This supersedes the old hand-maintained 12-entry `TERMINAL_ORDER_STATUSES`
+/// allow-list. The fail-closed default is unchanged: a status that is not in
+/// this table (something HL adds later) is still treated as non-terminal by
+/// [`OrderStatusFill::is_terminal`] — see that method's docs for why guessing
+/// "terminal" on an unknown status is the dangerous direction.
+///
+/// Sourced from https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint
+/// (fetched 2026-08-04) plus the issue body's must-include list. Every
+/// `*Rejected` name means the order was never created / can never fill again
+/// (including `iocCancelRejected`, whose zero-fill is a normal SETTLED
+/// outcome — HL cancelled the un-fillable IOC itself, not an error state).
+/// Every `*Canceled` name is likewise final. `open` and `triggered` are the
+/// only two non-terminal entries: an order in either state can still fill in
+/// the next millisecond.
+const ORDER_STATUS_VOCABULARY: &[(&str, bool)] = &[
+    // non-terminal — the order is still live and can still fill.
+    ("open", false),
+    ("triggered", false),
+    // terminal — placement-time rejections (never created; can never fill).
+    ("rejected", true),
+    ("tickRejected", true),
+    ("minTradeNtlRejected", true),
+    ("perpMarginRejected", true),
+    ("reduceOnlyRejected", true),
+    ("badAloPxRejected", true),
+    ("iocCancelRejected", true),
+    ("badTriggerPxRejected", true),
+    ("marketOrderNoLiquidityRejected", true),
+    ("positionIncreaseAtOpenInterestCapRejected", true),
+    ("positionFlipAtOpenInterestCapRejected", true),
+    ("tooAggressiveAtOpenInterestCapRejected", true),
+    ("openInterestIncreaseRejected", true),
+    ("insufficientSpotBalanceRejected", true),
+    ("oracleRejected", true),
+    ("perpMaxPositionRejected", true),
+    // terminal — cancellations (the order existed but will never fill again).
+    ("filled", true),
+    ("canceled", true),
+    ("marginCanceled", true),
+    ("reduceOnlyCanceled", true),
+    ("liquidatedCanceled", true),
+    ("vaultWithdrawalCanceled", true),
+    ("openInterestCapCanceled", true),
+    ("selfTradeCanceled", true),
+    ("siblingFilledCanceled", true),
+    ("delistedCanceled", true),
+    ("scheduledCancel", true),
 ];
 
 impl OrderStatusFill {
@@ -455,19 +539,150 @@ impl OrderStatusFill {
     /// "canceled"). Both are safety measures in the same direction: a wording
     /// change on HL's side must not silently reclassify a SETTLED order as
     /// still-live, which would hard-stop an otherwise healthy run. The reverse
-    /// error — treating a live order as settled — is guarded by keeping this
-    /// list explicit, so an unrecognised status is always non-terminal.
+    /// error — treating a live order as settled — is guarded by keeping the
+    /// vocabulary explicit: a status absent from the table (HL adds one we
+    /// don't know about yet) is always non-terminal, never guessed terminal.
     pub fn is_terminal(&self) -> bool {
         let got = normalise_status(&self.status);
-        TERMINAL_ORDER_STATUSES
+        ORDER_STATUS_VOCABULARY
             .iter()
-            .any(|t| normalise_status(t) == got)
+            .any(|(name, terminal)| *terminal && normalise_status(name) == got)
+    }
+
+    /// True when the status is a recognised member of the vocabulary at all
+    /// (terminal or not). A status that is neither is one HL has added since
+    /// this table was written — conformance drift, not a code bug.
+    pub fn is_known_status(&self) -> bool {
+        let got = normalise_status(&self.status);
+        ORDER_STATUS_VOCABULARY
+            .iter()
+            .any(|(name, _)| normalise_status(name) == got)
     }
 }
 
 /// Lowercase and collapse the "cancelled"/"canceled" spelling split.
 fn normalise_status(s: &str) -> String {
     s.to_ascii_lowercase().replace("cancelled", "canceled")
+}
+
+/// A fill that has passed every check a trusted-boundary exchange response
+/// must clear before its quantity is credited toward the run's target
+/// (Issue #7).
+///
+/// Exchange responses — both `/exchange` place acknowledgements and `/info
+/// orderStatus` snapshots — are the boundary where a malformed, malicious, or
+/// merely surprising response could silently corrupt the cumulative filled
+/// total that every later slice sizes off. Before this type existed, `place`
+/// and `orderStatus` responses were credited directly (`client.rs:663-680`,
+/// `twap.rs:795-807` pre-Issue-#7): a `filled.totalSz` greater than the
+/// intent's size, a non-positive `avgPx`, or a fill priced outside the
+/// signed limit would all have been accepted as-is.
+///
+/// Constructing a `ValidatedFill` is the only way to turn an untrusted
+/// `(filled_sz, avg_px)` pair plus the `OrderIntent` that produced it into a
+/// value a caller may add to `FillStats`. Two entry points cover the two wire
+/// shapes that carry a fill (`PlaceOutcome::Filled` and `OrderStatusFill`)
+/// without forcing a false unification between them — see
+/// [`ValidatedFill::try_from_place`] and [`ValidatedFill::try_from_status`].
+///
+/// Checks applied (all four must hold):
+/// - `0 <= filled <= intent.sz` — an overfill is a hard error, NEVER clamped.
+///   Silently clamping would mean crediting a size that was never actually
+///   asked for while hiding the fact that the exchange's number disagreed
+///   with ours.
+/// - `avg_px > 0` whenever `filled > 0` — a filled quantity at a zero or
+///   negative price is not a price at all.
+/// - side-aware price bound: a LONG's average fill price may not exceed the
+///   signed limit (`avg_px <= intent.px`); a SHORT's may not fall below it
+///   (`avg_px >= intent.px`). HL is a taker-limit order, so a fill outside
+///   the limit means the response does not describe the order we sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidatedFill {
+    pub filled_sz: Decimal,
+    /// `None` only when `filled_sz == 0` (a zero fill has no price).
+    pub avg_px: Option<Decimal>,
+}
+
+impl ValidatedFill {
+    /// Core validator shared by both entry points. `avg_px` is `None` when
+    /// the wire response omitted it (HL does this for a never-filled order).
+    fn validate(
+        filled_sz: Decimal,
+        avg_px: Option<Decimal>,
+        intent: &OrderIntent,
+    ) -> Result<Self, HlError> {
+        if filled_sz < Decimal::ZERO {
+            return Err(HlError::InvalidResponse(format!(
+                "fill validation: filled_sz {filled_sz} is negative"
+            )));
+        }
+        if filled_sz > intent.sz {
+            return Err(HlError::InvalidResponse(format!(
+                "fill validation: filled_sz {filled_sz} exceeds intent size {} \
+                 (cloid {}) — overfill is never clamped",
+                intent.sz, intent.cloid
+            )));
+        }
+
+        if filled_sz > Decimal::ZERO {
+            let px = avg_px.ok_or_else(|| {
+                HlError::InvalidResponse(format!(
+                    "fill validation: filled_sz {filled_sz} > 0 but avgPx is missing (cloid {})",
+                    intent.cloid
+                ))
+            })?;
+            if px <= Decimal::ZERO {
+                return Err(HlError::InvalidResponse(format!(
+                    "fill validation: avgPx {px} is not positive despite filled_sz {filled_sz} \
+                     (cloid {})",
+                    intent.cloid
+                )));
+            }
+            match intent.side {
+                crate::types::Side::Long if px > intent.px => {
+                    return Err(HlError::InvalidResponse(format!(
+                        "fill validation: long avgPx {px} exceeds limit {} (cloid {})",
+                        intent.px, intent.cloid
+                    )));
+                }
+                crate::types::Side::Short if px < intent.px => {
+                    return Err(HlError::InvalidResponse(format!(
+                        "fill validation: short avgPx {px} is below limit {} (cloid {})",
+                        intent.px, intent.cloid
+                    )));
+                }
+                _ => {}
+            }
+            return Ok(ValidatedFill {
+                filled_sz,
+                avg_px: Some(px),
+            });
+        }
+
+        Ok(ValidatedFill {
+            filled_sz,
+            avg_px: None,
+        })
+    }
+
+    /// Validate a `/exchange` place response's `Filled` outcome against the
+    /// intent that produced it.
+    pub fn try_from_place(outcome: &PlaceOutcome, intent: &OrderIntent) -> Result<Self, HlError> {
+        match outcome {
+            PlaceOutcome::Filled {
+                total_sz, avg_px, ..
+            } => Self::validate(*total_sz, Some(*avg_px), intent),
+            PlaceOutcome::Resting { .. } => Err(HlError::InvalidResponse(
+                "fill validation: cannot validate a Resting outcome as a fill".into(),
+            )),
+        }
+    }
+
+    /// Validate an `/info orderStatus` snapshot against the intent that
+    /// produced the order it describes.
+    pub fn try_from_status(fill: &OrderStatusFill, intent: &OrderIntent) -> Result<Self, HlError> {
+        Self::validate(fill.filled_sz, fill.avg_px, intent)
+    }
 }
 
 /// Minimal HL REST client.
@@ -887,7 +1102,27 @@ pub fn parse_order_status(text: &str) -> Result<Option<OrderStatusFill>, HlError
     // `origSz` is the original size; `sz` is the UNFILLED remainder.
     let orig_sz = decimal_field(inner, "origSz")?;
     let remaining = decimal_field(inner, "sz")?;
-    let filled_sz = (orig_sz - remaining).max(Decimal::ZERO);
+    // Issue #7: `remaining > origSz` is a malformed/impossible response — an
+    // order cannot have more left to fill than it started with. The old code
+    // clamped this to a zero fill via `.max(Decimal::ZERO)`, which silently
+    // turned a nonsensical response into a quiet zero instead of surfacing
+    // it. A hard error is the only safe response: guessing either "zero" or
+    // "orig_sz" here risks crediting a number the exchange never actually
+    // reported.
+    if remaining > orig_sz {
+        return Err(HlError::InvalidResponse(format!(
+            "orderStatus: remaining {remaining} exceeds origSz {orig_sz} (oid {:?}) — \
+             malformed response, refusing to clamp",
+            inner.get("oid")
+        )));
+    }
+    if remaining < Decimal::ZERO {
+        return Err(HlError::InvalidResponse(format!(
+            "orderStatus: remaining {remaining} is negative (oid {:?})",
+            inner.get("oid")
+        )));
+    }
+    let filled_sz = orig_sz - remaining;
 
     let status = wrapper
         .get("status")
@@ -901,10 +1136,37 @@ pub fn parse_order_status(text: &str) -> Result<Option<OrderStatusFill>, HlError
         .and_then(|p| p.as_str())
         .and_then(|s| s.parse::<Decimal>().ok());
 
+    let oid = inner
+        .get("oid")
+        .and_then(|o| o.as_u64())
+        .map(OrderId)
+        .ok_or_else(|| HlError::InvalidResponse("orderStatus: order.order.oid missing".into()))?;
+    let coin = inner
+        .get("coin")
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| HlError::InvalidResponse("orderStatus: order.order.coin missing".into()))?
+        .to_string();
+    let side = inner
+        .get("side")
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| HlError::InvalidResponse("orderStatus: order.order.side missing".into()))?
+        .to_string();
+    // `cloid` is nullable/absent on the wire; malformed non-null values are
+    // treated as absent rather than a hard error, since the cross-check only
+    // uses this when both sides have a cloid to compare.
+    let cloid = inner
+        .get("cloid")
+        .and_then(|c| c.as_str())
+        .and_then(|s| crate::types::Cloid::try_from(s.to_string()).ok());
+
     Ok(Some(OrderStatusFill {
         filled_sz,
         avg_px,
         status,
+        oid,
+        cloid,
+        coin,
+        side,
     }))
 }
 
@@ -1105,6 +1367,10 @@ mod tests {
             filled_sz: dec!(1),
             avg_px: None,
             status: status.into(),
+            oid: OrderId(1),
+            cloid: None,
+            coin: "HYPE".into(),
+            side: "B".into(),
         }
     }
 
@@ -1145,6 +1411,332 @@ mod tests {
         assert!(fill("Filled").is_terminal());
         assert!(fill("CANCELED").is_terminal());
         assert!(fill("marginCancelled").is_terminal());
+    }
+
+    // === Issue #7: every official status has terminal semantics ===
+
+    /// Every must-include name from the issue body's rejection list, plus
+    /// the pre-existing 12 terminal statuses and the two non-terminal ones.
+    /// This is the acceptance-criteria test: "Hyperliquid 公式資料に列挙され
+    /// た全 status に terminal semantics のテストがある".
+    #[test]
+    fn every_official_status_has_terminal_semantics() {
+        let non_terminal = ["open", "triggered"];
+        let terminal = [
+            "rejected",
+            "tickRejected",
+            "minTradeNtlRejected",
+            "perpMarginRejected",
+            "reduceOnlyRejected",
+            "badAloPxRejected",
+            "iocCancelRejected",
+            "badTriggerPxRejected",
+            "marketOrderNoLiquidityRejected",
+            "positionIncreaseAtOpenInterestCapRejected",
+            "positionFlipAtOpenInterestCapRejected",
+            "tooAggressiveAtOpenInterestCapRejected",
+            "openInterestIncreaseRejected",
+            "insufficientSpotBalanceRejected",
+            "oracleRejected",
+            "perpMaxPositionRejected",
+            "filled",
+            "canceled",
+            "marginCanceled",
+            "reduceOnlyCanceled",
+            "liquidatedCanceled",
+            "vaultWithdrawalCanceled",
+            "openInterestCapCanceled",
+            "selfTradeCanceled",
+            "siblingFilledCanceled",
+            "delistedCanceled",
+            "scheduledCancel",
+        ];
+        for s in non_terminal {
+            assert!(!fill(s).is_terminal(), "'{s}' must be non-terminal");
+            assert!(fill(s).is_known_status(), "'{s}' must be a known status");
+        }
+        for s in terminal {
+            assert!(fill(s).is_terminal(), "'{s}' must be terminal");
+            assert!(fill(s).is_known_status(), "'{s}' must be a known status");
+        }
+        // Every vocabulary entry was exercised above (no entry silently
+        // skipped by this test).
+        assert_eq!(
+            ORDER_STATUS_VOCABULARY.len(),
+            non_terminal.len() + terminal.len()
+        );
+    }
+
+    #[test]
+    fn ioc_cancel_rejected_zero_fill_is_settled_not_ambiguous() {
+        // PM decision / acceptance criteria: `iocCancelRejected` with zero
+        // fill is a normal SETTLED outcome (HL cancelled the un-fillable IOC
+        // itself), never an error and never treated as still-live.
+        let f = fill("iocCancelRejected");
+        assert!(f.is_terminal());
+        assert!(f.is_known_status());
+    }
+
+    #[test]
+    fn a_status_absent_from_the_vocabulary_is_unknown_and_non_terminal() {
+        // Fail-closed: an HL status this table has never seen is neither
+        // adopted as terminal nor silently treated as a known non-terminal —
+        // it is flagged as vocabulary drift via `is_known_status`.
+        let f = fill("someBrandNewStatusHlAddsLater");
+        assert!(!f.is_terminal());
+        assert!(!f.is_known_status());
+    }
+
+    // === ValidatedFill (Issue #7) ===
+
+    fn intent(side: crate::types::Side, px: Decimal, sz: Decimal) -> OrderIntent {
+        OrderIntent {
+            cloid: crate::types::Cloid::new(),
+            symbol: Symbol::new("HYPE"),
+            side,
+            px,
+            sz,
+            tif: crate::types::Tif::Ioc,
+            reduce_only: false,
+        }
+    }
+
+    #[test]
+    fn validated_fill_accepts_a_normal_long_fill_within_the_limit() {
+        let i = intent(crate::types::Side::Long, dec!(50), dec!(10));
+        let vf = ValidatedFill::validate(dec!(10), Some(dec!(49.9)), &i).unwrap();
+        assert_eq!(vf.filled_sz, dec!(10));
+        assert_eq!(vf.avg_px, Some(dec!(49.9)));
+    }
+
+    #[test]
+    fn validated_fill_accepts_a_normal_short_fill_within_the_limit() {
+        let i = intent(crate::types::Side::Short, dec!(50), dec!(10));
+        let vf = ValidatedFill::validate(dec!(10), Some(dec!(50.1)), &i).unwrap();
+        assert_eq!(vf.avg_px, Some(dec!(50.1)));
+    }
+
+    #[test]
+    fn validated_fill_accepts_a_zero_fill_with_no_price() {
+        let i = intent(crate::types::Side::Long, dec!(50), dec!(10));
+        let vf = ValidatedFill::validate(dec!(0), None, &i).unwrap();
+        assert_eq!(vf.filled_sz, Decimal::ZERO);
+        assert_eq!(vf.avg_px, None);
+    }
+
+    #[test]
+    fn validated_fill_rejects_overfill_never_clamps() {
+        // 0 <= filled <= intent.sz — an overfill is a hard error.
+        let i = intent(crate::types::Side::Long, dec!(50), dec!(10));
+        let err = ValidatedFill::validate(dec!(10.01), Some(dec!(50)), &i).unwrap_err();
+        match err {
+            HlError::InvalidResponse(msg) => assert!(msg.contains("exceeds intent size"), "{msg}"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validated_fill_rejects_negative_filled_sz() {
+        let i = intent(crate::types::Side::Long, dec!(50), dec!(10));
+        let err = ValidatedFill::validate(dec!(-1), Some(dec!(50)), &i).unwrap_err();
+        assert!(matches!(err, HlError::InvalidResponse(_)));
+    }
+
+    #[test]
+    fn validated_fill_rejects_zero_avg_px_when_filled() {
+        let i = intent(crate::types::Side::Long, dec!(50), dec!(10));
+        let err = ValidatedFill::validate(dec!(5), Some(dec!(0)), &i).unwrap_err();
+        match err {
+            HlError::InvalidResponse(msg) => assert!(msg.contains("not positive"), "{msg}"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validated_fill_rejects_negative_avg_px_when_filled() {
+        let i = intent(crate::types::Side::Long, dec!(50), dec!(10));
+        let err = ValidatedFill::validate(dec!(5), Some(dec!(-1)), &i).unwrap_err();
+        assert!(matches!(err, HlError::InvalidResponse(_)));
+    }
+
+    #[test]
+    fn validated_fill_rejects_missing_avg_px_when_filled() {
+        let i = intent(crate::types::Side::Long, dec!(50), dec!(10));
+        let err = ValidatedFill::validate(dec!(5), None, &i).unwrap_err();
+        match err {
+            HlError::InvalidResponse(msg) => assert!(msg.contains("avgPx is missing"), "{msg}"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validated_fill_rejects_long_avg_px_above_the_limit() {
+        let i = intent(crate::types::Side::Long, dec!(50), dec!(10));
+        let err = ValidatedFill::validate(dec!(5), Some(dec!(50.01)), &i).unwrap_err();
+        match err {
+            HlError::InvalidResponse(msg) => assert!(msg.contains("long avgPx"), "{msg}"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validated_fill_rejects_short_avg_px_below_the_limit() {
+        let i = intent(crate::types::Side::Short, dec!(50), dec!(10));
+        let err = ValidatedFill::validate(dec!(5), Some(dec!(49.99)), &i).unwrap_err();
+        match err {
+            HlError::InvalidResponse(msg) => assert!(msg.contains("short avgPx"), "{msg}"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validated_fill_accepts_avg_px_exactly_at_the_limit() {
+        // Boundary: exactly at the limit is fine on both sides.
+        let long = intent(crate::types::Side::Long, dec!(50), dec!(10));
+        ValidatedFill::validate(dec!(5), Some(dec!(50)), &long).unwrap();
+        let short = intent(crate::types::Side::Short, dec!(50), dec!(10));
+        ValidatedFill::validate(dec!(5), Some(dec!(50)), &short).unwrap();
+    }
+
+    #[test]
+    fn validated_fill_try_from_place_validates_filled_outcome() {
+        let i = intent(crate::types::Side::Long, dec!(50), dec!(10));
+        let outcome = PlaceOutcome::Filled {
+            oid: OrderId(1),
+            total_sz: dec!(10),
+            avg_px: dec!(49.9),
+        };
+        let vf = ValidatedFill::try_from_place(&outcome, &i).unwrap();
+        assert_eq!(vf.filled_sz, dec!(10));
+
+        let bad = PlaceOutcome::Filled {
+            oid: OrderId(1),
+            total_sz: dec!(11),
+            avg_px: dec!(49.9),
+        };
+        assert!(ValidatedFill::try_from_place(&bad, &i).is_err());
+    }
+
+    #[test]
+    fn validated_fill_try_from_place_rejects_resting_outcome() {
+        let i = intent(crate::types::Side::Long, dec!(50), dec!(10));
+        let outcome = PlaceOutcome::Resting { oid: OrderId(1) };
+        assert!(ValidatedFill::try_from_place(&outcome, &i).is_err());
+    }
+
+    #[test]
+    fn validated_fill_try_from_status_validates_order_status_fill() {
+        let i = intent(crate::types::Side::Long, dec!(50), dec!(10));
+        let ok = fill("filled");
+        let mut ok = ok;
+        ok.filled_sz = dec!(5);
+        ok.avg_px = Some(dec!(49.9));
+        let vf = ValidatedFill::try_from_status(&ok, &i).unwrap();
+        assert_eq!(vf.filled_sz, dec!(5));
+
+        let mut bad = fill("filled");
+        bad.filled_sz = dec!(11);
+        bad.avg_px = Some(dec!(49.9));
+        assert!(ValidatedFill::try_from_status(&bad, &i).is_err());
+    }
+
+    // === parse_order_status: remaining > origSz is a hard error (Issue #7) ===
+
+    #[test]
+    fn order_status_remaining_greater_than_orig_sz_is_a_hard_error_never_clamped() {
+        // The old code computed `(orig_sz - remaining).max(ZERO)`, silently
+        // clamping a malformed response to a zero fill. This must now be a
+        // hard error instead — guessing either "zero" or "orig_sz" risks
+        // crediting a number the exchange never actually reported.
+        let body = r#"{"status":"order","order":{"order":{
+            "coin":"HYPE","side":"B","limitPx":"38.2","sz":"15.0","origSz":"10.0",
+            "oid":999,"timestamp":1700000000000,"avgPx":"38.15"},
+            "status":"open","statusTimestamp":1700000000001}}"#;
+        let err = parse_order_status(body).unwrap_err();
+        match err {
+            HlError::InvalidResponse(msg) => {
+                assert!(msg.contains("remaining"), "{msg}");
+                assert!(msg.contains("exceeds"), "{msg}");
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_status_remaining_equal_to_orig_sz_is_a_valid_zero_fill() {
+        let body = r#"{"status":"order","order":{"order":{
+            "coin":"HYPE","side":"B","limitPx":"38.2","sz":"10.0","origSz":"10.0",
+            "oid":999,"timestamp":1700000000000},
+            "status":"open","statusTimestamp":1700000000001}}"#;
+        let got = parse_order_status(body).unwrap().unwrap();
+        assert_eq!(got.filled_sz, Decimal::ZERO);
+    }
+
+    #[test]
+    fn order_status_populates_oid_coin_side_for_cross_check() {
+        let body = r#"{"status":"order","order":{"order":{
+            "coin":"HYPE","side":"A","limitPx":"38.2","sz":"3.0","origSz":"10.0",
+            "oid":42,"timestamp":1700000000000,"avgPx":"38.15",
+            "cloid":"0x0123456789abcdef0123456789abcdef"},
+            "status":"open","statusTimestamp":1700000000001}}"#;
+        let got = parse_order_status(body).unwrap().unwrap();
+        assert_eq!(got.oid, OrderId(42));
+        assert_eq!(got.coin, "HYPE");
+        assert_eq!(got.side, "A");
+        assert!(got.cloid.is_some());
+    }
+
+    #[test]
+    fn order_status_cross_check_accepts_matching_coin_and_side() {
+        let f = fill("filled");
+        f.cross_check("HYPE", &crate::types::Side::Long, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn order_status_cross_check_rejects_coin_mismatch() {
+        let f = fill("filled");
+        let err = f
+            .cross_check("BTC", &crate::types::Side::Long, None)
+            .unwrap_err();
+        match err {
+            HlError::InvalidResponse(msg) => assert!(msg.contains("coin mismatch"), "{msg}"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_status_cross_check_rejects_side_mismatch() {
+        let f = fill("filled"); // side "B" == Long
+        let err = f
+            .cross_check("HYPE", &crate::types::Side::Short, None)
+            .unwrap_err();
+        match err {
+            HlError::InvalidResponse(msg) => assert!(msg.contains("side mismatch"), "{msg}"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_status_cross_check_rejects_cloid_mismatch_when_both_present() {
+        let mut f = fill("filled");
+        let expected = crate::types::Cloid::new();
+        f.cloid = Some(crate::types::Cloid::new());
+        let err = f
+            .cross_check("HYPE", &crate::types::Side::Long, Some(expected))
+            .unwrap_err();
+        match err {
+            HlError::InvalidResponse(msg) => assert!(msg.contains("cloid mismatch"), "{msg}"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_status_cross_check_ignores_cloid_when_response_has_none() {
+        let f = fill("filled"); // cloid: None
+        let expected = crate::types::Cloid::new();
+        f.cross_check("HYPE", &crate::types::Side::Long, Some(expected))
+            .unwrap();
     }
 
     // === F1: userRole parsing ===
