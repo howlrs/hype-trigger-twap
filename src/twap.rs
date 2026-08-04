@@ -1599,15 +1599,28 @@ pub async fn run_twap_journaled(
             break;
         }
 
-        // Issue #3: re-check the notional cap before EACH slice using the
-        // ACTUAL order px for that slice (book prices move between slices),
-        // not the estimate used at CLI pre-flight time.
+        // Issue #3 / B2: re-check the notional cap before EACH slice using
+        // the ACTUAL order px for that slice (book prices move between
+        // slices), not the estimate used at CLI pre-flight time.
+        //
+        // B2 PM decision: `max_notional_usd` is a RUN-LEVEL envelope, not a
+        // per-slice-only limit — the check must assert
+        // cumulative-executed-notional (`stats.notional`, Σ px*sz of every
+        // fill already credited this run) + this slice's own notional
+        // estimate against the cap, aborting BEFORE the slice that would
+        // exceed it. A per-slice-only comparison lets a rising price pass
+        // each individual slice while the RUN's total notional silently
+        // breaches the operator's cap.
         let slice_notional_estimate = plan.per_slice * px;
+        let cumulative_notional_estimate = stats.notional + slice_notional_estimate;
         if let Err(e) =
-            RiskEnvelope::check_notional_cap(slice_notional_estimate, plan.max_notional_usd)
+            RiskEnvelope::check_notional_cap(cumulative_notional_estimate, plan.max_notional_usd)
         {
             abort_reason = Some(format!(
-                "slice {slice_idx}: risk envelope rejected the notional: {e}"
+                "slice {slice_idx}: risk envelope rejected the notional \
+                 (cumulative {} + this slice {} would exceed the cap): {e}",
+                human(stats.notional),
+                human(slice_notional_estimate)
             ));
             break;
         }
@@ -4252,6 +4265,79 @@ mod loop_tests {
         assert_eq!(api.place_count(), 0, "must reject before /exchange");
         let reason = report.abort_reason.expect("must abort");
         assert!(reason.contains("notional"), "{reason}");
+    }
+
+    // === B2: the notional cap is a RUN-LEVEL envelope, not a per-slice-only
+    // check. PM-decided semantics: the pre-send re-check must assert
+    // cumulative-executed-notional (already-filled Σ px*sz) + the CURRENT
+    // slice's notional (at the actual order px) <= max_notional_usd,
+    // aborting BEFORE the slice that would exceed the cap. A price that
+    // rises between slices can make slice N pass ALONE (its own notional
+    // under the cap) while the cumulative total would breach it — the old
+    // check only ever compared the individual slice's notional against the
+    // cap and had no memory of what was already filled.
+
+    #[tokio::test(start_paused = true)]
+    async fn notional_cap_is_cumulative_across_slices_not_re_evaluated_per_slice_alone() {
+        // 2 slices, per_slice=100, cap=19000.
+        // Slice 1 price ~50.201 (ask 50.1 + 20bps slippage rounded) ->
+        // notional ~5020.1, comfortably under the cap alone.
+        // Slice 2's book price rises to ask=150.1 -> long px ~150.401 ->
+        // notional ~15040.1, which is ALSO under the cap taken alone — but
+        // cumulative (5020.1 + 15040.1 = 20060.2) breaches the $19000 cap.
+        // The old per-slice-only check would place both slices (each passes
+        // its own isolated comparison); the fix must abort before slice 2's
+        // send once the cumulative total would exceed the cap.
+        let per_slice = dec!(100);
+        let mut plan = plan_with_cap(Side::Long, per_slice, dec!(19000));
+        plan.slices = 2;
+        plan.total_adjusted = dec!(200);
+        plan.total_requested = dec!(200);
+
+        let api = ScriptedApi::new()
+            .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+            .push_book(Ok(book_at(dec!(149.9), dec!(150.1))))
+            .with_default_book(book_at(dec!(149.9), dec!(150.1)))
+            .push_place(filled(per_slice, dec!(50.201)));
+
+        let report = run_twap(&api, &plan).await;
+
+        assert_eq!(
+            api.place_count(),
+            1,
+            "only slice 1 must be placed — slice 2 must be blocked BEFORE any \
+             /exchange call once the cumulative notional would exceed the cap"
+        );
+        let reason = report
+            .abort_reason
+            .expect("must abort once the cumulative notional would exceed the cap");
+        assert!(reason.contains("notional"), "{reason}");
+        assert_eq!(report.filled, per_slice, "only slice 1's fill is credited");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notional_cap_cumulative_check_still_accepts_a_run_that_stays_under_the_cap() {
+        // Non-regression / control: same rising-price shape, but with a cap
+        // generous enough that the cumulative total across both slices never
+        // breaches it. Both slices must place.
+        let per_slice = dec!(100);
+        let mut plan = plan_with_cap(Side::Long, per_slice, dec!(30000));
+        plan.slices = 2;
+        plan.total_adjusted = dec!(200);
+        plan.total_requested = dec!(200);
+
+        let api = ScriptedApi::new()
+            .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+            .push_book(Ok(book_at(dec!(149.9), dec!(150.1))))
+            .with_default_book(book_at(dec!(149.9), dec!(150.1)))
+            .push_place(filled(per_slice, dec!(50.201)))
+            .push_place(filled(per_slice, dec!(150.401)));
+
+        let report = run_twap(&api, &plan).await;
+
+        assert_eq!(api.place_count(), 2, "both slices must be placed");
+        assert!(report.abort_reason.is_none(), "{:?}", report.abort_reason);
+        assert_eq!(report.filled, dec!(200));
     }
 
     // === Issue #3: non-positive limit price rejected unconditionally ===

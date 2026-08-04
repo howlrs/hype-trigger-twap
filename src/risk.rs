@@ -214,14 +214,50 @@ impl RiskEnvelope {
 /// True when `url`'s host is loopback (`http://127.0.0.1...` or
 /// `http://localhost...`), the narrow carve-out documented on
 /// [`RiskEnvelope::validate_endpoint_override`]. Deliberately conservative —
-/// only matches an explicit `http://` scheme on those two exact hosts, not
-/// e.g. `127.0.0.1.evil.example.com` or any other bypass shape.
+/// only matches an explicit lowercase `http://` scheme on those two exact
+/// hosts, not e.g. `127.0.0.1.evil.example.com` or any other bypass shape.
+///
+/// B1 hardening: a bare `strip_prefix("http://127.0.0.1")` check is fooled
+/// by URL userinfo (`user:pass@host` / `user@host`, RFC 3986 authority =
+/// `[userinfo@]host[:port]`). `http://127.0.0.1:8080@evil.com` strips the
+/// prefix to `:8080@evil.com`, which starts with `:` and looks like a valid
+/// port to a naive check — but `:8080@` here is userinfo, and the REAL host
+/// per RFC 3986 (and every real URL parser / browser / curl) is
+/// `evil.com`. To close this without pulling in a URL-parsing dependency,
+/// this function first hand-parses the authority (the substring between
+/// `scheme://` and the first `/`, `?`, or `#`) and rejects outright any
+/// authority containing `@` — i.e. ANY userinfo at all is disqualifying,
+/// never mind what it looks like. Only after that guard does it check the
+/// authority's host prefix.
+///
+/// IPv6 loopback (`http://[::1]`) is NOT recognised as loopback by this
+/// function — it is intentionally unsupported (the carve-out exists only to
+/// keep the mockito test seam, which binds IPv4/hostname loopback, working;
+/// see `ipv6_loopback_is_not_supported_and_is_rejected`).
 fn is_loopback_url(url: &str) -> bool {
-    for prefix in ["http://127.0.0.1", "http://localhost"] {
-        if let Some(rest) = url.strip_prefix(prefix) {
-            // Must be followed by end-of-string, `:` (port), or `/` (path) —
-            // not by more hostname characters.
-            if rest.is_empty() || rest.starts_with(':') || rest.starts_with('/') {
+    const SCHEME: &str = "http://";
+    let Some(after_scheme) = url.strip_prefix(SCHEME) else {
+        return false;
+    };
+    // The authority ends at the first `/`, `?`, or `#` (or end of string).
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+
+    // Any userinfo component at all disqualifies the URL from the loopback
+    // carve-out — the presence of `@` means SOMETHING is being smuggled in
+    // front of the real host, regardless of what it looks like.
+    if authority.contains('@') {
+        return false;
+    }
+
+    for host in ["127.0.0.1", "localhost"] {
+        if let Some(rest) = authority.strip_prefix(host) {
+            // Must be followed by end-of-authority or `:` (port) — not by
+            // more hostname characters (guards against
+            // "127.0.0.1.evil.example.com").
+            if rest.is_empty() || rest.starts_with(':') {
                 return true;
             }
         }
@@ -495,6 +531,95 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, RiskError::CustomEndpointNotHttps { .. }));
+    }
+
+    // === B1: userinfo (`user:pass@host` / `user@host`) bypass of the
+    // loopback carve-out ===
+    //
+    // `is_loopback_url`'s old implementation was a bare `strip_prefix` +
+    // "next char is empty/':'/'/'" check. A URL of the form
+    // `http://127.0.0.1:8080@evil.com/info` strips the "http://127.0.0.1"
+    // prefix leaving ":8080@evil.com/info", which starts with ':' — so the
+    // old check treated it as loopback with a "port". But `:8080@` here is
+    // USERINFO (RFC 3986 authority = [userinfo@]host[:port]), not a port —
+    // the REAL host per every URL parser (and every browser/curl) is
+    // `evil.com`. This is the http-only carve-out being smuggled onto an
+    // arbitrary remote host under --allow-custom-endpoints.
+
+    #[test]
+    fn userinfo_bypass_with_port_like_userinfo_is_rejected() {
+        // The exact shape from the finding: `127.0.0.1:8080@evil.com` — the
+        // ":8080" looks like a port to a naive prefix check, but it is
+        // actually part of the userinfo component; the real host is
+        // evil.com.
+        let result =
+            RiskEnvelope::validate_endpoint_override("http://127.0.0.1:8080@evil.com/info", true);
+        assert!(
+            result.is_err(),
+            "http://127.0.0.1:8080@evil.com must NOT be accepted as loopback — \
+             the real host is evil.com: {result:?}"
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            RiskError::CustomEndpointNotHttps { .. }
+        ));
+    }
+
+    #[test]
+    fn userinfo_bypass_without_port_is_rejected() {
+        // Simple `user@host` form (no colon at all) — the earlier probe
+        // mentioned in the finding.
+        let result =
+            RiskEnvelope::validate_endpoint_override("http://127.0.0.1@evil.com/info", true);
+        assert!(
+            result.is_err(),
+            "http://127.0.0.1@evil.com must NOT be accepted as loopback: {result:?}"
+        );
+    }
+
+    #[test]
+    fn dotted_lookalike_host_is_rejected() {
+        let result =
+            RiskEnvelope::validate_endpoint_override("http://127.0.0.1.evil.com/info", true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn uppercase_scheme_is_not_a_bypass() {
+        // An uppercase "HTTP://" must not accidentally be treated as
+        // https-exempt loopback OR silently pass the https:// check itself
+        // (that would be a SEPARATE bug: rejecting non-loopback
+        // "HTTP://example.com" is still required). This only asserts the
+        // loopback carve-out specifically is not fooled by case.
+        let result =
+            RiskEnvelope::validate_endpoint_override("HTTP://127.0.0.1:8080@evil.com/info", true);
+        assert!(
+            result.is_err(),
+            "uppercase-scheme userinfo bypass must also be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn genuine_loopback_with_port_is_still_accepted() {
+        // Non-regression: the legitimate mockito test-seam shape must keep
+        // working after hardening.
+        RiskEnvelope::validate_endpoint_override("http://127.0.0.1:12345/info", true).unwrap();
+        RiskEnvelope::validate_endpoint_override("http://localhost:12345/info", true).unwrap();
+    }
+
+    #[test]
+    fn ipv6_loopback_is_not_supported_and_is_rejected() {
+        // Documented limitation (B1): IPv6 `[::1]` loopback is NOT
+        // recognised by `is_loopback_url` — it is rejected like any other
+        // non-https host. This is intentional: the carve-out only needs to
+        // support the mockito test-seam, which binds IPv4/hostname loopback,
+        // not IPv6.
+        let result = RiskEnvelope::validate_endpoint_override("http://[::1]:12345/info", true);
+        assert!(
+            result.is_err(),
+            "IPv6 loopback is documented as unsupported and must be rejected, not silently \
+             accepted: {result:?}"
+        );
     }
 
     // === pre-send summary ===
