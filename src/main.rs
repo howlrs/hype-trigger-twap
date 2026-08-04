@@ -448,6 +448,52 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     // gate above. Live mode checks BEFORE any network call (fetch_meta is
     // the very next one below), so a blocked startup never wastes a request.
     let resolved_state_dir = hype_trigger_twap::journal::state_dir(cli.state_dir.as_deref());
+
+    // Issue #5: single-writer advisory lock, keyed by network+agent_address.
+    // Taken HERE — immediately after `resolved_state_dir` is known and
+    // strictly BEFORE the incomplete-run detection block below — so that two
+    // concurrent live processes for the same network+agent can never both
+    // run reconciliation/resume concurrently: the acceptance criterion
+    // "stale lock recovery does not skip reconcile" depends on this
+    // lock-then-reconcile ordering (see `src/lock.rs`'s test
+    // `stale_lock_scenario_does_not_bypass_incomplete_run_reconciliation`
+    // in this file's test module for the regression this guards).
+    //
+    // Read-only is completely unaffected (no lock file, no lock directory,
+    // nothing written) — gated on `!cli.read_only` exactly like every other
+    // live-only block in this function, preserving the "read-only creates
+    // nothing" invariant `read_only_creates_no_state_dir_or_journal_file`
+    // already covers for the journal.
+    //
+    // The lock is held for the rest of this function's scope (and the
+    // entire live run, since `_process_lock` is not dropped until
+    // `run_with_cli` returns) by keeping the guard bound in an outer `let`;
+    // Task 9 #1 (passive/post-only) runs entirely inside this same
+    // `run_with_cli` body and needs no changes here — one live process still
+    // equals one lock holder regardless of order style.
+    let _process_lock = if !cli.read_only {
+        let agent = agent_address.as_ref().ok_or_else(|| {
+            "internal error: live mode must have an agent address by this point".to_string()
+        })?;
+        let lock_key = hype_trigger_twap::lock::lock_key(&network.to_string(), agent);
+        let plan_summary = format!(
+            "{symbol} {side:?} usd={} slices={} network={network}",
+            cli.usd.map(|d| d.to_string()).unwrap_or_default(),
+            cli.slices
+        );
+        let metadata = hype_trigger_twap::lock::LockMetadata::new(plan_summary);
+        Some(
+            hype_trigger_twap::lock::ProcessLock::acquire(
+                &resolved_state_dir,
+                &lock_key,
+                &metadata,
+            )
+            .map_err(|e| e.to_string())?,
+        )
+    } else {
+        None
+    };
+
     if !cli.read_only {
         let incomplete = hype_trigger_twap::journal::find_incomplete_run(
             &resolved_state_dir,
@@ -492,6 +538,24 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         std::env::var("HL_EXCHANGE_URL").ok(),
     );
     let client = HlClient::new(config, signer).map_err(|e| e.to_string())?;
+
+    // Issue #5: seed the durable nonce high-water mark, right after
+    // `HlClient::new` and strictly BEFORE the first `/exchange` call could
+    // ever happen (the first network call at all is `fetch_meta` directly
+    // below, which never mints a nonce, but seeding here — before ANY
+    // network call — keeps the ordering simple to audit). Read-only never
+    // seeds anything: it has no signer and never calls `next_nonce`, and
+    // seeding would touch disk under the state dir, violating the
+    // read-only-creates-nothing invariant this whole function's live-only
+    // blocks already preserve.
+    if !cli.read_only {
+        if let Some(agent) = agent_address.as_ref() {
+            let key = hype_trigger_twap::lock::lock_key(&network.to_string(), agent);
+            let hwm = hype_trigger_twap::lock::NonceHwm::load(&resolved_state_dir, &key)
+                .map_err(|e| format!("failed to load nonce high-water mark: {e}"))?;
+            client.seed_nonce(hwm);
+        }
+    }
 
     // §4 step 2: resolve the symbol. Unknown → abort with zero orders sent.
     let meta = client.fetch_meta().await.map_err(|e| e.to_string())?;
@@ -2478,6 +2542,370 @@ mod tests {
         let err = result.expect_err("a new overlapping live run must be refused");
         assert!(err.contains("incomplete run"), "{err}");
         assert!(err.contains("prior-incomplete-run"), "{err}");
+    }
+
+    /// Issue #5 acceptance criterion 1: a second live process for the SAME
+    /// network+agent must fail BEFORE any order is placed. Simulated here by
+    /// pre-acquiring the lock directly (standing in for "another process
+    /// already holds it") and then calling `run_with_cli` — no `/exchange`
+    /// mock is registered, so any attempt to place an order would panic the
+    /// mock server, proving the failure happens before send.
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn second_live_process_for_the_same_agent_fails_before_any_order() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+
+        let key = hype_trigger_twap::lock::lock_key(
+            "testnet",
+            &hype_trigger_twap::types::Address::new(AGENT),
+        );
+        let held_lock = hype_trigger_twap::lock::ProcessLock::acquire(
+            &state_dir,
+            &key,
+            &hype_trigger_twap::lock::LockMetadata::new("first holder, still running"),
+        )
+        .expect("first acquire (simulating the already-running process) must succeed");
+
+        // No mocks registered at all: /info and /exchange must never be hit.
+        let server = mockito::Server::new_async().await;
+
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+
+        let args = live_cli(&["--network", "testnet"], &state_dir);
+        let cli = Cli::try_parse_from(&args).unwrap();
+        let result = run_with_cli(cli).await;
+
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+
+        let err = result.expect_err("a second live process for the same network+agent must fail");
+        assert!(
+            err.contains("already holds the writer lock"),
+            "expected a lock-contention error, got: {err}"
+        );
+
+        drop(held_lock);
+    }
+
+    /// Issue #5 acceptance criterion 2 (part 1): a DIFFERENT agent must run
+    /// concurrently unaffected by another agent's held lock.
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn different_agent_runs_concurrently_unaffected_by_another_agents_lock() {
+        const OTHER_AGENT: &str = "0x00000000000000000000000000000000000bad";
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+
+        let other_key = hype_trigger_twap::lock::lock_key(
+            "testnet",
+            &hype_trigger_twap::types::Address::new(OTHER_AGENT),
+        );
+        let _held_by_other = hype_trigger_twap::lock::ProcessLock::acquire(
+            &state_dir,
+            &other_key,
+            &hype_trigger_twap::lock::LockMetadata::new("a different agent's run"),
+        )
+        .unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        mock_full_live_run(&mut server).await;
+
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+
+        let args = live_cli(&["--network", "testnet"], &state_dir);
+        let cli = Cli::try_parse_from(&args).unwrap();
+        let result = run_with_cli(cli).await;
+
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+
+        result.expect(
+            "a different agent's live run must succeed even while another agent's lock is held",
+        );
+    }
+
+    /// Issue #5 acceptance criterion 2 (part 2): a read-only process must run
+    /// concurrently unaffected by a held live lock for the SAME agent, and
+    /// must not itself touch the lock/state dir at all.
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn read_only_runs_concurrently_unaffected_by_a_held_live_lock_for_the_same_agent() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+
+        let key = hype_trigger_twap::lock::lock_key(
+            "testnet",
+            &hype_trigger_twap::types::Address::new(AGENT),
+        );
+        let _held = hype_trigger_twap::lock::ProcessLock::acquire(
+            &state_dir,
+            &key,
+            &hype_trigger_twap::lock::LockMetadata::new("a live run for the same agent"),
+        )
+        .unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({"type": "meta"})))
+            .with_status(200)
+            .with_body(r#"{"universe":[{"name":"HYPE","szDecimals":2,"maxLeverage":10,"onlyIsolated":false}]}"#)
+            .create_async()
+            .await;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "l2Book"}),
+            ))
+            .with_status(200)
+            .with_body(book_body_at("HYPE", "49.9", "50.1", now_ms))
+            .create_async()
+            .await;
+
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+
+        let cli = Cli::try_parse_from([
+            "hype-twap",
+            "--symbol",
+            "HYPE",
+            "--side",
+            "long",
+            "--usd",
+            "50",
+            "--duration",
+            "2s",
+            "--slices",
+            "1",
+            "--network",
+            "testnet",
+            "--state-dir",
+            &state_dir.display().to_string(),
+            "--read-only",
+            "true",
+        ])
+        .unwrap();
+
+        let result = run_with_cli(cli).await;
+
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+
+        result.expect(
+            "a read-only run must succeed even while a live lock is held for the same network+agent",
+        );
+    }
+
+    /// Issue #5 acceptance criterion 3: even in a "stale lock" scenario (the
+    /// held lock's owner is simulated as gone by dropping it before the new
+    /// process starts, so acquisition succeeds), the incomplete-run
+    /// reconciliation flow that Task 7/#4 already implemented is NOT
+    /// skipped — lock acquisition happens strictly BEFORE incomplete-run
+    /// detection in `run_with_cli`, so a stale lock's recovery can never
+    /// shortcut past reconciliation. This test proves the ordering by
+    /// combining both fixtures: a prior incomplete run (unresolved
+    /// `SubmittedUnknown` cloid) AND a lock that has just been released
+    /// (simulating the crash that left both behind) — the resuming process
+    /// must still be forced through reconciliation (verified by the
+    /// resolved cloid ending up Terminal in the journal), not just allowed
+    /// to barrel past it because the lock happened to be free.
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn stale_lock_recovery_does_not_skip_incomplete_run_reconciliation() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+        let prior_cloid = hype_trigger_twap::types::Cloid::new();
+
+        // Simulate the crashed process: it held the lock, then died (flock
+        // auto-releases on process death — modeled here by simply dropping
+        // the guard) leaving an incomplete run behind.
+        {
+            let key = hype_trigger_twap::lock::lock_key(
+                "testnet",
+                &hype_trigger_twap::types::Address::new(AGENT),
+            );
+            let crashed_holder = hype_trigger_twap::lock::ProcessLock::acquire(
+                &state_dir,
+                &key,
+                &hype_trigger_twap::lock::LockMetadata::new("the crashed process"),
+            )
+            .unwrap();
+            drop(crashed_holder); // simulates process death releasing the flock
+        }
+
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+
+        // Same plan_hash-matching trick as `resume_reconciles_the_incomplete_
+        // cloid_before_continuing`: derive the real plan_hash via a throwaway
+        // probe run rather than hand-computing DefaultHasher output.
+        let probe_state_dir = tmp.path().join("probe-state");
+        {
+            let mut probe_server = mockito::Server::new_async().await;
+            mock_full_live_run(&mut probe_server).await;
+            std::env::set_var("HL_INFO_URL", format!("{}/info", probe_server.url()));
+            std::env::set_var(
+                "HL_EXCHANGE_URL",
+                format!("{}/exchange", probe_server.url()),
+            );
+            let probe_args = live_cli(&["--network", "testnet"], &probe_state_dir);
+            let probe_cli = Cli::try_parse_from(&probe_args).unwrap();
+            run_with_cli(probe_cli)
+                .await
+                .expect("probe run must succeed to derive a real plan_hash");
+            std::env::remove_var("HL_INFO_URL");
+            std::env::remove_var("HL_EXCHANGE_URL");
+        }
+        let probe_run_id = std::fs::read_dir(probe_state_dir.join("runs"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name()
+            .into_string()
+            .unwrap();
+        let probe_records =
+            hype_trigger_twap::journal::ExecutionJournal::read_all(&probe_state_dir, &probe_run_id)
+                .unwrap();
+        let plan_hash = match &probe_records[0] {
+            hype_trigger_twap::journal::JournalRecord::Header(h) => h.plan_hash.clone(),
+            other => panic!("expected Header, got {other:?}"),
+        };
+
+        // Seed the incomplete run this process will --resume, with the same
+        // plan_hash derived above.
+        {
+            let mut j = hype_trigger_twap::journal::ExecutionJournal::start(
+                &state_dir,
+                "stale-lock-incomplete-run".into(),
+                hype_trigger_twap::journal::RunHeader {
+                    run_id: "stale-lock-incomplete-run".into(),
+                    network: "testnet".into(),
+                    agent: Some(hype_trigger_twap::types::Address::new(AGENT)),
+                    master: Some(hype_trigger_twap::types::Address::new(MASTER)),
+                    symbol: hype_trigger_twap::types::Symbol::new("HYPE"),
+                    side: hype_trigger_twap::types::Side::Long,
+                    slices: 1,
+                    plan_hash,
+                    started_at_unix_ms: 0,
+                },
+            )
+            .unwrap();
+            j.record(&hype_trigger_twap::journal::JournalRecord::Prepared {
+                slice_idx: 1,
+                cloid: prior_cloid,
+                nonce: None,
+                symbol: hype_trigger_twap::types::Symbol::new("HYPE"),
+                side: hype_trigger_twap::types::Side::Long,
+                px: "50".into(),
+                sz: "1".into(),
+            })
+            .unwrap();
+            j.record(
+                &hype_trigger_twap::journal::JournalRecord::SubmittedUnknown {
+                    slice_idx: 1,
+                    cloid: prior_cloid,
+                },
+            )
+            .unwrap();
+        }
+
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({"type": "meta"})))
+            .with_status(200)
+            .with_body(r#"{"universe":[{"name":"HYPE","szDecimals":2,"maxLeverage":10,"onlyIsolated":false}]}"#)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "userRole"}),
+            ))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"role":"agent","data":{{"user":"{MASTER}"}}}}"#
+            ))
+            .create_async()
+            .await;
+        // Reconciliation queries orderStatus for the unresolved cloid: report
+        // it as filled, so the reconciled Terminal record is unambiguous.
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "orderStatus", "oid": prior_cloid.to_hex_string()}),
+            ))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"status":"order","order":{{"order":{{"oid":42,"coin":"HYPE","side":"B","cloid":"{prior_cloid}","origSz":"1","sz":"0","avgPx":"50"}},"status":"filled","statusTimestamp":0}}}}"#
+            ))
+            .create_async()
+            .await;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "l2Book"}),
+            ))
+            .with_status(200)
+            .with_body(book_body_at("HYPE", "49.9", "50.1", now_ms))
+            .expect_at_least(0)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/exchange")
+            .with_status(200)
+            .with_body(
+                r#"{"status":"ok","response":{"type":"order","data":{"statuses":[
+                    {"filled":{"oid":2,"totalSz":"1","avgPx":"50"}}]}}}"#,
+            )
+            .expect_at_least(0)
+            .create_async()
+            .await;
+
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+
+        let mut args = live_cli(&["--network", "testnet"], &state_dir);
+        args.push("--resume".into());
+        args.push("stale-lock-incomplete-run".into());
+        let cli = Cli::try_parse_from(&args).unwrap();
+        let result = run_with_cli(cli).await;
+
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+
+        result.expect("resuming after a stale-lock scenario must succeed");
+
+        let records = hype_trigger_twap::journal::ExecutionJournal::read_all(
+            &state_dir,
+            "stale-lock-incomplete-run",
+        )
+        .unwrap();
+        assert!(
+            records.iter().any(|r| matches!(
+                r,
+                hype_trigger_twap::journal::JournalRecord::Terminal { cloid, .. }
+                    if *cloid == prior_cloid
+            )),
+            "reconciliation must have resolved the prior unresolved cloid to Terminal, \
+             proving the stale-lock recovery path did not skip it: {records:?}"
+        );
     }
 
     /// `--resume <run-id>` on an incomplete run force-reconciles its
