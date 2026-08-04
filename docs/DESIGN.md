@@ -285,11 +285,21 @@ target_at_slice(i) = per_slice × i     (最終スライスは adjusted 合計�
 `TwapPlan.child_algo` (`--child-algo market|passive`、既定 `market`) は、
 各スライスが実際にどう発注されるかを切り替える。市場価格・丸め・
 risk gate (`RiskEnvelope::check_notional_cap` / `validate_limit_price`)・
-`ExecutionDeadline` チェック・catch-up サイジング (`decide_slice` /
-`slice_order_size` / `target_at_slice`) はどちらのアルゴリズムでも
-**完全に共通のコードパス**を通る。分岐するのは「どんな `Tif` でいくらの
-価格に発注するか」と「発注後にどう扱うか」だけであり、`child_algo` の
-有無によって既存のサイジング・ガードのロジックが複製・分岐することはない。
+catch-up サイジング (`decide_slice` / `slice_order_size` / `target_at_slice`)
+はどちらのアルゴリズムでも共通のコードパスを通る。分岐するのは「どんな
+`Tif` でいくらの価格に発注するか」と「発注後にどう扱うか」であり、
+`child_algo` の有無によって既存のサイジング・ガードのロジックが
+複製・分岐することはない。
+
+`ExecutionDeadline` の送信直前チェック (`check_before_send`) だけは、
+market/passive それぞれの発注呼び出し site に個別に置かれている
+(market は `place_slice_reconciled` 内、passive は ALO 発注呼び出しの
+直前) — 共通関数を経由しない分岐であるため、**完全に共通のコードパス**
+ではない。A1 (issues-1-10 hardening) でこの非対称が実際に見つかり
+(板取得が deadline の残り時間ぎりぎりまでかかるケースで passive 発注が
+締切超過後に送信され得た)、passive 側にも同じ即時ゲートを追加して
+揃えた。両ブランチとも `exec_deadline.check_before_send` を送信直前に
+呼ぶという契約は共通だが、コード自体は複製されている。
 
 #### market (既定)
 
