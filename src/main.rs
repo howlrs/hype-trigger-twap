@@ -294,7 +294,17 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<ExitCode, String> {
-    let cli = Cli::parse();
+    run_with_cli(Cli::parse()).await
+}
+
+/// The body of `run()`, taking an already-parsed [`Cli`] rather than reading
+/// `std::env::args()` itself. This split exists purely as a test seam: it
+/// lets `#[cfg(test)]` drive a full pre-wait/post-trigger `run()` execution
+/// against a mock HTTP server (via `Cli::try_parse_from` + `HL_INFO_URL`/
+/// `HL_EXCHANGE_URL` env overrides, both of which `run()` already reads),
+/// without needing `Cli::parse()` to read real process argv. `run()` itself
+/// is unchanged in every other respect — same validation, same behavior.
+async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     cli.validate()?;
 
     let symbol = Symbol::new(&cli.symbol);
@@ -410,22 +420,6 @@ async fn run() -> Result<ExitCode, String> {
         }
     };
 
-    // Issue #2: live-preflight clock-skew check. `expiresAfter` is a
-    // wall-clock Unix ms value trusted by both the local `ExecutionDeadline`
-    // and Hyperliquid's own exchange-side enforcement of the same field — if
-    // this host's clock is skewed against HL's, the two enforcers disagree
-    // about when the run's orders actually expire. Read-only / paper mode
-    // signs nothing, so a bad local clock there is harmless; this check is
-    // therefore live-only (see docs/DESIGN.md "クロックずれ").
-    if !cli.read_only {
-        let skew_book = client
-            .fetch_l2_book(&symbol)
-            .await
-            .map_err(|e| format!("clock-skew preflight l2Book: {e}"))?;
-        check_clock_skew(wall_clock_now_ms() as i64, skew_book.time_ms)
-            .map_err(|e| e.to_string())?;
-    }
-
     // §4 step 5 (moved ahead of step 4: the gate below needs to know whether
     // this run is time-only before it may touch l2Book at all).
     let trigger_cfg = cli.trigger_config();
@@ -485,6 +479,30 @@ async fn run() -> Result<ExitCode, String> {
                 .map_err(|e| format!("pre-flight l2Book: {e}"))?
         }
     };
+
+    // Issue #2 (Finding 3): live-preflight clock-skew check, relocated to
+    // execution entry. `expiresAfter` is a wall-clock Unix ms value trusted
+    // by both the local `ExecutionDeadline` and Hyperliquid's own
+    // exchange-side enforcement of the same field — if this host's clock is
+    // skewed against HL's, the two enforcers disagree about when the run's
+    // orders actually expire. Read-only / paper mode signs nothing, so a bad
+    // local clock there is harmless; this check is therefore live-only (see
+    // docs/DESIGN.md "クロックずれ").
+    //
+    // This check MUST run here — after the trigger has fired and a snapshot
+    // is already in hand — rather than pre-wait: a pre-wait check would
+    // require its own dedicated l2Book call, which a time-only trigger
+    // (`--start-after` with no `--trigger-price`) must never make before its
+    // deadline (Issue #6/#8; see `time_only_trigger_fires_after_deadline_without_network`
+    // in `trigger.rs`). Reading `server_ts_ms` off the snapshot ALREADY
+    // obtained above (whichever branch produced it) applies the same check
+    // uniformly to both trigger modes, exactly once, with no extra l2Book
+    // call of its own — it fails closed before ANY place happens.
+    if !cli.read_only {
+        check_clock_skew(wall_clock_now_ms() as i64, snapshot.server_ts_ms)
+            .map_err(|e| e.to_string())?;
+    }
+
     let mid = snapshot.mid;
 
     let (total_coin, requested_desc) = match (cli.size, cli.usd) {
@@ -1054,5 +1072,217 @@ mod tests {
             d,
             "Trigger: price above 40 OR after 2h (whichever comes first); EXPIRES after 4h (no order if not fired)"
         );
+    }
+
+    // === Finding 3 (Issue #2 relocation): clock-skew check moved from
+    // pre-wait to execution entry ===
+
+    const TEST_PK: &str = "0x0123456789012345678901234567890123456789012345678901234567890123";
+    // The address TEST_PK actually derives to (same key used by
+    // tests/signing_cross_check.rs's vectors — see expected_address there).
+    const AGENT: &str = "0x14791697260e4c9a71f18484c9f997b308e59325";
+    const MASTER: &str = "0x00000000000000000000000000000000000000aa";
+
+    fn book_body_at(coin: &str, bid: &str, ask: &str, time_ms: i64) -> String {
+        format!(
+            r#"{{"coin":"{coin}","time":{time_ms},"levels":[
+                [{{"px":"{bid}","sz":"100","n":1}}],
+                [{{"px":"{ask}","sz":"100","n":1}}]]}}"#
+        )
+    }
+
+    /// Regression guard for the invariant Finding 3 protects: a live
+    /// time-only trigger (`--start-after`, no `--trigger-price`) must make
+    /// ZERO network calls before its deadline elapses. This was true before
+    /// commit 9986b46 (`wait_for_trigger` itself never touches the network
+    /// for a time-only wait — see `time_only_trigger_fires_after_deadline_without_network`
+    /// in `trigger.rs`) but 9986b46 broke it end-to-end by adding a
+    /// dedicated pre-wait `l2Book` call in `main.rs::run()` purely for the
+    /// clock-skew check. This test exercises `run_with_cli` (the `Cli`-
+    /// injectable body of `run()`) against a mock server that has NO route
+    /// registered for `/info` at all — any network call made before the
+    /// wait completes would fail loudly (mockito 501s an unmatched request),
+    /// which would surface as an error well before the deadline. Instead,
+    /// the run must reach the deadline (virtual time elapses the full
+    /// `--start-after`), THEN make its post-trigger `l2Book` call (which the
+    /// mock now serves) for sizing/clock-skew, and finally fail on
+    /// `--size`/exchange being absent from this minimal fixture — the
+    /// precise failure mode after that point does not matter; what matters
+    /// is that virtual time advanced the full wait duration first, proving
+    /// no network call happened during the wait itself.
+    // Real time, not `start_paused`: this test drives `run_with_cli` against
+    // a real (localhost) mockito HTTP server, and mixing tokio's virtual-time
+    // pause with real socket I/O is unreliable (the mock server's own
+    // accept/response loop runs on real time regardless of the test's
+    // virtual clock). A short, real --start-after keeps the test fast while
+    // still proving the ordering.
+    #[tokio::test]
+    async fn issue2_live_time_only_trigger_makes_no_network_call_before_its_deadline() {
+        let mut server = mockito::Server::new_async().await;
+        // meta: needed at startup, before the wait begins — this IS allowed
+        // (it happens at §4 step 2, well before the trigger wait).
+        let _meta = server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({"type": "meta"})))
+            .with_status(200)
+            .with_body(r#"{"universe":[{"name":"HYPE","szDecimals":2,"maxLeverage":10,"onlyIsolated":false}]}"#)
+            .create_async()
+            .await;
+        // l2Book: only served AFTER the trigger fires (post-trigger pre-flight
+        // fetch + clock-skew read). If this were hit DURING the wait, the
+        // virtual clock would not have advanced the full --start-after
+        // duration by the time the run errors out below.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let _book = server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "l2Book"}),
+            ))
+            .with_status(200)
+            .with_body(book_body_at("HYPE", "49.9", "50.1", now_ms))
+            .create_async()
+            .await;
+
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+
+        let cli = Cli::try_parse_from([
+            "hype-twap",
+            "--symbol",
+            "HYPE",
+            "--side",
+            "long",
+            "--usd",
+            "1500",
+            "--duration",
+            "5m",
+            "--start-after",
+            "2s",
+            "--read-only",
+            "true",
+        ])
+        .unwrap();
+
+        let start = std::time::Instant::now();
+        // This test only cares about the ordering up to (and just past) the
+        // trigger firing; once triggered, the run continues into sizing and
+        // the slice loop, which — with no `/exchange` mock registered here —
+        // eventually retries a going-stale book for several seconds before
+        // aborting. Bound the whole call so the test does not pay for that
+        // unrelated retry storm.
+        let _ = tokio::time::timeout(Duration::from_secs(10), run_with_cli(cli)).await;
+        let elapsed = start.elapsed();
+
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+
+        // The load-bearing assertion: real time advanced by (at least) the
+        // full 2s --start-after wait. If a pre-wait skew check like the one
+        // 9986b46 added were still present, its l2Book call would be served
+        // by the mock immediately at T=0 (the mock has no artificial delay),
+        // making `elapsed` far short of 2s.
+        assert!(
+            elapsed >= Duration::from_secs(2),
+            "a time-only trigger must not resolve before its --start-after deadline; \
+             elapsed = {elapsed:?} (expected >= 2s) — a network call before the wait \
+             would let this finish early"
+        );
+    }
+
+    /// Adapts the "skew > 5s fails closed" behavior to assert it now fires at
+    /// EXECUTION ENTRY (after "Triggered:", using the trigger's own
+    /// snapshot) rather than pre-wait. Uses an immediate trigger (no wait) so
+    /// the ONLY l2Book call in the whole run is the one that both fires the
+    /// trigger (well, immediate doesn't need one) and doubles as the
+    /// post-trigger pre-flight snapshot the skew check reads — proving the
+    /// relocated check reads `server_ts_ms` off that snapshot rather than
+    /// issuing a second dedicated l2Book call.
+    #[tokio::test]
+    async fn issue2_live_skew_beyond_tolerance_fails_closed_at_execution_entry_not_prewait() {
+        let mut server = mockito::Server::new_async().await;
+        let _meta = server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({"type": "meta"})))
+            .with_status(200)
+            .with_body(r#"{"universe":[{"name":"HYPE","szDecimals":2,"maxLeverage":10,"onlyIsolated":false}]}"#)
+            .create_async()
+            .await;
+        let _role = server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "userRole"}),
+            ))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"role":"agent","data":{{"user":"{MASTER}"}}}}"#
+            ))
+            .create_async()
+            .await;
+        // A time-only trigger (`--start-after`) is used so `wait_for_trigger`
+        // itself makes NO l2Book call (Issue #6/#8 contract) — the ONLY
+        // l2Book call in the whole run is the post-trigger pre-flight fetch
+        // (`fetch_fresh_book(..., None)` at main.rs, `TriggerReason::Elapsed`
+        // branch), which per the Finding 3 relocation is also the source of
+        // `server_ts_ms` for the skew check. This proves the relocated check
+        // reads the ALREADY-obtained snapshot rather than issuing a second,
+        // dedicated l2Book call. The response is stamped far in the PAST
+        // (skew < -5s) rather than the future, so it fails only the
+        // clock-skew check and not `ValidatedMarketSnapshot`'s own
+        // unconditional `MAX_FUTURE_SKEW_MS` (2s) future-skew check;
+        // `--max-book-age-ms 0` disables the (unrelated) staleness half of
+        // that same validation so an old timestamp does not fail for the
+        // wrong reason.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let skewed_ms = now_ms - 10_000; // 10s in the past: beyond MAX_CLOCK_SKEW_MS (5s)
+        let _book = server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "l2Book"}),
+            ))
+            .with_status(200)
+            .with_body(book_body_at("HYPE", "39.9", "40.1", skewed_ms))
+            .expect(1)
+            .create_async()
+            .await;
+
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+
+        let cli = Cli::try_parse_from([
+            "hype-twap",
+            "--symbol",
+            "HYPE",
+            "--side",
+            "long",
+            "--usd",
+            "1500",
+            "--duration",
+            "5m",
+            "--start-after",
+            "1s",
+            "--max-book-age-ms",
+            "0",
+            "--read-only",
+            "false",
+        ])
+        .unwrap();
+
+        let result = run_with_cli(cli).await;
+
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+
+        let err = result.expect_err("a >5s clock skew must fail the run closed");
+        assert!(err.contains("skew"), "{err}");
+
+        // Exactly one l2Book call: the trigger-poll snapshot doubles as the
+        // skew-check source. A pre-wait-style implementation would need TWO
+        // l2Book calls (one for the old pre-wait skew preflight, one for the
+        // trigger poll); the relocated implementation needs only one.
+        _book.assert_async().await;
     }
 }

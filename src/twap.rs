@@ -588,7 +588,33 @@ pub async fn fetch_fresh_book(
                 )));
             }
         }
-        let book = client.fetch_l2_book(symbol).await?;
+        // Issue #2 (Finding 2): a single fetch_l2_book call within one
+        // attempt can otherwise run for up to the full HTTP_TIMEOUT past the
+        // deadline before this loop notices (the has_passed check above only
+        // runs BETWEEN attempts). When a deadline with a defined remaining
+        // duration is in play, bound the in-flight call itself with
+        // tokio::time::timeout. An elapsed timeout is treated as a deadline
+        // abort (matching the style of the has_passed check above), not as
+        // an ordinary fetch failure — it must NOT fall through to the
+        // retry-and-sleep logic below, which could otherwise retry past the
+        // deadline.
+        let book = match deadline {
+            Some(dl) => {
+                let remaining = dl.remaining(tokio::time::Instant::now());
+                match tokio::time::timeout(remaining, client.fetch_l2_book(symbol)).await {
+                    Ok(result) => result?,
+                    Err(_elapsed) => {
+                        return Err(HlError::InvalidResponse(format!(
+                            "execution deadline elapsed while awaiting an in-flight book fetch \
+                             (attempt {}); refusing to await it to completion or retry past the \
+                             deadline",
+                            attempt + 1
+                        )));
+                    }
+                }
+            }
+            None => client.fetch_l2_book(symbol).await?,
+        };
         match ValidatedMarketSnapshot::validate(&book, symbol, max_age_ms) {
             Ok(snapshot) => return Ok(snapshot),
             Err(e) => {
@@ -2066,6 +2092,84 @@ mod loop_tests {
             "{reason}"
         );
         assert_eq!(report.exit_code(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn issue2_single_fetch_exceeding_remaining_deadline_is_timed_out_not_awaited_to_completion(
+    ) {
+        // A single fetch_l2_book call that would take far longer than the
+        // remaining deadline must be cut off by fetch_fresh_book itself (via
+        // a timeout wrapped around the in-flight call), not merely allowed
+        // to run to completion and rejected afterwards by some OUTER caller
+        // (e.g. place_slice_reconciled's check_before_send). This is proven
+        // by calling fetch_fresh_book directly (no run_twap, no outer
+        // deadline gate in the picture) with a fetch delay (30s) much larger
+        // than the remaining deadline (200ms), and asserting:
+        //   1. it returns an error (the fetch never got to complete),
+        //   2. it returns promptly relative to the fetch delay — i.e. it did
+        //      NOT await the full 30s before giving up.
+        struct SlowBookApi {
+            inner: ScriptedApi,
+            book_delay: Duration,
+        }
+
+        #[async_trait::async_trait]
+        impl HlApi for SlowBookApi {
+            async fn fetch_l2_book(&self, s: &Symbol) -> Result<OrderBook, HlError> {
+                tokio::time::sleep(self.book_delay).await;
+                self.inner.fetch_l2_book(s).await
+            }
+            async fn place_order_once(
+                &self,
+                i: &OrderIntent,
+                a: u32,
+                e: u64,
+            ) -> Result<(u64, PlaceOutcome), HlError> {
+                self.inner.place_order_once(i, a, e).await
+            }
+            async fn cancel_by_cloid(&self, i: &CancelIntent, a: u32) -> Result<(), HlError> {
+                self.inner.cancel_by_cloid(i, a).await
+            }
+            async fn fetch_order_status(
+                &self,
+                u: &Address,
+                o: OrderId,
+            ) -> Result<Option<OrderStatusFill>, HlError> {
+                self.inner.fetch_order_status(u, o).await
+            }
+            async fn fetch_order_status_by_cloid(
+                &self,
+                u: &Address,
+                c: Cloid,
+            ) -> Result<Option<OrderStatusFill>, HlError> {
+                self.inner.fetch_order_status_by_cloid(u, c).await
+            }
+        }
+
+        let inner = ScriptedApi::new().with_default_book(book_at(dec!(49.9), dec!(50.1)));
+        let api = SlowBookApi {
+            inner,
+            book_delay: Duration::from_secs(30),
+        };
+
+        let start = tokio::time::Instant::now();
+        // Only 200ms remaining — far less than the 30s the fetch would take.
+        let dl =
+            ExecutionDeadline::from_parts(start + Duration::from_millis(200), 1_700_000_000_000);
+
+        let before = tokio::time::Instant::now();
+        let result = fetch_fresh_book(&api, &Symbol::new("ETH"), 60_000, Some(&dl)).await;
+        let elapsed = tokio::time::Instant::now() - before;
+
+        assert!(
+            result.is_err(),
+            "a fetch that cannot complete within the remaining deadline must error, not succeed"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "fetch_fresh_book must be cut off by the deadline itself (~200ms), not await the \
+             full 30s in-flight fetch to completion; elapsed = {elapsed:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
