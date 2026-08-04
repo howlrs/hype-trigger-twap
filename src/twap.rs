@@ -1113,10 +1113,12 @@ pub async fn run_twap(client: &dyn HlApi, plan: &TwapPlan) -> TwapReport {
 /// reimplementing reconciliation.
 ///
 /// Every cloid handed to this function is one this run never itself
-/// observed placing (it is reconciling a PRIOR process's in-flight state),
-/// so `slice_idx` is not tracked by the caller — `0` is used as a
-/// placeholder in the journal record; it is meaningful only within a single
-/// live `run_twap_journaled` call, not across a resume boundary.
+/// observed placing (it is reconciling a PRIOR process's in-flight state) —
+/// `slice_idx` is therefore supplied by the CALLER, recovered from the
+/// prior run's own journal (its `Prepared` record for this same cloid,
+/// joined by cloid) rather than defaulted here, so the resolved `Terminal`
+/// record this function writes carries the TRUE original slice index and
+/// full audit-trail fidelity is preserved across a resume boundary.
 ///
 /// - HL has the cloid, terminal → journaled `Terminal` with the credited
 ///   fill (possibly zero, e.g. `canceled`/`rejected`).
@@ -1132,18 +1134,26 @@ pub async fn reconcile_unresolved_cloid(
     client: &dyn HlApi,
     plan: &TwapPlan,
     cloid: Cloid,
+    slice_idx: u32,
     journal: &mut ExecutionJournal,
 ) -> Result<(), HlError> {
     let user = plan.status_user()?;
     match reconcile_by_cloid(client, plan, user, cloid).await {
         Ok(Some(st)) => {
-            journal_terminal(Some(journal), 0, cloid, &st.status, st.filled_sz, st.avg_px)?;
+            journal_terminal(
+                Some(journal),
+                slice_idx,
+                cloid,
+                &st.status,
+                st.filled_sz,
+                st.avg_px,
+            )?;
             Ok(())
         }
         Ok(None) => {
             journal_terminal(
                 Some(journal),
-                0,
+                slice_idx,
                 cloid,
                 "neverReceived",
                 Decimal::ZERO,
