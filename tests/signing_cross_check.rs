@@ -4,8 +4,14 @@
 //! not edit `tests/fixtures/signing/known_vectors.json` by hand.
 //!
 //! Copied verbatim from `diff-old-new/executor/crates/executor-hl/tests/`;
-//! only the crate import paths changed. Passing 10/10 is the proof that the
-//! msgpack field order and EIP-712 domain survived the port.
+//! only the crate import paths changed. Passing the original 10/10 is the
+//! proof that the msgpack field order and EIP-712 domain survived the port.
+//!
+//! Issue #2 (Task 5) added 7 MORE vectors covering `expiresAfter` (generated
+//! the same way, via a local hyperliquid-python-sdk venv — see
+//! `.superpowers/sdd/issues-1-10-hardening/task-5-report.md` for the
+//! generator script). The original 10 vectors are byte-for-byte untouched;
+//! the new ones are appended after them. 10 + 7 = 17 total.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -35,7 +41,6 @@ struct Vector {
     action: serde_json::Value,
     nonce: u64,
     vault_address: Option<String>,
-    #[allow(dead_code)] // expires_after not yet exercised
     expires_after: Option<u64>,
     is_mainnet: bool,
     expected_r: String,
@@ -54,12 +59,12 @@ fn vectors() -> Vec<Vector> {
 }
 
 #[test]
-fn fixture_loads_with_10_vectors() {
+fn fixture_loads_with_17_vectors() {
     let v = vectors();
     assert_eq!(
         v.len(),
-        10,
-        "fixture should have 10 vectors (5 actions x mainnet/testnet)"
+        17,
+        "fixture should have 17 vectors (10 original + 7 expiresAfter, Issue #2)"
     );
 }
 
@@ -99,7 +104,10 @@ async fn cross_check_all_known_vectors() {
             v.name
         );
 
-        let sig = match signer.sign_l1(&v.action, v.nonce, vault.as_ref()).await {
+        let sig = match signer
+            .sign_l1(&v.action, v.nonce, vault.as_ref(), v.expires_after)
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 failed.push(format!("{}: sign_l1 errored: {e}", v.name));
@@ -132,7 +140,7 @@ async fn cross_check_all_known_vectors() {
     }
     eprintln!("\n=== cross-check summary ===");
     eprintln!("vectors checked: {checked} (all)");
-    assert_eq!(checked, 10, "expected to check all 10 vectors");
+    assert_eq!(checked, 17, "expected to check all 17 vectors");
     if !failed.is_empty() {
         panic!("\ncross-check failures:\n{}\n", failed.join("\n\n"));
     }

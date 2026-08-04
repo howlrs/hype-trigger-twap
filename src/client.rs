@@ -891,19 +891,32 @@ impl HlClient {
     /// "outcome unknown", not "did not happen", and the caller must reconcile
     /// via `orderStatus` before deciding anything.
     ///
+    /// `expires_after_ms` (Issue #2): the wall-clock Unix ms the action
+    /// expires at. The SAME value is put in the signed hash (via `sign_l1`)
+    /// AND in the request body's `expiresAfter` field — this is the exchange-
+    /// side half of the hard-window invariant, backing up the caller's own
+    /// monotonic `ExecutionDeadline` check with HL's own expiry enforcement.
+    /// `None` omits `expiresAfter` from both (used by `cancel_by_cloid`,
+    /// which is always allowed regardless of the execution deadline).
+    ///
     /// Returns the nonce alongside the body text so callers can prove a resend
     /// used fresh nonce material.
     async fn post_exchange_once(
         &self,
         action: &serde_json::Value,
+        expires_after_ms: Option<u64>,
     ) -> Result<(u64, String), HlError> {
         let nonce = self.next_nonce();
-        let sig = self.signer()?.sign_l1(action, nonce, None).await?;
+        let sig = self
+            .signer()?
+            .sign_l1(action, nonce, None, expires_after_ms)
+            .await?;
         let body = serde_json::json!({
             "action": action,
             "nonce": nonce,
             "signature": sig,
             "vaultAddress": serde_json::Value::Null,
+            "expiresAfter": expires_after_ms,
         });
         let text = self.post_once(&self.config.exchange_url, &body).await?;
         Ok((nonce, text))
@@ -914,19 +927,33 @@ impl HlClient {
     /// Sent exactly once (W1) — see `post_exchange_once`. A per-order
     /// `{"error": msg}` or a top-level `{"status":"err"}` is returned as
     /// `HlError::Exchange` — the caller hard-stops (§5).
+    ///
+    /// `expires_after_ms` (Issue #2) is the run's execution-deadline wall-clock
+    /// expiry; see [`Self::place_order_once`].
     pub async fn place_order(
         &self,
         intent: &OrderIntent,
         asset: u32,
+        expires_after_ms: u64,
     ) -> Result<PlaceOutcome, HlError> {
-        self.place_order_once(intent, asset).await.map(|(_, o)| o)
+        self.place_order_once(intent, asset, expires_after_ms)
+            .await
+            .map(|(_, o)| o)
     }
 
     /// `place_order`, additionally reporting the nonce that was signed.
+    ///
+    /// `expires_after_ms` (Issue #2): the run-level `ExecutionDeadline`'s
+    /// wall-clock Unix ms expiry. Every slice's place — the final slice and
+    /// any resend included — carries the SAME value here, so the signed
+    /// action hash and the `/exchange` body's `expiresAfter` field agree, and
+    /// HL enforces the same hard window the local `ExecutionDeadline` check
+    /// enforces (defence in depth: see `docs/DESIGN.md` "執行期限").
     pub async fn place_order_once(
         &self,
         intent: &OrderIntent,
         asset: u32,
+        expires_after_ms: u64,
     ) -> Result<(u64, PlaceOutcome), HlError> {
         let wire = crate::eip712::order_intent_to_wire(intent, asset);
         let action = crate::eip712::OrderAction {
@@ -936,7 +963,9 @@ impl HlClient {
         };
         let action_value = serde_json::to_value(&action)
             .map_err(|e| HlError::ActionFormat(format!("order serialize: {e}")))?;
-        let (nonce, text) = self.post_exchange_once(&action_value).await?;
+        let (nonce, text) = self
+            .post_exchange_once(&action_value, Some(expires_after_ms))
+            .await?;
         parse_place_response(&text).map(|o| (nonce, o))
     }
 
@@ -944,6 +973,11 @@ impl HlClient {
     ///
     /// Also sent exactly once (W1). A failed cancel is non-fatal: the caller's
     /// `orderStatus` reconciliation is what establishes the truth.
+    ///
+    /// A cancel is NOT subject to the execution deadline (Issue #2 PM
+    /// decision: cancels remain allowed after the deadline), so it is signed
+    /// with `expires_after_ms: None` — cancelling an order should not itself
+    /// be able to expire.
     pub async fn cancel_by_cloid(&self, intent: &CancelIntent, asset: u32) -> Result<(), HlError> {
         let wire = crate::eip712::cancel_intent_to_wire(intent, asset);
         let action = crate::eip712::CancelByCloidAction {
@@ -952,7 +986,7 @@ impl HlClient {
         };
         let action_value = serde_json::to_value(&action)
             .map_err(|e| HlError::ActionFormat(format!("cancel serialize: {e}")))?;
-        let (_, text) = self.post_exchange_once(&action_value).await?;
+        let (_, text) = self.post_exchange_once(&action_value, None).await?;
         parse_cancel_response(&text)
     }
 }

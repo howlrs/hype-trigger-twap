@@ -24,8 +24,8 @@ use hype_trigger_twap::trigger::{
     wait_for_trigger, TriggerConfig, TriggerOutcome, TriggerReason, TriggerWhen,
 };
 use hype_trigger_twap::twap::{
-    compute_sizing, fetch_fresh_book, run_twap, usd_to_coin, TwapPlan, MIN_NOTIONAL_USD,
-    READ_ONLY_BANNER,
+    check_clock_skew, compute_sizing, fetch_fresh_book, run_twap, usd_to_coin, wall_clock_now_ms,
+    TwapPlan, MIN_NOTIONAL_USD, READ_ONLY_BANNER,
 };
 use hype_trigger_twap::types::{Address, Side, Symbol};
 
@@ -410,6 +410,22 @@ async fn run() -> Result<ExitCode, String> {
         }
     };
 
+    // Issue #2: live-preflight clock-skew check. `expiresAfter` is a
+    // wall-clock Unix ms value trusted by both the local `ExecutionDeadline`
+    // and Hyperliquid's own exchange-side enforcement of the same field — if
+    // this host's clock is skewed against HL's, the two enforcers disagree
+    // about when the run's orders actually expire. Read-only / paper mode
+    // signs nothing, so a bad local clock there is harmless; this check is
+    // therefore live-only (see docs/DESIGN.md "クロックずれ").
+    if !cli.read_only {
+        let skew_book = client
+            .fetch_l2_book(&symbol)
+            .await
+            .map_err(|e| format!("clock-skew preflight l2Book: {e}"))?;
+        check_clock_skew(wall_clock_now_ms() as i64, skew_book.time_ms)
+            .map_err(|e| e.to_string())?;
+    }
+
     // §4 step 5 (moved ahead of step 4: the gate below needs to know whether
     // this run is time-only before it may touch l2Book at all).
     let trigger_cfg = cli.trigger_config();
@@ -464,7 +480,7 @@ async fn run() -> Result<ExitCode, String> {
     let snapshot = match &reason {
         TriggerReason::Price { snapshot, .. } => snapshot.clone(),
         TriggerReason::Immediate | TriggerReason::Elapsed { .. } => {
-            fetch_fresh_book(&client, &symbol, cli.max_book_age_ms)
+            fetch_fresh_book(&client, &symbol, cli.max_book_age_ms, None)
                 .await
                 .map_err(|e| format!("pre-flight l2Book: {e}"))?
         }

@@ -41,11 +41,17 @@ pub trait Signer: Send + Sync {
     /// Sign an L1 action with a specific nonce.
     /// `vault` allows trading on behalf of a vault/subaccount; pass `None`
     /// for direct master/agent action.
+    /// `expires_after` (Issue #2) is the wall-clock Unix ms the action
+    /// expires at; it MUST be the same value the caller puts in the
+    /// `/exchange` request body's `expiresAfter` field, or the signature will
+    /// not match what HL re-derives from the body. `None` omits the expires
+    /// flag from the signed hash entirely (matches HL python-sdk semantics).
     async fn sign_l1(
         &self,
         action: &Action,
         nonce: u64,
         vault: Option<&Address>,
+        expires_after: Option<u64>,
     ) -> Result<Signature, HlError>;
 }
 
@@ -104,6 +110,7 @@ impl Signer for Eip712AgentSigner {
         action: &Action,
         nonce: u64,
         vault: Option<&Address>,
+        expires_after: Option<u64>,
     ) -> Result<Signature, HlError> {
         // Convert crate::types::Address (String wrapper) to alloy 20-byte
         // typed Address for action_hash. Parse failures surface as
@@ -116,7 +123,7 @@ impl Signer for Eip712AgentSigner {
             })
             .transpose()?;
 
-        let hash = dispatch_and_hash(action, nonce, vault_alloy.as_ref())?;
+        let hash = dispatch_and_hash(action, nonce, vault_alloy.as_ref(), expires_after)?;
         let agent = build_agent(hash, self.is_mainnet);
         let signing_hash = agent.eip712_signing_hash(&l1_domain());
 
@@ -151,6 +158,7 @@ fn dispatch_and_hash(
     action: &Action,
     nonce: u64,
     vault: Option<&AlloyAddress>,
+    expires_after: Option<u64>,
 ) -> Result<alloy::primitives::B256, HlError> {
     use serde::Deserialize;
 
@@ -163,25 +171,25 @@ fn dispatch_and_hash(
         "dummy" => {
             let typed = DummyAction::deserialize(action)
                 .map_err(|e| HlError::ActionFormat(format!("dummy decode: {e}")))?;
-            action_hash(&typed, nonce, vault, None)
+            action_hash(&typed, nonce, vault, expires_after)
                 .map_err(|e| HlError::ActionFormat(format!("dummy msgpack: {e}")))
         }
         "order" => {
             let typed = OrderAction::deserialize(action)
                 .map_err(|e| HlError::ActionFormat(format!("order decode: {e}")))?;
-            action_hash(&typed, nonce, vault, None)
+            action_hash(&typed, nonce, vault, expires_after)
                 .map_err(|e| HlError::ActionFormat(format!("order msgpack: {e}")))
         }
         "scheduleCancel" => {
             let typed = ScheduleCancelAction::deserialize(action)
                 .map_err(|e| HlError::ActionFormat(format!("scheduleCancel decode: {e}")))?;
-            action_hash(&typed, nonce, vault, None)
+            action_hash(&typed, nonce, vault, expires_after)
                 .map_err(|e| HlError::ActionFormat(format!("scheduleCancel msgpack: {e}")))
         }
         "cancelByCloid" => {
             let typed = CancelByCloidAction::deserialize(action)
                 .map_err(|e| HlError::ActionFormat(format!("cancelByCloid decode: {e}")))?;
-            action_hash(&typed, nonce, vault, None)
+            action_hash(&typed, nonce, vault, expires_after)
                 .map_err(|e| HlError::ActionFormat(format!("cancelByCloid msgpack: {e}")))
         }
         other => Err(HlError::ActionFormat(format!(
@@ -237,8 +245,8 @@ mod tests {
         let action = json!({"type": "dummy", "num": 100000000000i64});
         let m = Eip712AgentSigner::from_secret(SecretString::new(TEST_PK.into()), true).unwrap();
         let t = Eip712AgentSigner::from_secret(SecretString::new(TEST_PK.into()), false).unwrap();
-        let sm = m.sign_l1(&action, 0, None).await.unwrap();
-        let st = t.sign_l1(&action, 0, None).await.unwrap();
+        let sm = m.sign_l1(&action, 0, None, None).await.unwrap();
+        let st = t.sign_l1(&action, 0, None, None).await.unwrap();
         assert_ne!(sm, st);
     }
 
@@ -246,7 +254,7 @@ mod tests {
     async fn unsupported_action_type_is_rejected() {
         let s = Eip712AgentSigner::from_secret(SecretString::new(TEST_PK.into()), true).unwrap();
         let err = s
-            .sign_l1(&json!({"type": "withdraw3"}), 1, None)
+            .sign_l1(&json!({"type": "withdraw3"}), 1, None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, HlError::ActionFormat(_)));
@@ -257,7 +265,7 @@ mod tests {
         let s = Eip712AgentSigner::from_secret(SecretString::new(TEST_PK.into()), true).unwrap();
         for nonce in 0..8u64 {
             let sig = s
-                .sign_l1(&json!({"type": "dummy", "num": 1i64}), nonce, None)
+                .sign_l1(&json!({"type": "dummy", "num": 1i64}), nonce, None, None)
                 .await
                 .unwrap();
             assert!(sig.v == 27 || sig.v == 28, "v was {}", sig.v);
