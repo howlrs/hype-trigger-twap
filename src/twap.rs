@@ -1102,6 +1102,59 @@ pub async fn run_twap(client: &dyn HlApi, plan: &TwapPlan) -> TwapReport {
     run_twap_journaled(client, plan, None, None).await
 }
 
+/// Force-reconcile ONE unresolved cloid (`Prepared`/`SubmittedUnknown`/
+/// `Acknowledged` per the journal replay) via `orderStatus`, appending the
+/// resolved outcome to `journal` (Issue #4).
+///
+/// Reuses the SAME `orderStatus`-by-cloid policy (`reconcile_by_cloid`,
+/// Issue #7's W1 unknownOid streak logic) that `place_slice_reconciled`
+/// already uses for an ambiguous send inside a live run — `main.rs`'s
+/// `--resume` and `--abandon-incomplete-run` paths call this instead of
+/// reimplementing reconciliation.
+///
+/// Every cloid handed to this function is one this run never itself
+/// observed placing (it is reconciling a PRIOR process's in-flight state),
+/// so `slice_idx` is not tracked by the caller — `0` is used as a
+/// placeholder in the journal record; it is meaningful only within a single
+/// live `run_twap_journaled` call, not across a resume boundary.
+///
+/// - HL has the cloid, terminal → journaled `Terminal` with the credited
+///   fill (possibly zero, e.g. `canceled`/`rejected`).
+/// - HL never received it (unknownOid streak cleared) → journaled
+///   `Terminal` with `filled_sz = 0` — the order genuinely never landed, so
+///   it is safe to record as a zero-fill terminal outcome; a resume/abandon
+///   NEVER resends on this codepath (only a live run's OWN
+///   `place_slice_reconciled` may resend).
+/// - Neither resolves within the reconciliation budget → the error is
+///   propagated as-is; `main.rs` surfaces it and the run does not proceed
+///   (leaving the cloid unresolved in the journal for a future attempt).
+pub async fn reconcile_unresolved_cloid(
+    client: &dyn HlApi,
+    plan: &TwapPlan,
+    cloid: Cloid,
+    journal: &mut ExecutionJournal,
+) -> Result<(), HlError> {
+    let user = plan.status_user()?;
+    match reconcile_by_cloid(client, plan, user, cloid).await {
+        Ok(Some(st)) => {
+            journal_terminal(Some(journal), 0, cloid, &st.status, st.filled_sz, st.avg_px)?;
+            Ok(())
+        }
+        Ok(None) => {
+            journal_terminal(
+                Some(journal),
+                0,
+                cloid,
+                "neverReceived",
+                Decimal::ZERO,
+                None,
+            )?;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Cooperative shutdown signal (Issue #4).
 ///
 /// Backed by [`tokio::sync::watch`] rather than a real OS signal so both the

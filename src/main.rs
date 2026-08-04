@@ -25,8 +25,8 @@ use hype_trigger_twap::trigger::{
     wait_for_trigger, TriggerConfig, TriggerOutcome, TriggerReason, TriggerWhen,
 };
 use hype_trigger_twap::twap::{
-    check_clock_skew, compute_sizing, fetch_fresh_book, run_twap, usd_to_coin, wall_clock_now_ms,
-    TwapPlan, MIN_NOTIONAL_USD, READ_ONLY_BANNER,
+    check_clock_skew, compute_sizing, fetch_fresh_book, usd_to_coin, wall_clock_now_ms, TwapPlan,
+    MIN_NOTIONAL_USD, READ_ONLY_BANNER,
 };
 use hype_trigger_twap::types::{Address, Side, Symbol};
 
@@ -221,6 +221,38 @@ struct Cli {
     /// prints `EXPIRED: no trigger fired within <dur>` on expiry.
     #[arg(long, value_parser = parse_duration)]
     expire_after: Option<Duration>,
+
+    /// Root directory for run-state persistence (Issue #4). Defaults to
+    /// `$XDG_STATE_HOME/hype-twap` if set, else `~/.local/state/hype-twap`.
+    /// A read-only run never touches this — no directory is created, no
+    /// journal is written. Live runs write `<dir>/runs/<run-id>/journal.jsonl`.
+    #[arg(long)]
+    state_dir: Option<std::path::PathBuf>,
+
+    /// Resume a specific incomplete run by its run id (Issue #4). Every
+    /// submitted/unknown cloid recorded in that run's journal is reconciled
+    /// via `orderStatus` BEFORE the run continues; fills already credited in
+    /// the journal are never re-requested. Mutually exclusive with starting
+    /// a brand-new run when an incomplete run already exists for the same
+    /// network+agent — one of `--resume` or `--abandon-incomplete-run` is
+    /// required in that situation.
+    #[arg(long, conflicts_with = "abandon_incomplete_run")]
+    resume: Option<String>,
+
+    /// Explicit confirmation to abandon an incomplete run for this
+    /// network+agent WITHOUT resuming it (Issue #4). Every submitted/unknown
+    /// cloid is still force-reconciled via `orderStatus` first — this flag
+    /// never skips reconciliation, it only accepts that whatever remainder
+    /// was not yet executed will NOT be continued.
+    #[arg(long, default_value_t = false)]
+    abandon_incomplete_run: bool,
+
+    /// How long SIGINT/SIGTERM shutdown may spend reconciling in-flight
+    /// orders and cancelling confirmed resting ones before giving up
+    /// (Issue #4). Exceeding this exits non-zero with any still-unresolved
+    /// cloid journaled as `outcome_unknown`.
+    #[arg(long, value_parser = parse_duration, default_value = "60s")]
+    shutdown_grace: Duration,
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -410,6 +442,51 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     };
     let agent_address = signer.as_ref().map(|s| s.address());
 
+    // Issue #4: state-dir resolution and incomplete-run detection. Read-only
+    // never creates a directory or touches the journal at all — this whole
+    // block is gated on `!cli.read_only`, mirroring the endpoint-override
+    // gate above. Live mode checks BEFORE any network call (fetch_meta is
+    // the very next one below), so a blocked startup never wastes a request.
+    let resolved_state_dir = hype_trigger_twap::journal::state_dir(cli.state_dir.as_deref());
+    if !cli.read_only {
+        let incomplete = hype_trigger_twap::journal::find_incomplete_run(
+            &resolved_state_dir,
+            network.to_string().as_str(),
+            agent_address.as_ref(),
+        )
+        .map_err(|e| format!("checking for an incomplete prior run failed: {e}"))?;
+        if let Some(incomplete_run_id) = incomplete {
+            let is_the_one_being_resumed =
+                cli.resume.as_deref() == Some(incomplete_run_id.as_str());
+            if !is_the_one_being_resumed && !cli.abandon_incomplete_run {
+                return Err(format!(
+                    "an incomplete run ({incomplete_run_id}) exists for this network+agent \
+                     (state dir: {}); refusing to start a new overlapping live run. \
+                     Pass --resume {incomplete_run_id} to continue it, or \
+                     --abandon-incomplete-run to force-reconcile and abandon it \
+                     (nothing further from that run will be executed).",
+                    resolved_state_dir.display()
+                ));
+            }
+            if let Some(requested) = &cli.resume {
+                if requested != &incomplete_run_id {
+                    return Err(format!(
+                        "--resume {requested} does not match the incomplete run on disk \
+                         ({incomplete_run_id}); pass the correct run id, or \
+                         --abandon-incomplete-run to abandon {incomplete_run_id} instead."
+                    ));
+                }
+            }
+        } else if cli.resume.is_some() {
+            return Err(format!(
+                "--resume {} was given but no incomplete run exists for this network+agent \
+                 (state dir: {})",
+                cli.resume.as_deref().unwrap_or_default(),
+                resolved_state_dir.display()
+            ));
+        }
+    }
+
     let config = HlConfig::new(network).with_overrides(
         std::env::var("HL_INFO_URL").ok(),
         std::env::var("HL_EXCHANGE_URL").ok(),
@@ -483,6 +560,80 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
             Some(master)
         }
     };
+
+    // Issue #4: resolve `--resume`/`--abandon-incomplete-run` reconciliation
+    // HERE — immediately after `master` is known and strictly BEFORE the
+    // trigger wait / any l2Book call below. Both flags force-reconcile every
+    // submitted/unknown cloid from the PRIOR run via `orderStatus`; this
+    // must happen before this process risks placing anything of its own
+    // (resume) or before it declares itself done (abandon) — waiting until
+    // after the trigger fires would let a long wait (or an immediate
+    // trigger's sizing/pre-flight calls) run first, which is wrong for
+    // abandon (nothing should happen at all) and unnecessarily late for
+    // resume. Only `symbol`/`side`/`master` are needed for reconciliation
+    // (`orderStatus` cross-check + the master-address query), so a minimal
+    // plan fragment is built here rather than waiting for the full `TwapPlan`
+    // (which needs sizing that has not happened yet).
+    if !cli.read_only && (cli.resume.is_some() || cli.abandon_incomplete_run) {
+        let reconcile_plan = TwapPlan {
+            symbol: symbol.clone(),
+            side,
+            asset_index: 0,
+            sz_decimals: 0,
+            per_slice: Decimal::ZERO,
+            total_adjusted: Decimal::ZERO,
+            total_requested: Decimal::ZERO,
+            slices: 1,
+            duration: Duration::ZERO,
+            slippage_bps: cli.slippage_bps,
+            max_book_age_ms: cli.max_book_age_ms,
+            read_only: false,
+            max_notional_usd: Decimal::MAX,
+            agent: agent_address.clone(),
+            master: master.clone(),
+        };
+
+        if let Some(resume_id) = &cli.resume {
+            let mut j = hype_trigger_twap::journal::ExecutionJournal::open_existing(
+                &resolved_state_dir,
+                resume_id,
+            )
+            .map_err(|e| format!("--resume {resume_id}: failed to open journal: {e}"))?;
+            reconcile_incomplete_run(&client, &reconcile_plan, &mut j)
+                .await
+                .map_err(|e| format!("--resume {resume_id}: reconciliation failed: {e}"))?;
+        } else if cli.abandon_incomplete_run {
+            let incomplete_id = hype_trigger_twap::journal::find_incomplete_run(
+                &resolved_state_dir,
+                network.to_string().as_str(),
+                agent_address.as_ref(),
+            )
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| {
+                "--abandon-incomplete-run given but no incomplete run was found".to_string()
+            })?;
+            let mut j = hype_trigger_twap::journal::ExecutionJournal::open_existing(
+                &resolved_state_dir,
+                &incomplete_id,
+            )
+            .map_err(|e| format!("--abandon-incomplete-run: failed to open journal: {e}"))?;
+            reconcile_incomplete_run(&client, &reconcile_plan, &mut j)
+                .await
+                .map_err(|e| format!("--abandon-incomplete-run: reconciliation failed: {e}"))?;
+            j.record(&hype_trigger_twap::journal::JournalRecord::Abandoned {
+                note: format!(
+                    "operator passed --abandon-incomplete-run; run {incomplete_id} force-\
+                     reconciled and closed without continuing"
+                ),
+            })
+            .map_err(|e| e.to_string())?;
+            println!(
+                "Abandoned incomplete run {incomplete_id} after forced reconciliation; \
+                 nothing further will be executed for it."
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
 
     // §4 step 5 (moved ahead of step 4: the gate below needs to know whether
     // this run is time-only before it may touch l2Book at all).
@@ -666,7 +817,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
 
     // §8: the loop.
     let plan = TwapPlan {
-        symbol,
+        symbol: symbol.clone(),
         side,
         asset_index: asset.asset_index,
         sz_decimals: asset.sz_decimals,
@@ -679,10 +830,135 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         max_book_age_ms: cli.max_book_age_ms,
         read_only: cli.read_only,
         max_notional_usd,
-        agent: agent_address,
-        master,
+        agent: agent_address.clone(),
+        master: master.clone(),
     };
-    let report = run_twap(&client, &plan).await;
+
+    // Issue #4: open (or resume) the journal for a LIVE run only — read-only
+    // never creates the state dir or a journal file (mirrors the incomplete-
+    // run-detection gate above). `--abandon-incomplete-run` already returned
+    // above (right after reconciliation, before the trigger wait), so only
+    // two cases remain here: `--resume` re-opens the ALREADY-reconciled
+    // run's journal for append and continues it, or a brand-new run starts
+    // a fresh journal.
+    let mut journal = if cli.read_only {
+        None
+    } else if let Some(resume_id) = &cli.resume {
+        Some(
+            hype_trigger_twap::journal::ExecutionJournal::open_existing(
+                &resolved_state_dir,
+                resume_id,
+            )
+            .map_err(|e| format!("--resume {resume_id}: failed to re-open journal: {e}"))?,
+        )
+    } else {
+        let plan_hash = hype_trigger_twap::journal::hash_plan_params(&[
+            plan.symbol.as_str(),
+            &plan.side.to_string(),
+            &plan.per_slice.to_string(),
+            &plan.total_adjusted.to_string(),
+            &plan.slices.to_string(),
+            &plan.duration.as_secs().to_string(),
+            &plan.slippage_bps.to_string(),
+            &plan.max_notional_usd.to_string(),
+        ]);
+        let run_id = uuid::Uuid::now_v7().to_string();
+        let header = hype_trigger_twap::journal::RunHeader {
+            run_id: run_id.clone(),
+            network: network.to_string(),
+            agent: agent_address.clone(),
+            master: master.clone(),
+            symbol: plan.symbol.clone(),
+            side: plan.side,
+            slices: plan.slices,
+            plan_hash,
+            started_at_unix_ms: hype_trigger_twap::twap::wall_clock_now_ms(),
+        };
+        Some(
+            hype_trigger_twap::journal::ExecutionJournal::start(
+                &resolved_state_dir,
+                run_id,
+                header,
+            )
+            .map_err(|e| format!("failed to start execution journal: {e}"))?,
+        )
+    };
+
+    // Issue #4: SIGINT/SIGTERM cooperative shutdown. A tokio::sync::watch
+    // channel is the shutdown token both the real signal task and (in
+    // src/twap.rs's tests) a test harness can drive identically. The signal
+    // task itself only flips the watch value — all the actual
+    // stop-scheduling / reconcile / cancel / report behaviour lives in
+    // `run_twap_journaled`, so there is exactly one code path for both a
+    // normal end-of-run and a signal-interrupted one.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown_signal = hype_trigger_twap::twap::ShutdownSignal::new(shutdown_rx);
+    let signal_task = if cli.read_only {
+        None
+    } else {
+        Some(tokio::spawn(async move {
+            let mut sigterm =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to install SIGTERM handler");
+                        return;
+                    }
+                };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::warn!("SIGINT received; requesting graceful shutdown");
+                }
+                _ = sigterm.recv() => {
+                    tracing::warn!("SIGTERM received; requesting graceful shutdown");
+                }
+            }
+            let _ = shutdown_tx.send(true);
+        }))
+    };
+
+    let run_fut = hype_trigger_twap::twap::run_twap_journaled(
+        &client,
+        &plan,
+        journal.as_mut(),
+        Some(shutdown_signal),
+    );
+
+    // Issue #4: bound the WHOLE run (not just the shutdown-triggered tail)
+    // by `--shutdown-grace` ONLY once a signal has actually fired — a
+    // healthy run with no signal must never be timed out by this. The
+    // simplest correct way to express "grace only applies after shutdown"
+    // without duplicating run_twap_journaled's internal reconcile/cancel
+    // logic is: race the run against the grace timer, but only START the
+    // grace timer once the signal task has completed (i.e. a signal fired).
+    let report = if let Some(task) = signal_task {
+        tokio::select! {
+            report = run_fut => report,
+            _ = async {
+                let _ = task.await;
+                tokio::time::sleep(cli.shutdown_grace).await;
+            } => {
+                tracing::error!(
+                    grace = ?cli.shutdown_grace,
+                    "shutdown grace period exceeded; giving up with outcome_unknown"
+                );
+                if let Some(j) = journal.as_mut() {
+                    let _ = j.record(&hype_trigger_twap::journal::JournalRecord::FinalReport {
+                        completed: false,
+                        filled_total: "0".into(),
+                        outcome_unknown_cloids: Vec::new(),
+                        note: format!(
+                            "shutdown grace period ({:?}) exceeded before reconciliation finished",
+                            cli.shutdown_grace
+                        ),
+                    });
+                }
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+    } else {
+        run_fut.await
+    };
     print!("{}", report.render());
 
     if report.exit_code() == 0 {
@@ -690,6 +966,44 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     } else {
         Ok(ExitCode::FAILURE)
     }
+}
+
+/// Issue #4: force-reconcile every submitted/unknown cloid in an incomplete
+/// run's journal via `orderStatus`, appending the resolved
+/// `Acknowledged`/`Terminal` records. Used by both `--resume` (which then
+/// continues the run) and `--abandon-incomplete-run` (which reconciles then
+/// marks the run `Abandoned` without continuing it) — reconciliation itself
+/// is identical either way, only what happens AFTER it differs.
+///
+/// Reuses [`hype_trigger_twap::twap::reconcile_unresolved_cloid`], which
+/// wraps the same `orderStatus`-by-cloid policy `place_slice_reconciled`
+/// already uses for an ambiguous send (Issue #7's `reconcile_by_cloid`) —
+/// there is exactly one orderStatus reconciliation policy in this codebase,
+/// not a second one for the resume path.
+async fn reconcile_incomplete_run(
+    client: &HlClient,
+    plan: &TwapPlan,
+    journal: &mut hype_trigger_twap::journal::ExecutionJournal,
+) -> Result<(), String> {
+    let records = hype_trigger_twap::journal::ExecutionJournal::read_all(
+        journal
+            .dir()
+            .parent()
+            .and_then(|p| p.parent())
+            .ok_or_else(|| {
+                "malformed journal run directory (expected <state_dir>/runs/<run_id>)".to_string()
+            })?,
+        journal.run_id(),
+    )
+    .map_err(|e| e.to_string())?;
+    let summary = hype_trigger_twap::journal::summarize(&records);
+
+    for cloid in summary.unresolved_cloids() {
+        hype_trigger_twap::twap::reconcile_unresolved_cloid(client, plan, cloid, journal)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1564,5 +1878,529 @@ mod tests {
 
         let err = result.expect_err("a live custom endpoint override must be rejected");
         assert!(err.contains("--allow-custom-endpoints"), "{err}");
+    }
+
+    // === Issue #4: state-dir / journal / incomplete-run tests ===
+
+    /// Hand-rolled temp-dir guard (no `tempfile` dependency, matching
+    /// `src/journal.rs`'s own test module).
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("hype-twap-main-test-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn live_cli(extra: &[&str], state_dir: &std::path::Path) -> Vec<String> {
+        let mut args: Vec<String> = vec![
+            "hype-twap".into(),
+            "--symbol".into(),
+            "HYPE".into(),
+            "--side".into(),
+            "long".into(),
+            "--usd".into(),
+            "50".into(),
+            "--duration".into(),
+            "2s".into(),
+            "--slices".into(),
+            "1".into(),
+            "--max-notional-usd".into(),
+            "1000000".into(),
+            "--allow-custom-endpoints".into(),
+            "--read-only".into(),
+            "false".into(),
+            "--state-dir".into(),
+            state_dir.display().to_string(),
+        ];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        args
+    }
+
+    /// Registers the full mock set a complete one-slice live run needs: meta,
+    /// userRole, l2Book (served for both the startup snapshot and the
+    /// pre-flight/slice-loop fetch — `.expect_at_least(1)` since exactly how
+    /// many times it is called is an implementation detail this test does
+    /// not pin), and one filled `/exchange` response.
+    async fn mock_full_live_run(server: &mut mockito::ServerGuard) {
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({"type": "meta"})))
+            .with_status(200)
+            .with_body(r#"{"universe":[{"name":"HYPE","szDecimals":2,"maxLeverage":10,"onlyIsolated":false}]}"#)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "userRole"}),
+            ))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"role":"agent","data":{{"user":"{MASTER}"}}}}"#
+            ))
+            .create_async()
+            .await;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "l2Book"}),
+            ))
+            .with_status(200)
+            .with_body(book_body_at("HYPE", "49.9", "50.1", now_ms))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/exchange")
+            .with_status(200)
+            .with_body(
+                r#"{"status":"ok","response":{"type":"order","data":{"statuses":[
+                    {"filled":{"oid":1,"totalSz":"1","avgPx":"50"}}]}}}"#,
+            )
+            .create_async()
+            .await;
+    }
+
+    /// Read-only regression (Issue #4 acceptance criterion): a read-only run
+    /// must create NEITHER the state directory NOR a journal file, even when
+    /// `--state-dir` points at a path that does not exist yet.
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn read_only_creates_no_state_dir_or_journal_file() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("would-be-state-dir");
+        assert!(!state_dir.exists());
+
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({"type": "meta"})))
+            .with_status(200)
+            .with_body(r#"{"universe":[{"name":"HYPE","szDecimals":2,"maxLeverage":10,"onlyIsolated":false}]}"#)
+            .create_async()
+            .await;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "l2Book"}),
+            ))
+            .with_status(200)
+            .with_body(book_body_at("HYPE", "49.9", "50.1", now_ms))
+            .create_async()
+            .await;
+
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+
+        let cli = Cli::try_parse_from([
+            "hype-twap",
+            "--symbol",
+            "HYPE",
+            "--side",
+            "long",
+            "--usd",
+            "50",
+            "--duration",
+            "2s",
+            "--slices",
+            "1",
+            "--state-dir",
+            &state_dir.display().to_string(),
+            "--read-only",
+            "true",
+        ])
+        .unwrap();
+
+        let _ = run_with_cli(cli).await;
+
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+
+        assert!(
+            !state_dir.exists(),
+            "a read-only run must never create the state directory"
+        );
+    }
+
+    /// A complete one-slice LIVE run creates the state dir and a journal
+    /// file containing a Header record and a FinalReport (completed: true).
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn live_run_creates_state_dir_and_a_completed_journal() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+
+        let mut server = mockito::Server::new_async().await;
+        mock_full_live_run(&mut server).await;
+
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+
+        let args = live_cli(&[], &state_dir);
+        let cli = Cli::try_parse_from(&args).unwrap();
+        let result = run_with_cli(cli).await;
+
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+
+        result.expect("a fully-mocked one-slice live run must succeed");
+        assert!(state_dir.exists(), "a live run must create the state dir");
+
+        let runs_dir = state_dir.join("runs");
+        let run_ids: Vec<_> = std::fs::read_dir(&runs_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(run_ids.len(), 1, "exactly one run directory: {run_ids:?}");
+
+        let records =
+            hype_trigger_twap::journal::ExecutionJournal::read_all(&state_dir, &run_ids[0])
+                .unwrap();
+        assert!(
+            matches!(
+                records[0],
+                hype_trigger_twap::journal::JournalRecord::Header(_)
+            ),
+            "the first record must be the run header: {records:?}"
+        );
+        assert!(
+            records.iter().any(|r| matches!(
+                r,
+                hype_trigger_twap::journal::JournalRecord::FinalReport {
+                    completed: true,
+                    ..
+                }
+            )),
+            "a completed run must end with a completed FinalReport: {records:?}"
+        );
+    }
+
+    /// Issue #4 acceptance criterion: an incomplete run for the same
+    /// network+agent must block a brand-new overlapping live run (no
+    /// `--resume`, no `--abandon-incomplete-run`).
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn incomplete_run_blocks_a_new_live_run_without_resume_or_abandon() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+
+        // Seed an incomplete run directly via the journal API (no
+        // FinalReport, one unresolved SubmittedUnknown cloid) — simulating a
+        // prior process that crashed mid-run.
+        {
+            let mut j = hype_trigger_twap::journal::ExecutionJournal::start(
+                &state_dir,
+                "prior-incomplete-run".into(),
+                hype_trigger_twap::journal::RunHeader {
+                    run_id: "prior-incomplete-run".into(),
+                    network: "testnet".into(),
+                    agent: Some(hype_trigger_twap::types::Address::new(AGENT)),
+                    master: Some(hype_trigger_twap::types::Address::new(MASTER)),
+                    symbol: hype_trigger_twap::types::Symbol::new("HYPE"),
+                    side: hype_trigger_twap::types::Side::Long,
+                    slices: 1,
+                    plan_hash: "irrelevant".into(),
+                    started_at_unix_ms: 0,
+                },
+            )
+            .unwrap();
+            j.record(
+                &hype_trigger_twap::journal::JournalRecord::SubmittedUnknown {
+                    slice_idx: 1,
+                    cloid: hype_trigger_twap::types::Cloid::new(),
+                },
+            )
+            .unwrap();
+        }
+
+        let server = mockito::Server::new_async().await; // no mocks: must never be reached
+
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+
+        let args = live_cli(&["--network", "testnet"], &state_dir);
+        let cli = Cli::try_parse_from(&args).unwrap();
+        let result = run_with_cli(cli).await;
+
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+
+        let err = result.expect_err("a new overlapping live run must be refused");
+        assert!(err.contains("incomplete run"), "{err}");
+        assert!(err.contains("prior-incomplete-run"), "{err}");
+    }
+
+    /// `--resume <run-id>` on an incomplete run force-reconciles its
+    /// unresolved cloid via `orderStatus`, then CONTINUES the run for the
+    /// remaining plan — proving the resumed run's own journal ends up with
+    /// the reconciled cloid resolved to Terminal, not left dangling.
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn resume_reconciles_the_incomplete_cloid_before_continuing() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+        let prior_cloid = hype_trigger_twap::types::Cloid::new();
+
+        {
+            let mut j = hype_trigger_twap::journal::ExecutionJournal::start(
+                &state_dir,
+                "run-to-resume".into(),
+                hype_trigger_twap::journal::RunHeader {
+                    run_id: "run-to-resume".into(),
+                    network: "testnet".into(),
+                    agent: Some(hype_trigger_twap::types::Address::new(AGENT)),
+                    master: Some(hype_trigger_twap::types::Address::new(MASTER)),
+                    symbol: hype_trigger_twap::types::Symbol::new("HYPE"),
+                    side: hype_trigger_twap::types::Side::Long,
+                    slices: 1,
+                    plan_hash: "irrelevant".into(),
+                    started_at_unix_ms: 0,
+                },
+            )
+            .unwrap();
+            j.record(&hype_trigger_twap::journal::JournalRecord::Prepared {
+                slice_idx: 1,
+                cloid: prior_cloid,
+                nonce: None,
+                symbol: hype_trigger_twap::types::Symbol::new("HYPE"),
+                side: hype_trigger_twap::types::Side::Long,
+                px: "50".into(),
+                sz: "1".into(),
+            })
+            .unwrap();
+            j.record(
+                &hype_trigger_twap::journal::JournalRecord::SubmittedUnknown {
+                    slice_idx: 1,
+                    cloid: prior_cloid,
+                },
+            )
+            .unwrap();
+        }
+
+        let mut server = mockito::Server::new_async().await;
+        mock_full_live_run(&mut server).await;
+        // The forced reconciliation for the PRIOR cloid: orderStatus by
+        // cloid must report it as terminal/filled so no resend occurs.
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "orderStatus", "oid": prior_cloid.to_hex_string()}),
+            ))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"status":"order","order":{{"order":{{"oid":42,"coin":"HYPE","side":"B","cloid":"{prior_cloid}","origSz":"1","sz":"0","avgPx":"50"}},"status":"filled","statusTimestamp":0}}}}"#
+            ))
+            .create_async()
+            .await;
+
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+
+        let args = live_cli(
+            &["--network", "testnet", "--resume", "run-to-resume"],
+            &state_dir,
+        );
+        let cli = Cli::try_parse_from(&args).unwrap();
+        let result = run_with_cli(cli).await;
+
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+
+        result.expect("resume of a fully-mocked incomplete run must succeed");
+
+        let records =
+            hype_trigger_twap::journal::ExecutionJournal::read_all(&state_dir, "run-to-resume")
+                .unwrap();
+        let summary = hype_trigger_twap::journal::summarize(&records);
+        assert!(
+            summary.unresolved_cloids().is_empty(),
+            "the resumed cloid must be resolved, not left dangling: {records:?}"
+        );
+    }
+
+    /// `--abandon-incomplete-run` force-reconciles the incomplete run's
+    /// cloid, marks the run `Abandoned`, and does NOT continue/place
+    /// anything new (the mock `/exchange` endpoint must never be hit).
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn abandon_incomplete_run_reconciles_then_stops_without_placing_anything_new() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+        let prior_cloid = hype_trigger_twap::types::Cloid::new();
+
+        {
+            let mut j = hype_trigger_twap::journal::ExecutionJournal::start(
+                &state_dir,
+                "run-to-abandon".into(),
+                hype_trigger_twap::journal::RunHeader {
+                    run_id: "run-to-abandon".into(),
+                    network: "testnet".into(),
+                    agent: Some(hype_trigger_twap::types::Address::new(AGENT)),
+                    master: Some(hype_trigger_twap::types::Address::new(MASTER)),
+                    symbol: hype_trigger_twap::types::Symbol::new("HYPE"),
+                    side: hype_trigger_twap::types::Side::Long,
+                    slices: 1,
+                    plan_hash: "irrelevant".into(),
+                    started_at_unix_ms: 0,
+                },
+            )
+            .unwrap();
+            j.record(
+                &hype_trigger_twap::journal::JournalRecord::SubmittedUnknown {
+                    slice_idx: 1,
+                    cloid: prior_cloid,
+                },
+            )
+            .unwrap();
+        }
+
+        let mut server = mockito::Server::new_async().await;
+        // Only meta/userRole (startup) + orderStatus (forced reconciliation)
+        // are mocked — NO /exchange mock, so a resend/new-place would 501.
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({"type": "meta"})))
+            .with_status(200)
+            .with_body(r#"{"universe":[{"name":"HYPE","szDecimals":2,"maxLeverage":10,"onlyIsolated":false}]}"#)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "userRole"}),
+            ))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"role":"agent","data":{{"user":"{MASTER}"}}}}"#
+            ))
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "orderStatus", "oid": prior_cloid.to_hex_string()}),
+            ))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"status":"order","order":{{"order":{{"oid":42,"coin":"HYPE","side":"B","cloid":"{prior_cloid}","origSz":"1","sz":"1"}},"status":"canceled","statusTimestamp":0}}}}"#
+            ))
+            .create_async()
+            .await;
+
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+
+        let args = live_cli(
+            &["--network", "testnet", "--abandon-incomplete-run"],
+            &state_dir,
+        );
+        let cli = Cli::try_parse_from(&args).unwrap();
+        let result = run_with_cli(cli).await;
+
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+
+        result.expect("abandon of a fully-mocked incomplete run must succeed");
+
+        let records =
+            hype_trigger_twap::journal::ExecutionJournal::read_all(&state_dir, "run-to-abandon")
+                .unwrap();
+        let summary = hype_trigger_twap::journal::summarize(&records);
+        assert!(
+            summary.abandoned,
+            "the run must be marked Abandoned: {records:?}"
+        );
+        assert!(
+            summary.unresolved_cloids().is_empty(),
+            "the abandoned cloid must still have been reconciled: {records:?}"
+        );
+    }
+
+    // === Issue #4 / #10: no secrets in the journal (CLI-level audit) ===
+
+    /// End-to-end audit: a completed live run's ENTIRE journal file, byte
+    /// for byte, must never contain the private key, its raw hex digits, or
+    /// the literal string "SecretString"/"private". This is in addition to
+    /// `journal_never_serializes_secret_material` in `src/journal.rs` (which
+    /// audits the record TYPES in isolation) — this test audits what an
+    /// actual live run, driven through `HL_AGENT_PK`, writes to disk.
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn live_run_journal_file_never_contains_the_private_key() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+
+        let mut server = mockito::Server::new_async().await;
+        mock_full_live_run(&mut server).await;
+
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+
+        let args = live_cli(&[], &state_dir);
+        let cli = Cli::try_parse_from(&args).unwrap();
+        let result = run_with_cli(cli).await;
+
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+
+        result.expect("fully-mocked live run must succeed");
+
+        let runs_dir = state_dir.join("runs");
+        let run_id = std::fs::read_dir(&runs_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name()
+            .into_string()
+            .unwrap();
+        let journal_path = runs_dir.join(&run_id).join("journal.jsonl");
+        let raw = std::fs::read_to_string(&journal_path).unwrap();
+
+        let pk_hex = TEST_PK.trim_start_matches("0x");
+        assert!(
+            !raw.to_lowercase().contains(&pk_hex.to_lowercase()),
+            "journal file must never contain the raw private key hex"
+        );
+        for banned in ["secretstring", "private_key", "signature"] {
+            assert!(
+                !raw.to_lowercase().contains(banned),
+                "journal file must never contain {banned:?}: {raw}"
+            );
+        }
     }
 }

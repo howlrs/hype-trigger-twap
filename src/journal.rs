@@ -173,6 +173,22 @@ pub struct RunHeader {
     pub started_at_unix_ms: u64,
 }
 
+/// Hash a plan's defining parameters into the `plan_hash` a [`RunHeader`]
+/// carries, so `--resume` can flag an invocation whose plan no longer
+/// matches the run it is resuming (e.g. a different `--slices`/`--duration`
+/// was passed by mistake). Not a cryptographic hash — `DefaultHasher`
+/// (SipHash) is used only as a change-detector, not for anything
+/// security-sensitive, so no new dependency is needed.
+pub fn hash_plan_params(fields: &[&str]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for f in fields {
+        f.hash(&mut hasher);
+        0u8.hash(&mut hasher); // field separator, avoids "ab"+"c" == "a"+"bc"
+    }
+    format!("{:016x}", hasher.finish())
+}
+
 impl RunHeader {
     /// Stable partition key for "incomplete run for the same network+agent"
     /// detection — the exact granularity the PM brief specifies startup
