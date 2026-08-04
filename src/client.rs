@@ -20,12 +20,14 @@
 //!   `{"error": ...}`) are NEVER retried. They hard-stop the run.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use crate::errors::HlError;
+use crate::lock::NonceHwm;
 use crate::signer::Signer;
 use crate::types::{BookLevel, CancelIntent, OrderBook, OrderId, OrderIntent, Symbol};
 
@@ -693,6 +695,12 @@ pub struct HlClient {
     signer: Option<Box<dyn Signer>>,
     /// Monotonic nonce: `max(last + 1, now_ms)` (§5).
     last_nonce: AtomicU64,
+    /// Durable per-network+agent nonce high-water mark (Issue #5). `None`
+    /// when no persistence has been wired up (read-only mode, or any
+    /// existing test constructing `HlClient` directly) — in that case
+    /// `next_nonce` behaves exactly as before: in-process monotonicity only,
+    /// no cross-restart durability. Set via [`HlClient::seed_nonce`].
+    nonce_hwm: Mutex<Option<NonceHwm>>,
 }
 
 impl HlClient {
@@ -707,6 +715,7 @@ impl HlClient {
             http,
             signer,
             last_nonce: AtomicU64::new(0),
+            nonce_hwm: Mutex::new(None),
         })
     }
 
@@ -714,14 +723,52 @@ impl HlClient {
         &self.config
     }
 
+    /// Wire a durable [`NonceHwm`] into this client (Issue #5): seeds the
+    /// in-process nonce counter to `hwm.next_seed(now_ms) - 1` so the very
+    /// next [`HlClient::next_nonce`] call naturally produces
+    /// `max(now_ms, persisted_hwm + 1)` via the existing (unchanged)
+    /// `max(last + 1, now_ms)` logic below, and stores the `NonceHwm` so
+    /// every subsequent mint is persisted back to disk before the nonce is
+    /// returned to the caller. Called once from `main.rs`, right after
+    /// `HlClient::new`, before any `/exchange` call — never in read-only
+    /// mode (read-only never mints a nonce at all).
+    pub fn seed_nonce(&self, hwm: NonceHwm) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default();
+        let seed = hwm.next_seed(now_ms);
+        // `next_nonce` computes `max(last + 1, now_ms)`; storing `seed - 1`
+        // here means its first call reproduces `seed` exactly (assuming
+        // `now_ms` has not moved backwards between the two calls to
+        // `SystemTime::now()`, which the `max` in `next_nonce` covers
+        // regardless).
+        self.last_nonce
+            .store(seed.saturating_sub(1), Ordering::Release);
+        if let Ok(mut guard) = self.nonce_hwm.lock() {
+            *guard = Some(hwm);
+        }
+    }
+
     /// Next nonce: `max(last + 1, now_ms)`. Monotonic even if two actions land
-    /// inside the same millisecond.
+    /// inside the same millisecond. If a [`NonceHwm`] has been wired in via
+    /// [`HlClient::seed_nonce`], the newly-minted nonce is persisted
+    /// (fsynced) to it before this function returns — see `src/lock.rs`'s
+    /// module doc for the durability rationale (fsync every mint, matching
+    /// the journal's own "fsync every record" precedent). A persistence
+    /// failure here is logged but does not fail the call: at this point the
+    /// nonce value itself is already durable-enough for THIS process's
+    /// in-memory monotonicity (the `AtomicU64` swap below already
+    /// succeeded); losing the on-disk HWM write only risks non-monotonicity
+    /// on a FUTURE restart, which is a availability/hygiene concern, not a
+    /// double-send risk for the request this nonce is about to be signed
+    /// into.
     fn next_nonce(&self) -> u64 {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or_default();
-        loop {
+        let next = loop {
             let last = self.last_nonce.load(Ordering::Acquire);
             let next = now_ms.max(last + 1);
             if self
@@ -729,9 +776,23 @@ impl HlClient {
                 .compare_exchange(last, next, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return next;
+                break next;
+            }
+        };
+        if let Ok(mut guard) = self.nonce_hwm.lock() {
+            if let Some(hwm) = guard.as_mut() {
+                if let Err(e) = hwm.advance(next) {
+                    tracing::error!(
+                        nonce = next,
+                        error = %e,
+                        "failed to persist nonce high-water mark; in-process nonce is still \
+                         monotonic for this run, but a restart before the next successful \
+                         persist could replay an already-used nonce value"
+                    );
+                }
             }
         }
+        next
     }
 
     /// POST with the §5 retry policy. Only transport failures are retried;
@@ -2023,6 +2084,101 @@ mod tests {
             assert!(n > prev, "nonce {n} not > {prev}");
             prev = n;
         }
+    }
+
+    /// Hand-rolled temp-dir guard, matching the pattern used in
+    /// `src/journal.rs` / `src/lock.rs`'s own test modules.
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "hype-twap-client-nonce-test-{}",
+                uuid::Uuid::now_v7()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Issue #5 acceptance criterion: nonce monotonicity across a simulated
+    /// process restart. `seed_nonce` loads a persisted HWM and the first
+    /// `next_nonce()` call must exceed it even though this is a brand-new
+    /// `HlClient` (i.e. "restart") with its `AtomicU64` back at whatever
+    /// `seed_nonce` set it to, not 0.
+    #[test]
+    fn seed_nonce_restart_monotonicity_first_nonce_exceeds_persisted_hwm() {
+        let tmp = TempDir::new();
+        let key = crate::lock::lock_key(
+            "testnet",
+            &crate::types::Address::new("0xabc0000000000000000000000000000000abc0"),
+        );
+
+        // "Process 1": mint a nonce, persisting the HWM.
+        let client1 = HlClient::new(HlConfig::new(Network::Testnet), None).unwrap();
+        let hwm1 = crate::lock::NonceHwm::load(tmp.path(), &key).unwrap();
+        client1.seed_nonce(hwm1);
+        let minted = client1.next_nonce();
+        drop(client1);
+
+        // "Process 2" (restart): fresh HlClient, fresh load from disk.
+        let client2 = HlClient::new(HlConfig::new(Network::Testnet), None).unwrap();
+        let hwm2 = crate::lock::NonceHwm::load(tmp.path(), &key).unwrap();
+        assert_eq!(
+            hwm2.current(),
+            minted,
+            "HWM must have persisted the minted nonce"
+        );
+        client2.seed_nonce(hwm2);
+        let next = client2.next_nonce();
+        assert!(
+            next > minted,
+            "post-restart nonce ({next}) must exceed the pre-restart minted nonce ({minted})"
+        );
+    }
+
+    /// Issue #5 acceptance criterion: nonce monotonicity across a simulated
+    /// clock rollback. Even if system time appears to move backwards
+    /// between mints, the persisted HWM's `+1` floor keeps the nonce
+    /// strictly increasing.
+    #[test]
+    fn seed_nonce_clock_rollback_monotonicity() {
+        let tmp = TempDir::new();
+        let key = crate::lock::lock_key(
+            "testnet",
+            &crate::types::Address::new("0xdef0000000000000000000000000000000def0"),
+        );
+
+        let mut hwm = crate::lock::NonceHwm::load(tmp.path(), &key).unwrap();
+        // Simulate a nonce minted far in the future (e.g. system clock was
+        // briefly fast), persisted to disk.
+        hwm.advance(9_999_999_999_999).unwrap();
+
+        let client = HlClient::new(HlConfig::new(Network::Testnet), None).unwrap();
+        client.seed_nonce(hwm);
+        // `next_nonce()` uses real `SystemTime::now()`, which today is far
+        // below the simulated future HWM above — this exercises the exact
+        // "clock behind the persisted HWM" scenario a rollback produces.
+        let next = client.next_nonce();
+        assert!(
+            next > 9_999_999_999_999,
+            "nonce ({next}) must exceed the persisted HWM (9_999_999_999_999) despite the \
+             wall clock reading far below it"
+        );
+
+        let hwm_reloaded = crate::lock::NonceHwm::load(tmp.path(), &key).unwrap();
+        assert_eq!(
+            hwm_reloaded.current(),
+            next,
+            "the persisted HWM must have been advanced to the newly minted nonce"
+        );
     }
 
     #[test]
