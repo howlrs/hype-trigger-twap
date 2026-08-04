@@ -574,6 +574,18 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     // (`orderStatus` cross-check + the master-address query), so a minimal
     // plan fragment is built here rather than waiting for the full `TwapPlan`
     // (which needs sizing that has not happened yet).
+    //
+    // Ordering note: the `--resume` plan_hash consistency check (below, near
+    // where the full `TwapPlan` and journal are opened) intentionally runs
+    // AFTER this reconciliation, not before. Reconciliation itself never
+    // risks a duplicate fill (it only queries `orderStatus`, never places),
+    // so there is no safety reason to gate it on the plan matching — and
+    // gating it the other way round would mean a `--resume` with a
+    // mismatched plan leaves the prior run's cloids permanently unresolved
+    // every time the operator retries with the wrong parameters. Running
+    // reconciliation unconditionally first means the run's on-disk state
+    // only ever gets MORE resolved, never less, regardless of which flags
+    // the operator got wrong.
     if !cli.read_only && (cli.resume.is_some() || cli.abandon_incomplete_run) {
         let reconcile_plan = TwapPlan {
             symbol: symbol.clone(),
@@ -834,6 +846,25 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         master: master.clone(),
     };
 
+    // Issue #4: this plan's hash — computed identically whether starting a
+    // fresh run (stored in its new header) or resuming one (compared
+    // against the STORED header's hash below). Any drift means the operator
+    // passed different sizing/timing/risk parameters on the resume than the
+    // original invocation used, which is exactly the mismatch a `--resume`
+    // safety check exists to catch — resuming a 30-minute/10-slice run as
+    // if it were a 5-minute/1-slice run would silently reinterpret the
+    // remaining schedule.
+    let plan_hash = hype_trigger_twap::journal::hash_plan_params(&[
+        plan.symbol.as_str(),
+        &plan.side.to_string(),
+        &plan.per_slice.to_string(),
+        &plan.total_adjusted.to_string(),
+        &plan.slices.to_string(),
+        &plan.duration.as_secs().to_string(),
+        &plan.slippage_bps.to_string(),
+        &plan.max_notional_usd.to_string(),
+    ]);
+
     // Issue #4: open (or resume) the journal for a LIVE run only — read-only
     // never creates the state dir or a journal file (mirrors the incomplete-
     // run-detection gate above). `--abandon-incomplete-run` already returned
@@ -844,6 +875,25 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     let mut journal = if cli.read_only {
         None
     } else if let Some(resume_id) = &cli.resume {
+        let records =
+            hype_trigger_twap::journal::ExecutionJournal::read_all(&resolved_state_dir, resume_id)
+                .map_err(|e| format!("--resume {resume_id}: failed to read journal: {e}"))?;
+        let stored_hash = records.iter().find_map(|r| match r {
+            hype_trigger_twap::journal::JournalRecord::Header(h) => Some(h.plan_hash.clone()),
+            _ => None,
+        });
+        if let Some(stored_hash) = stored_hash {
+            if stored_hash != plan_hash {
+                return Err(format!(
+                    "--resume {resume_id}: this invocation's plan does not match the run being \
+                     resumed (stored plan_hash {stored_hash}, this invocation computes \
+                     {plan_hash}). Re-run --resume with the EXACT SAME --symbol/--side/--usd or \
+                     --size/--duration/--slices/--slippage-bps/--max-notional-usd the original \
+                     run used, or pass --abandon-incomplete-run instead if you intend to change \
+                     them."
+                ));
+            }
+        }
         Some(
             hype_trigger_twap::journal::ExecutionJournal::open_existing(
                 &resolved_state_dir,
@@ -852,16 +902,6 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
             .map_err(|e| format!("--resume {resume_id}: failed to re-open journal: {e}"))?,
         )
     } else {
-        let plan_hash = hype_trigger_twap::journal::hash_plan_params(&[
-            plan.symbol.as_str(),
-            &plan.side.to_string(),
-            &plan.per_slice.to_string(),
-            &plan.total_adjusted.to_string(),
-            &plan.slices.to_string(),
-            &plan.duration.as_secs().to_string(),
-            &plan.slippage_bps.to_string(),
-            &plan.max_notional_usd.to_string(),
-        ]);
         let run_id = uuid::Uuid::now_v7().to_string();
         let header = hype_trigger_twap::journal::RunHeader {
             run_id: run_id.clone(),
@@ -2163,6 +2203,50 @@ mod tests {
         let state_dir = tmp.path().join("state");
         let prior_cloid = hype_trigger_twap::types::Cloid::new();
 
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+
+        // Issue #4's --resume verifies the stored plan_hash against a
+        // freshly recomputed one before resuming, so the fixture seeded
+        // below must carry the SAME hash `live_cli`'s resolved TwapPlan will
+        // compute at runtime. Rather than hand-reconstruct rust_decimal's
+        // exact string formatting (fragile / easy to drift from the real
+        // formatter), derive it from a real probe run: start a fresh live
+        // run with the SAME `live_cli` args against a throwaway state dir,
+        // let it write its own header, then read the plan_hash back out.
+        let probe_state_dir = tmp.path().join("probe-state");
+        {
+            let mut probe_server = mockito::Server::new_async().await;
+            mock_full_live_run(&mut probe_server).await;
+            std::env::set_var("HL_INFO_URL", format!("{}/info", probe_server.url()));
+            std::env::set_var(
+                "HL_EXCHANGE_URL",
+                format!("{}/exchange", probe_server.url()),
+            );
+            let probe_args = live_cli(&["--network", "testnet"], &probe_state_dir);
+            run_with_cli(Cli::try_parse_from(&probe_args).unwrap())
+                .await
+                .expect("probe run to derive plan_hash must succeed");
+        }
+        let probe_run_id = std::fs::read_dir(probe_state_dir.join("runs"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name()
+            .into_string()
+            .unwrap();
+        let probe_records =
+            hype_trigger_twap::journal::ExecutionJournal::read_all(&probe_state_dir, &probe_run_id)
+                .unwrap();
+        let matching_plan_hash = probe_records
+            .iter()
+            .find_map(|r| match r {
+                hype_trigger_twap::journal::JournalRecord::Header(h) => Some(h.plan_hash.clone()),
+                _ => None,
+            })
+            .unwrap();
+
         {
             let mut j = hype_trigger_twap::journal::ExecutionJournal::start(
                 &state_dir,
@@ -2175,7 +2259,7 @@ mod tests {
                     symbol: hype_trigger_twap::types::Symbol::new("HYPE"),
                     side: hype_trigger_twap::types::Side::Long,
                     slices: 1,
-                    plan_hash: "irrelevant".into(),
+                    plan_hash: matching_plan_hash,
                     started_at_unix_ms: 0,
                 },
             )
@@ -2242,6 +2326,87 @@ mod tests {
             summary.unresolved_cloids().is_empty(),
             "the resumed cloid must be resolved, not left dangling: {records:?}"
         );
+    }
+
+    /// `--resume <run-id>` must be rejected when this invocation's plan
+    /// (sizing/timing/risk parameters) does not match the plan_hash stored
+    /// in the run being resumed — protects against silently reinterpreting
+    /// the remaining schedule of a run under different parameters than it
+    /// was started with.
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn resume_is_rejected_when_the_plan_hash_does_not_match() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+        let prior_cloid = hype_trigger_twap::types::Cloid::new();
+
+        {
+            let mut j = hype_trigger_twap::journal::ExecutionJournal::start(
+                &state_dir,
+                "run-mismatched".into(),
+                hype_trigger_twap::journal::RunHeader {
+                    run_id: "run-mismatched".into(),
+                    network: "testnet".into(),
+                    agent: Some(hype_trigger_twap::types::Address::new(AGENT)),
+                    master: Some(hype_trigger_twap::types::Address::new(MASTER)),
+                    symbol: hype_trigger_twap::types::Symbol::new("HYPE"),
+                    side: hype_trigger_twap::types::Side::Long,
+                    slices: 1,
+                    plan_hash: "this-will-never-match-a-real-hash".into(),
+                    started_at_unix_ms: 0,
+                },
+            )
+            .unwrap();
+            j.record(
+                &hype_trigger_twap::journal::JournalRecord::SubmittedUnknown {
+                    slice_idx: 1,
+                    cloid: prior_cloid,
+                },
+            )
+            .unwrap();
+        }
+
+        // Reconciliation (which the brief requires to run BEFORE any
+        // plan-consistency check, since it must never be skipped) is mocked
+        // to succeed quickly via orderStatus; meta/userRole/l2Book are
+        // mocked so sizing can complete and reach the plan_hash comparison.
+        // NO `/exchange` mock is registered: the mismatch must be caught
+        // before any NEW place is attempted, so a place attempt here would
+        // 501 and fail this test as intended evidence that it never happened.
+        let mut server = mockito::Server::new_async().await;
+        mock_full_live_run(&mut server).await;
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "orderStatus", "oid": prior_cloid.to_hex_string()}),
+            ))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"status":"order","order":{{"order":{{"oid":42,"coin":"HYPE","side":"B","cloid":"{prior_cloid}","origSz":"1","sz":"0","avgPx":"50"}},"status":"filled","statusTimestamp":0}}}}"#
+            ))
+            .create_async()
+            .await;
+
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+
+        let args = live_cli(
+            &["--network", "testnet", "--resume", "run-mismatched"],
+            &state_dir,
+        );
+        let cli = Cli::try_parse_from(&args).unwrap();
+        let result = run_with_cli(cli).await;
+
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+
+        let err = result.expect_err("a plan_hash mismatch must reject --resume");
+        assert!(err.contains("does not match"), "{err}");
+        assert!(err.contains("plan_hash"), "{err}");
     }
 
     /// `--abandon-incomplete-run` force-reconciles the incomplete run's
