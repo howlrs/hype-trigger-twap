@@ -355,6 +355,12 @@ the shortfall; a normal run reaches its last slice inside the window anyway.
 - **Wall-clock dependent.** Nonces and book-freshness checks assume a
   reasonably accurate system clock; run NTP. (A book timestamp *ahead* of local
   time is treated as fresh, so mild skew is tolerated.)
+- **Timing flags use a monotonic clock, not wall-clock.** `--start-after`,
+  `--duration`, and `--expire-after` are all timed off `tokio::time::Instant`
+  (`CLOCK_MONOTONIC` on Linux), which does **not** advance while the system is
+  suspended. On a laptop that sleeps, a run started with `--start-after 2h`
+  will begin 2 hours of *awake* time after launch — if the machine suspends
+  for an hour in between, the actual wall-clock start is delayed by that hour.
 - **HL error strings are matched by substring.** Hyperliquid can reword its
   rejection messages at any time; a reworded message still stops the run, it
   just falls back to the generic "exchange rejected" wording.
