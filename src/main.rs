@@ -1116,7 +1116,18 @@ mod tests {
     // accept/response loop runs on real time regardless of the test's
     // virtual clock). A short, real --start-after keeps the test fast while
     // still proving the ordering.
+    // `#[serial]`: this test mutates process-global env vars (HL_INFO_URL,
+    // HL_EXCHANGE_URL) that `run_with_cli` reads mid-flight over several real
+    // seconds. `cargo test` runs test fns concurrently on separate threads
+    // within one process, and env vars are process-wide — without
+    // serialization this races against the other env-mutating test below
+    // (`issue2_live_skew_beyond_tolerance_...`), letting one test's
+    // in-flight `run_with_cli` pick up the other's HL_INFO_URL/HL_EXCHANGE_URL
+    // mid-run and hit the wrong mockito server (observed as a spurious
+    // mockito 501 on an unmatched route, e.g. a "userRole probe" landing on
+    // a server that never registered that route).
     #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
     async fn issue2_live_time_only_trigger_makes_no_network_call_before_its_deadline() {
         let mut server = mockito::Server::new_async().await;
         // meta: needed at startup, before the wait begins — this IS allowed
@@ -1197,7 +1208,12 @@ mod tests {
     /// post-trigger pre-flight snapshot the skew check reads — proving the
     /// relocated check reads `server_ts_ms` off that snapshot rather than
     /// issuing a second dedicated l2Book call.
+    // `#[serial]`: see the comment on
+    // `issue2_live_time_only_trigger_makes_no_network_call_before_its_deadline`
+    // above — same process-global env var race (this test additionally sets
+    // HL_AGENT_PK / HL_AGENT_ADDRESS).
     #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
     async fn issue2_live_skew_beyond_tolerance_fails_closed_at_execution_entry_not_prewait() {
         let mut server = mockito::Server::new_async().await;
         let _meta = server

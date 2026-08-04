@@ -49,6 +49,12 @@ mockito = "1.7.2"
 # `test-util` enables tokio::time::pause / #[tokio::test(start_paused = true)],
 # which the trigger and slice-deadline tests rely on for determinism.
 tokio = { version = "1.52", features = ["full", "test-util"] }
+# Serializes tests that mutate process-global env vars (HL_INFO_URL,
+# HL_EXCHANGE_URL, HL_AGENT_PK, HL_AGENT_ADDRESS) via std::env::set_var —
+# `cargo test` runs test fns concurrently on separate threads within the
+# same process, and env vars are process-wide, not thread-local, so two such
+# tests running at once can clobber each other's config mid-run.
+serial_test = "3.2"
 
 [profile.release]
 lto = "thin"
