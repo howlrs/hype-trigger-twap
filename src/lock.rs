@@ -298,22 +298,61 @@ impl NonceHwm {
     /// happen given `next_seed`'s contract, but kept defensive rather than
     /// panicking — `next_seed`/`advance` misuse should not be able to
     /// silently move the HWM backwards).
+    ///
+    /// B3 hardening, two independent fixes:
+    ///
+    /// (a) The in-memory `self.current` is now updated only AFTER the
+    /// durable write (including its `fsync`/rename) has fully succeeded. The
+    /// old code set `self.current = nonce` BEFORE attempting the write; if
+    /// that write then failed, the in-memory value had already advanced, so
+    /// a LATER `advance` call with the same (now already-in-memory) nonce
+    /// would short-circuit via the `nonce <= self.current` no-op check above
+    /// and never retry the write — leaving the on-disk HWM permanently
+    /// stale relative to what was actually signed, which risks nonce reuse
+    /// after a restart. On error, `self.current` now stays exactly as it
+    /// was, so a subsequent `advance` call with the same or a larger nonce
+    /// is free to retry the write.
+    ///
+    /// (b) The write itself is now tmp-file + `fsync` + atomic `rename`,
+    /// not a truncate-in-place `write_all` on the live path. A crash
+    /// mid-write under the old scheme could leave a truncated/partial JSON
+    /// file that fails to parse on the next `NonceHwm::load`, which would
+    /// block a live run from starting at all (availability). `rename(2)` on
+    /// the same filesystem is atomic — the live path either still has its
+    /// old complete contents, or is fully replaced by the new complete
+    /// contents; there is no observable partial state.
     pub fn advance(&mut self, nonce: u64) -> Result<(), LockError> {
         if nonce <= self.current {
             return Ok(());
         }
-        self.current = nonce;
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let body = serde_json::to_vec(&NonceHwmFile { hwm: self.current })?;
+        let body = serde_json::to_vec(&NonceHwmFile { hwm: nonce })?;
+
+        // Atomic tmp-file + fsync + rename (B3b). The tmp path lives beside
+        // the target (same directory => same filesystem => `rename` is
+        // atomic) and is named uniquely enough that two processes racing
+        // `advance` for the SAME key (which should never happen — the
+        // caller holds `ProcessLock` for this key for the run's whole
+        // lifetime — but kept defensive) do not clobber each other's
+        // in-flight tmp file.
+        let tmp_path = self
+            .path
+            .with_extension(format!("{}.tmp", std::process::id()));
         let mut f = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(&self.path)?;
+            .open(&tmp_path)?;
         f.write_all(&body)?;
         f.sync_data()?;
+        drop(f);
+        std::fs::rename(&tmp_path, &self.path)?;
+
+        // Only now, after the durable write has fully succeeded, does the
+        // in-memory HWM advance (B3a).
+        self.current = nonce;
         Ok(())
     }
 
@@ -500,5 +539,110 @@ mod tests {
 
         let reloaded = NonceHwm::load(tmp.path(), &key).unwrap();
         assert_eq!(reloaded.current(), 777);
+    }
+
+    // === B3: advance's memory/disk ordering and write atomicity ===
+
+    /// B3(a): if the durable write fails, `self.current` (the in-memory
+    /// HWM) must NOT have been advanced — otherwise a later `advance` call
+    /// with the SAME (now already-in-memory) nonce short-circuits via the
+    /// `nonce <= self.current` no-op check and never retries the write, so
+    /// after a process restart the on-disk HWM is stale relative to what
+    /// was actually signed, risking nonce reuse.
+    ///
+    /// Forces the write to fail by making the HWM file's parent directory
+    /// (`<state_root>/locks`) read-only after it has already been created,
+    /// so `OpenOptions::open(&self.path)` fails with a permission error —
+    /// Unix-only (chmod), matches this crate's existing Unix-first stance
+    /// elsewhere.
+    #[cfg(unix)]
+    #[test]
+    fn advance_does_not_move_the_in_memory_hwm_when_the_durable_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new();
+        let key = lock_key("testnet", &addr("0xabc"));
+
+        let mut hwm = NonceHwm::load(tmp.path(), &key).unwrap();
+        // First advance succeeds normally and creates the `locks` dir.
+        hwm.advance(100).unwrap();
+        assert_eq!(hwm.current(), 100);
+
+        // The write path creates a NEW tmp file (for the atomic tmp+rename
+        // scheme), which needs write+execute permission on the PARENT
+        // directory, not on any existing file — so make the `locks`
+        // directory itself read+execute-only to force the tmp-file create
+        // to fail.
+        let locks_dir = tmp.path().join("locks");
+        let original_mode = std::fs::metadata(&locks_dir).unwrap().permissions().mode();
+        std::fs::set_permissions(&locks_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = hwm.advance(200);
+
+        // Restore permissions before any panic-unwind cleanup (Drop) tries
+        // to remove the tree, and so the retry below can write again.
+        std::fs::set_permissions(&locks_dir, std::fs::Permissions::from_mode(original_mode))
+            .unwrap();
+
+        assert!(
+            result.is_err(),
+            "the write must actually fail under a read-only locks dir for this test to prove \
+             anything"
+        );
+        assert_eq!(
+            hwm.current(),
+            100,
+            "a failed durable write must NOT have advanced the in-memory HWM — otherwise a \
+             later advance(200) call would short-circuit as a no-op (200 <= self.current) \
+             without ever retrying the write, leaving the on-disk HWM stale at 100"
+        );
+
+        // The retry must actually be attempted (not silently skipped) once
+        // the write path works again, and it must succeed.
+        hwm.advance(200).unwrap();
+        assert_eq!(hwm.current(), 200);
+        let reloaded = NonceHwm::load(tmp.path(), &key).unwrap();
+        assert_eq!(
+            reloaded.current(),
+            200,
+            "after the retry succeeds, disk must reflect the advanced HWM"
+        );
+    }
+
+    /// B3(b): the HWM file write must be atomic (tmp-file + fsync + rename),
+    /// not a truncate-in-place, so a crash mid-write cannot leave a
+    /// corrupted/partial JSON file that fails to parse on the next startup
+    /// (an availability bug: `NonceHwm::load` would error and block a live
+    /// run entirely). This test simulates the "recovery" side of that
+    /// property: after a normal `advance` completes, the file on disk must
+    /// be a single complete, parbeable JSON document (proving the write
+    /// path does not leave any intermediate/partial state visible) — and
+    /// specifically that a `.tmp` sibling file used during the atomic
+    /// rename does not leak/remain after a successful write.
+    #[test]
+    fn advance_write_is_atomic_tmp_file_is_not_left_behind_after_success() {
+        let tmp = TempDir::new();
+        let key = lock_key("testnet", &addr("0xabc"));
+        let mut hwm = NonceHwm::load(tmp.path(), &key).unwrap();
+        hwm.advance(42).unwrap();
+
+        let hwm_path = NonceHwm::hwm_path(tmp.path(), &key);
+        // The file itself must parse cleanly as a complete JSON document.
+        let raw = std::fs::read_to_string(&hwm_path).unwrap();
+        let parsed: NonceHwmFile = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed.hwm, 42);
+
+        // No leftover temp file from the atomic rename should remain beside
+        // it.
+        let dir = hwm_path.parent().unwrap();
+        let leftover_tmp: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "tmp"))
+            .collect();
+        assert!(
+            leftover_tmp.is_empty(),
+            "no .tmp file should remain after a successful atomic write: {leftover_tmp:?}"
+        );
     }
 }
