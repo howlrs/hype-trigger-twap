@@ -20,7 +20,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 use crate::api::HlApi;
-use crate::client::{OrderStatusFill, PlaceOutcome, ValidatedMarketSnapshot};
+use crate::client::{OrderStatusFill, PlaceOutcome, ValidatedFill, ValidatedMarketSnapshot};
 use crate::errors::{HlError, RejectionKind};
 use crate::format::{human, round_size, taker_limit_price};
 use crate::types::{Address, CancelIntent, Cloid, OrderIntent, Side, Symbol, Tif};
@@ -46,9 +46,52 @@ pub fn min_notional_gate() -> Decimal {
 const STALE_BOOK_RETRIES: u32 = 3;
 const STALE_BOOK_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Retries when recovering a resting order's fill via `orderStatus` (§8).
+/// Retries when recovering a resting order's fill via `orderStatus` (§8, T3).
+///
+/// This is UNRELATED to the W1 unknownOid resend policy below — a resting
+/// order is known to exist (HL gave us its oid), so this loop is purely
+/// "keep asking until the status is terminal," with no safe-resend decision
+/// involved.
 const ORDER_STATUS_RETRIES: u32 = 3;
 const ORDER_STATUS_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+
+/// W1 unknownOid safe-resend policy (Issue #7, PM-decided, binding).
+///
+/// HL's `orderStatus` carries no documented read-after-write guarantee
+/// immediately after `/exchange` (see docs/DEVELOPMENT.md). A single
+/// `unknownOid` observation is therefore NOT proof the order never landed —
+/// it may simply not be visible yet. Treating the first `unknownOid` as
+/// definitive (the pre-Issue-#7 behaviour: 3 retries × 500ms = 1.5s) risked a
+/// resend racing the order's own propagation, which would double-place it.
+///
+/// The tightened policy requires BOTH:
+/// - at least [`UNKNOWN_OID_MIN_CONSECUTIVE`] consecutive `unknownOid`
+///   responses (no live/terminal observation in between — a single non-
+///   unknownOid response resets the streak and aborts outcome-unknown), AND
+/// - at least [`UNKNOWN_OID_MIN_WINDOW`] of wall-clock time elapsed between
+///   the FIRST and LAST `unknownOid` observation in that streak.
+///
+/// Anything else — fewer than the minimum consecutive observations, a mixed
+/// sequence (an `unknownOid` followed by a live/terminal response), or
+/// exhausting the retry budget before the window closes — aborts
+/// outcome-unknown (`Err`), which `run_twap` maps to a hard stop (exit 1).
+const UNKNOWN_OID_MIN_CONSECUTIVE: u32 = 3;
+const UNKNOWN_OID_MIN_WINDOW: Duration = Duration::from_secs(2);
+
+/// Poll interval while accumulating the unknownOid streak.
+///
+/// `UNKNOWN_OID_MIN_CONSECUTIVE` observations span `MIN_CONSECUTIVE - 1`
+/// intervals (the elapsed window is measured from the FIRST observation to
+/// the LAST, not from the start of polling). With 3 observations spaced
+/// 1100ms apart that is 2 × 1100ms = 2.2s, comfortably clearing the 2s
+/// window rather than sitting exactly on the boundary.
+const UNKNOWN_OID_POLL_INTERVAL: Duration = Duration::from_millis(1100);
+
+/// Hard cap on how long `reconcile_by_cloid` may keep polling before giving
+/// up even if the streak has not resolved either way. Generous relative to
+/// `UNKNOWN_OID_MIN_WINDOW` so a healthy 2s-window resend is never starved,
+/// while still bounding the worst case.
+const UNKNOWN_OID_MAX_ATTEMPTS: u32 = 8;
 
 pub const READ_ONLY_BANNER: &str = "=== READ-ONLY MODE: NO ORDERS ARE SENT ===";
 
@@ -424,8 +467,13 @@ pub async fn fetch_fresh_book(
 /// precisely the accident this recovery path exists to prevent. So only a
 /// terminal status is adopted; a non-terminal one keeps retrying, and running
 /// out of retries is a hard stop, deliberately the safe side.
+///
+/// Issue #7: also cross-checks the response's coin/side against `plan` —
+/// oid is trivially correct (we queried by it), but a coin/side mismatch
+/// means the response does not describe the order we placed.
 async fn poll_terminal_status(
     client: &dyn HlApi,
+    plan: &TwapPlan,
     user: &Address,
     oid: crate::types::OrderId,
 ) -> Result<OrderStatusFill, HlError> {
@@ -433,6 +481,7 @@ async fn poll_terminal_status(
     for attempt in 0..ORDER_STATUS_RETRIES {
         match client.fetch_order_status(user, oid).await {
             Ok(Some(st)) if st.is_terminal() => {
+                st.cross_check(plan.symbol.as_str(), &plan.side, None)?;
                 tracing::info!(
                     oid = %oid,
                     filled = %human(st.filled_sz),
@@ -497,7 +546,7 @@ async fn recover_resting_fill(
 
     // F1: orderStatus must be queried as the MASTER, not the agent.
     let user = plan.status_user()?;
-    poll_terminal_status(client, user, oid).await
+    poll_terminal_status(client, plan, user, oid).await
 }
 
 /// How many times a place may be re-signed and re-sent after an AMBIGUOUS
@@ -547,25 +596,24 @@ async fn place_slice_reconciled(
     let mut attempt = 0u32;
     loop {
         let send_err = match client.place_order_once(intent, plan.asset_index).await {
-            Ok((
-                nonce,
-                PlaceOutcome::Filled {
-                    total_sz, avg_px, ..
-                },
-            )) => {
+            Ok((nonce, outcome @ PlaceOutcome::Filled { .. })) => {
+                // Issue #7: the exchange response is a trusted boundary —
+                // overfill, non-positive avgPx, and a fill outside the
+                // signed limit are all hard errors here, never credited.
+                let vf = ValidatedFill::try_from_place(&outcome, intent)?;
                 tracing::debug!(nonce, "place acknowledged");
                 return Ok(SliceOutcome {
-                    sz: total_sz,
-                    px: avg_px,
+                    sz: vf.filled_sz,
+                    px: vf.avg_px.unwrap_or(intent.px),
                 });
             }
             Ok((_, PlaceOutcome::Resting { oid })) => {
                 let st = recover_resting_fill(client, plan, intent.cloid, oid).await?;
+                let vf = ValidatedFill::try_from_status(&st, intent)?;
                 // T5: credit at HL's realised average, not at our limit.
-                let px = st.avg_px.unwrap_or(intent.px);
                 return Ok(SliceOutcome {
-                    sz: st.filled_sz,
-                    px,
+                    sz: vf.filled_sz,
+                    px: vf.avg_px.unwrap_or(intent.px),
                 });
             }
             // Exchange rejections are decisions, not ambiguity — propagate.
@@ -586,19 +634,19 @@ async fn place_slice_reconciled(
         tokio::time::sleep(RECONCILE_DELAY).await;
 
         let user = plan.status_user()?;
-        match reconcile_by_cloid(client, user, intent.cloid).await {
+        match reconcile_by_cloid(client, plan, user, intent.cloid).await {
             // HL has it, and it is settled — adopt that as the truth.
             Ok(Some(st)) => {
+                let vf = ValidatedFill::try_from_status(&st, intent)?;
                 tracing::info!(
                     cloid = %intent.cloid,
-                    filled = %human(st.filled_sz),
+                    filled = %human(vf.filled_sz),
                     status = %st.status,
                     "reconciled: HL had the order; no resend"
                 );
-                let px = st.avg_px.unwrap_or(intent.px);
                 return Ok(SliceOutcome {
-                    sz: st.filled_sz,
-                    px,
+                    sz: vf.filled_sz,
+                    px: vf.avg_px.unwrap_or(intent.px),
                 });
             }
             // HL never received it — safe to re-sign with a fresh nonce.
@@ -632,36 +680,89 @@ async fn place_slice_reconciled(
     }
 }
 
-/// Ask HL whether it holds `cloid`, retrying until the answer is unambiguous.
+/// Ask HL whether it holds `cloid`, retrying until the answer is unambiguous
+/// under the Issue #7 W1 safe-resend policy.
 ///
-/// `Ok(Some(st))` — HL has the order in a TERMINAL state.
-/// `Ok(None)`     — HL definitively does not know the cloid (`unknownOid`).
-/// `Err(_)`       — could not establish either, including "HL has it but it is
-///                  still open", which is NOT a safe basis for a resend.
+/// `Ok(Some(st))` — HL has the order in a TERMINAL state; adopt it, no resend.
+/// `Ok(None)`     — the unknownOid streak cleared BOTH thresholds
+///                  ([`UNKNOWN_OID_MIN_CONSECUTIVE`] consecutive observations
+///                  spanning at least [`UNKNOWN_OID_MIN_WINDOW`]) — safe to
+///                  resend with a fresh nonce.
+/// `Err(_)`       — could not establish either. This covers every other
+///                  case: HL has it but it is still open/non-terminal, a
+///                  mixed sequence (an unknownOid streak broken by a live
+///                  response resets the streak), or the streak never
+///                  cleared both thresholds before the attempt budget ran
+///                  out. None of these is a safe basis for a resend.
 async fn reconcile_by_cloid(
     client: &dyn HlApi,
+    plan: &TwapPlan,
     user: &Address,
     cloid: Cloid,
 ) -> Result<Option<OrderStatusFill>, HlError> {
     let mut last_err: Option<String> = None;
-    for attempt in 0..ORDER_STATUS_RETRIES {
+    // Consecutive unknownOid streak tracking (W1 tightened policy): reset to
+    // `None` by ANY non-unknownOid, non-terminal observation, since a mixed
+    // sequence is not a safe basis for a resend even if the streak had
+    // already cleared the count threshold.
+    let mut streak_start: Option<tokio::time::Instant> = None;
+    let mut streak_count: u32 = 0;
+
+    for attempt in 0..UNKNOWN_OID_MAX_ATTEMPTS {
         match client.fetch_order_status_by_cloid(user, cloid).await {
-            Ok(Some(st)) if st.is_terminal() => return Ok(Some(st)),
+            Ok(Some(st)) if st.is_terminal() => {
+                st.cross_check(plan.symbol.as_str(), &plan.side, Some(cloid))?;
+                return Ok(Some(st));
+            }
             Ok(Some(st)) => {
                 // The order exists and is still working. A resend here would
-                // duplicate it, so keep waiting for it to settle.
+                // duplicate it, so this is never a safe-resend basis — and it
+                // breaks any unknownOid streak in progress (a mixed sequence
+                // is exactly what the tightened policy refuses to trust).
                 last_err = Some(format!("order is live but non-terminal ('{}')", st.status));
+                streak_start = None;
+                streak_count = 0;
             }
-            Ok(None) => return Ok(None),
-            Err(e) => last_err = Some(e.to_string()),
+            Ok(None) => {
+                let now = tokio::time::Instant::now();
+                streak_count += 1;
+                let start = *streak_start.get_or_insert(now);
+                let elapsed = now.saturating_duration_since(start);
+                tracing::debug!(
+                    cloid = %cloid,
+                    streak_count,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "unknownOid observed; accumulating safe-resend streak"
+                );
+                if streak_count >= UNKNOWN_OID_MIN_CONSECUTIVE && elapsed >= UNKNOWN_OID_MIN_WINDOW
+                {
+                    return Ok(None);
+                }
+                last_err = Some(format!(
+                    "unknownOid streak at {streak_count}/{UNKNOWN_OID_MIN_CONSECUTIVE} \
+                     observations, {}ms/{}ms window",
+                    elapsed.as_millis(),
+                    UNKNOWN_OID_MIN_WINDOW.as_millis()
+                ));
+            }
+            Err(e) => {
+                last_err = Some(e.to_string());
+                streak_start = None;
+                streak_count = 0;
+            }
         }
-        if attempt + 1 < ORDER_STATUS_RETRIES {
-            tokio::time::sleep(ORDER_STATUS_RETRY_INTERVAL).await;
+        if attempt + 1 < UNKNOWN_OID_MAX_ATTEMPTS {
+            tokio::time::sleep(UNKNOWN_OID_POLL_INTERVAL).await;
         }
     }
-    Err(HlError::InvalidResponse(
-        last_err.unwrap_or_else(|| "no detail".into()),
-    ))
+    Err(HlError::InvalidResponse(format!(
+        "reconciliation for cloid {cloid} could not establish a safe-resend basis \
+         ({}); a resend here risks a duplicate fill — \
+         check your fills on Hyperliquid before re-running \
+         (see docs/DEVELOPMENT.md \"orderStatus の read-after-write に関する注意\" for the \
+         propagation-window policy this enforces)",
+        last_err.unwrap_or_else(|| "no detail".into())
+    )))
 }
 
 /// Run the TWAP loop (§8).
@@ -1379,11 +1480,30 @@ mod loop_tests {
         })
     }
 
+    /// Default oid/coin/side match `plan()`'s HYPE/Long order, so existing
+    /// tests that don't care about the cross-check keep passing it for free.
     fn status(filled_sz: Decimal, avg_px: Option<Decimal>, st: &str) -> OrderStatusFill {
+        status_full(filled_sz, avg_px, st, OrderId(77), None, "HYPE", "B")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn status_full(
+        filled_sz: Decimal,
+        avg_px: Option<Decimal>,
+        st: &str,
+        oid: OrderId,
+        cloid: Option<Cloid>,
+        coin: &str,
+        side: &str,
+    ) -> OrderStatusFill {
         OrderStatusFill {
             filled_sz,
             avg_px,
             status: st.into(),
+            oid,
+            cloid,
+            coin: coin.into(),
+            side: side.into(),
         }
     }
 
@@ -1844,14 +1964,26 @@ mod loop_tests {
 
     #[tokio::test(start_paused = true)]
     async fn f_run_breaks_early_once_filled_reaches_the_adjusted_total() {
-        // Slice 1 over-fills relative to its own share (HL filled the whole
-        // remaining size). The loop must stop immediately rather than keep
-        // sending slices that would push past the target.
+        // Single-slice plan whose one order fills exactly its (also the
+        // run's) full target. The loop must stop immediately after slice 1
+        // rather than attempt a slice 2 that does not exist.
+        //
+        // Issue #7: a fill can never legitimately exceed the intent's own
+        // signed `sz`, so this no longer scripts a "slice fills the whole
+        // 50-coin run target in one 5-coin order" scenario — that shape is
+        // now (correctly) a hard-error overfill, covered separately by
+        // `w7_overfill_relative_to_intent_hard_stops_before_next_slice`.
         let api = ScriptedApi::new()
             .with_default_book(book_at(dec!(49.9), dec!(50.1)))
             .push_place(filled(dec!(50), dec!(50)));
 
-        let report = run_twap(&api, &plan(false)).await;
+        let mut p = plan(false);
+        p.slices = 1;
+        p.per_slice = dec!(50);
+        p.total_adjusted = dec!(50);
+        p.total_requested = dec!(50);
+
+        let report = run_twap(&api, &p).await;
 
         assert_eq!(api.place_count(), 1, "must break after the target is met");
         assert_eq!(report.filled, dec!(50));
@@ -1901,13 +2033,18 @@ mod loop_tests {
 
     #[tokio::test(start_paused = true)]
     async fn w1_unknown_oid_means_hl_never_got_it_so_a_fresh_nonce_resend_is_safe() {
-        // The POST failed BEFORE HL saw it. `unknownOid` proves the order does
-        // not exist, so re-signing with a FRESH nonce is safe — and required,
-        // since the old nonce may have been burned.
+        // The POST failed BEFORE HL saw it. Issue #7's tightened policy
+        // requires >= 3 CONSECUTIVE unknownOid observations spanning >= 2s
+        // before a resend is considered safe — a single `unknownOid` is no
+        // longer enough, since HL's orderStatus carries no documented
+        // read-after-write guarantee. Once the streak clears both
+        // thresholds, re-signing with a FRESH nonce is safe and required.
         let api = ScriptedApi::new()
             .with_default_book(book_at(dec!(49.9), dec!(50.1)))
             .push_place(Err(HlError::Network("connection refused".into())))
-            .push_status(Ok(None)) // unknownOid
+            .push_status(Ok(None)) // unknownOid #1
+            .push_status(Ok(None)) // unknownOid #2
+            .push_status(Ok(None)) // unknownOid #3 — streak + 2s window clear
             .push_place(filled(dec!(5), dec!(50)));
 
         let mut p = plan(false);
@@ -1942,11 +2079,13 @@ mod loop_tests {
     async fn w1_unresolvable_ambiguity_hard_stops_instead_of_guessing() {
         // The send failed and reconciliation cannot establish what happened.
         // The order may or may not be live, so the only safe move is to stop
-        // and tell the operator to check their fills.
+        // and tell the operator to check their fills. Every reconciliation
+        // attempt errors, so the streak never accumulates and the attempt
+        // budget (`UNKNOWN_OID_MAX_ATTEMPTS`) is what ends the loop.
         let mut api = ScriptedApi::new()
             .with_default_book(book_at(dec!(49.9), dec!(50.1)))
             .push_place(Err(HlError::Network("timed out".into())));
-        for _ in 0..ORDER_STATUS_RETRIES {
+        for _ in 0..UNKNOWN_OID_MAX_ATTEMPTS {
             api = api.push_status(Err(HlError::Network("info also down".into())));
         }
 
@@ -1971,12 +2110,16 @@ mod loop_tests {
 
     #[tokio::test(start_paused = true)]
     async fn w1_resend_is_bounded_and_gives_up_safely() {
-        // HL keeps not receiving the order. The resend loop must be bounded
+        // HL keeps not receiving the order — each attempt clears a full
+        // 3-consecutive/2s unknownOid streak, so the resend is judged safe
+        // every time. The OUTER resend-attempt loop must still be bounded
         // rather than hammering the exchange forever.
         let mut api = ScriptedApi::new().with_default_book(book_at(dec!(49.9), dec!(50.1)));
         for _ in 0..(PLACE_RESEND_LIMIT + 1) {
             api = api
                 .push_place(Err(HlError::Network("connection refused".into())))
+                .push_status(Ok(None))
+                .push_status(Ok(None))
                 .push_status(Ok(None));
         }
 
@@ -2046,6 +2189,332 @@ mod loop_tests {
             .clone()
             .expect("must abort without a master");
         assert!(reason.contains("master address"), "{reason}");
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    // === Issue #7: exchange responses are a trusted boundary ===
+
+    /// A single-slice plan whose slice size matches the plan's `total_adjusted`,
+    /// so any `PlaceOutcome::Filled` with `total_sz` above `per_slice` is a
+    /// genuine overfill relative to the signed `OrderIntent.sz`.
+    fn single_slice_plan() -> TwapPlan {
+        let mut p = plan(false);
+        p.slices = 1;
+        p.per_slice = dec!(5);
+        p.total_adjusted = dec!(5);
+        p.total_requested = dec!(5);
+        p
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn w7_overfill_relative_to_intent_hard_stops_before_next_slice() {
+        // HL reports totalSz greater than the sz we signed. This must never
+        // be clamped or partially credited — it is a hard-stop, and no
+        // further slice may be attempted.
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(filled(dec!(5.01), dec!(50)));
+
+        let report = run_twap(&api, &single_slice_plan()).await;
+
+        assert_eq!(
+            api.place_count(),
+            1,
+            "no further slice after the bad response"
+        );
+        assert_eq!(
+            report.filled,
+            Decimal::ZERO,
+            "the bad fill must not be credited"
+        );
+        let reason = report.abort_reason.clone().expect("must hard-stop");
+        assert!(reason.contains("exceeds intent size"), "{reason}");
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn w7_zero_avg_px_on_a_nonzero_fill_hard_stops_before_next_slice() {
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(filled(dec!(5), dec!(0)));
+
+        let report = run_twap(&api, &single_slice_plan()).await;
+
+        assert_eq!(
+            api.place_count(),
+            1,
+            "no further slice after the bad response"
+        );
+        assert_eq!(report.filled, Decimal::ZERO);
+        let reason = report.abort_reason.clone().expect("must hard-stop");
+        assert!(reason.contains("not positive"), "{reason}");
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn w7_negative_avg_px_hard_stops_before_next_slice() {
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(filled(dec!(5), dec!(-1)));
+
+        let report = run_twap(&api, &single_slice_plan()).await;
+
+        assert_eq!(api.place_count(), 1);
+        assert_eq!(report.filled, Decimal::ZERO);
+        assert!(report.abort_reason.is_some());
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn w7_long_fill_priced_above_the_limit_hard_stops_before_next_slice() {
+        // plan() is Side::Long. taker_limit_price will be computed and
+        // signed as intent.px; a reported avgPx above that limit means the
+        // response does not describe an order we could have gotten.
+        let mut p = single_slice_plan();
+        p.slices = 3; // so a hard-stop-before-next-slice is observable
+        p.per_slice = dec!(5);
+        p.total_adjusted = dec!(15);
+        p.total_requested = dec!(15);
+        let limit = taker_limit_price(dec!(49.9), dec!(50.1), Side::Long, dec!(20), 2);
+
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(filled(dec!(5), limit + dec!(1)));
+
+        let report = run_twap(&api, &p).await;
+
+        assert_eq!(
+            api.place_count(),
+            1,
+            "must hard-stop before any further slice is attempted"
+        );
+        assert_eq!(report.filled, Decimal::ZERO);
+        let reason = report.abort_reason.clone().expect("must hard-stop");
+        assert!(reason.contains("long avgPx"), "{reason}");
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn w7_short_fill_priced_below_the_limit_hard_stops_before_next_slice() {
+        let mut p = single_slice_plan();
+        p.side = Side::Short;
+        p.slices = 3;
+        p.per_slice = dec!(5);
+        p.total_adjusted = dec!(15);
+        p.total_requested = dec!(15);
+        let limit = taker_limit_price(dec!(49.9), dec!(50.1), Side::Short, dec!(20), 2);
+
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(filled(dec!(5), limit - dec!(1)));
+
+        let report = run_twap(&api, &p).await;
+
+        assert_eq!(api.place_count(), 1);
+        assert_eq!(report.filled, Decimal::ZERO);
+        let reason = report.abort_reason.clone().expect("must hard-stop");
+        assert!(reason.contains("short avgPx"), "{reason}");
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn w7_recovered_resting_fill_overfill_hard_stops_before_next_slice() {
+        // The overfill check applies equally to the resting-order recovery
+        // path (T3/T5), not just the direct Filled path.
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(Ok(PlaceOutcome::Resting { oid: OrderId(77) }))
+            .push_status(Ok(Some(status(dec!(5.5), Some(dec!(49.5)), "filled"))));
+
+        let report = run_twap(&api, &single_slice_plan()).await;
+
+        assert_eq!(
+            api.place_count(),
+            1,
+            "no further slice after the bad response"
+        );
+        assert_eq!(report.filled, Decimal::ZERO);
+        let reason = report.abort_reason.clone().expect("must hard-stop");
+        assert!(reason.contains("exceeds intent size"), "{reason}");
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn w7_ioc_cancel_rejected_zero_fill_settles_cleanly_no_resend_no_hard_stop() {
+        // Acceptance criteria: iocCancelRejected with a zero fill is a
+        // normal SETTLED outcome, not an error and not ambiguous. This
+        // exercises it through the resting-order recovery path exactly as a
+        // real IOC-rests-then-gets-cancelled sequence would.
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(Ok(PlaceOutcome::Resting { oid: OrderId(77) }))
+            .push_status(Ok(Some(status(dec!(0), None, "iocCancelRejected"))));
+
+        let mut p = plan(false);
+        p.slices = 1;
+        p.per_slice = dec!(5);
+        p.total_adjusted = dec!(5);
+        p.total_requested = dec!(5);
+
+        let report = run_twap(&api, &p).await;
+
+        assert_eq!(report.filled, Decimal::ZERO);
+        assert_eq!(
+            report.abort_reason, None,
+            "a zero-fill iocCancelRejected is settled, not an abort"
+        );
+        assert_eq!(report.exit_code(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn w7_remaining_greater_than_orig_sz_from_recovery_hard_stops_before_next_slice() {
+        // The malformed orderStatus response (remaining > origSz) surfaces
+        // as a parse-time InvalidResponse from `fetch_order_status` on every
+        // retry attempt (a malformed response does not self-correct), which
+        // must propagate as a hard stop with zero further slices — never
+        // silently clamped to a zero fill (the pre-Issue-#7 behaviour).
+        let malformed = || {
+            Err(HlError::InvalidResponse(
+                "orderStatus: remaining 15 exceeds origSz 10 (oid Some(77)) — \
+                 malformed response, refusing to clamp"
+                    .into(),
+            ))
+        };
+        let mut api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(Ok(PlaceOutcome::Resting { oid: OrderId(77) }));
+        for _ in 0..ORDER_STATUS_RETRIES {
+            api = api.push_status(malformed());
+        }
+
+        let report = run_twap(&api, &single_slice_plan()).await;
+
+        assert_eq!(
+            api.place_count(),
+            1,
+            "no further slice after the bad response"
+        );
+        assert_eq!(report.filled, Decimal::ZERO);
+        let reason = report.abort_reason.clone().expect("must hard-stop");
+        assert!(reason.contains("exceeds origSz"), "{reason}");
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn w7_unknown_status_from_recovery_is_fail_closed_no_further_placement() {
+        // A status HL adds later (not in our vocabulary) must never be
+        // adopted as terminal — the recovery loop keeps retrying, and
+        // exhausting the retry budget without ever seeing a KNOWN terminal
+        // status is a hard stop, never a guessed credit.
+        let mut api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(Ok(PlaceOutcome::Resting { oid: OrderId(77) }));
+        for _ in 0..ORDER_STATUS_RETRIES {
+            api = api.push_status(Ok(Some(status(
+                dec!(3),
+                Some(dec!(49.5)),
+                "someBrandNewStatusHlAddsLater",
+            ))));
+        }
+
+        let report = run_twap(&api, &single_slice_plan()).await;
+
+        assert_eq!(
+            api.place_count(),
+            1,
+            "no further placement on an unknown status"
+        );
+        assert_eq!(report.filled, Decimal::ZERO);
+        assert!(report.abort_reason.is_some());
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn w7_delayed_visibility_unknown_then_terminal_causes_no_duplicate_place() {
+        // Delayed-visibility test (Issue #7 acceptance criteria): the first
+        // several `orderStatus(cloid)` calls after an ambiguous send return
+        // unknownOid — not enough to clear the 3-consecutive/2s threshold —
+        // and then a later call returns a terminal fill. The resend must NOT
+        // fire, even though the early unknownOid observations looked like a
+        // safe-resend candidate in progress.
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(Err(HlError::Network("operation timed out".into())))
+            .push_status(Ok(None)) // unknownOid #1
+            .push_status(Ok(None)) // unknownOid #2 — streak in progress
+            .push_status(Ok(Some(status(dec!(5), Some(dec!(50.05)), "filled"))));
+
+        let report = run_twap(&api, &single_slice_plan()).await;
+
+        assert_eq!(
+            api.place_count(),
+            1,
+            "the order became visible before the safe-resend threshold cleared; \
+             must NOT resend and must NOT duplicate the place"
+        );
+        assert_eq!(report.filled, dec!(5));
+        assert_eq!(report.avg_px, Some(dec!(50.05)));
+        assert_eq!(report.abort_reason, None);
+        assert_eq!(report.exit_code(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn w7_unknown_oid_streak_broken_by_a_live_response_aborts_outcome_unknown() {
+        // A mixed sequence — unknownOid, unknownOid, then a LIVE (non-
+        // terminal) response — must reset the streak and never be treated
+        // as a safe-resend basis, even though 2 consecutive unknownOid
+        // observations had already been seen.
+        let mut api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(Err(HlError::Network("timed out".into())))
+            .push_status(Ok(None)) // unknownOid #1
+            .push_status(Ok(None)) // unknownOid #2 — streak in progress
+            .push_status(Ok(Some(status(dec!(1), Some(dec!(50)), "open")))); // live, non-terminal
+        for _ in 0..(UNKNOWN_OID_MAX_ATTEMPTS - 3) {
+            api = api.push_status(Ok(Some(status(dec!(1), Some(dec!(50)), "open"))));
+        }
+
+        let report = run_twap(&api, &single_slice_plan()).await;
+
+        assert_eq!(api.place_count(), 1, "must not resend on a mixed sequence");
+        assert_eq!(report.filled, Decimal::ZERO);
+        let reason = report
+            .abort_reason
+            .clone()
+            .expect("must abort outcome-unknown");
+        assert!(reason.contains("check your fills"), "{reason}");
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn w7_orderstatus_cross_check_rejects_a_coin_mismatch_and_hard_stops() {
+        // The response claims a different coin than the one we queried
+        // about — a defence against a proxy/cache serving the wrong id or a
+        // client bug, not something HL itself would normally do.
+        let mismatched = status_full(
+            dec!(5),
+            Some(dec!(49.9)),
+            "filled",
+            OrderId(77),
+            None,
+            "BTC", // plan is HYPE
+            "B",
+        );
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(Ok(PlaceOutcome::Resting { oid: OrderId(77) }))
+            .push_status(Ok(Some(mismatched)));
+
+        let report = run_twap(&api, &single_slice_plan()).await;
+
+        assert_eq!(
+            api.place_count(),
+            1,
+            "no further slice after a cross-check failure"
+        );
+        assert_eq!(report.filled, Decimal::ZERO);
+        let reason = report.abort_reason.clone().expect("must hard-stop");
+        assert!(reason.contains("coin mismatch"), "{reason}");
         assert_eq!(report.exit_code(), 1);
     }
 }

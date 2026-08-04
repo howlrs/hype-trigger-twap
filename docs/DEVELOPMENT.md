@@ -4,25 +4,27 @@
 
 ```bash
 cargo build --release
-cargo test                                  # 単体 + 結合テスト (197 件)
+cargo test                                  # 単体 + 結合テスト (275 件)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
 この 4 つがすべてクリーンであることが、変更をコミットする際の最低条件です。
 
-**ネットワークに触れるテストはありません。** `/info` と `/exchange` は `mockito` でモックし、
+**通常のテストスイートはネットワークに触れません。** `/info` と `/exchange` は `mockito` でモックし、
 スライスループは後述のトレイトシーム経由でスクリプト化した偽実装に対して検証しています。
+唯一の例外が `tests/status_vocabulary_conformance.rs` の `#[ignore]` 付きスモークテストで、
+実際の Hyperliquid API を叩きます (詳細は後述の「orderStatus ステータス表の更新手順」参照)。
 
 ## モジュール構成
 
 | ファイル | 行数 | 役割 |
 |---|---|---|
-| `src/main.rs` | 819 | CLI 定義 (clap)、起動シーケンス、事前検証、終了コード |
-| `src/twap.rs` | 2051 | スライスループ、サイジング、キャッチアップ、約定照合、レポート |
-| `src/client.rs` | 1417 | Hyperliquid REST クライアント (`/info`, `/exchange`)、応答解析、再試行方針、`ValidatedMarketSnapshot` (板の検証境界) |
+| `src/main.rs` | 1042 | CLI 定義 (clap)、起動シーケンス、事前検証、終了コード |
+| `src/twap.rs` | 2518 | スライスループ、サイジング、キャッチアップ、約定照合 (`ValidatedFill` 経由)、W1 unknownOid 安全再送ポリシー、レポート |
+| `src/client.rs` | 2009 | Hyperliquid REST クライアント (`/info`, `/exchange`)、応答解析、再試行方針、`ValidatedMarketSnapshot` (板の検証境界)、`ORDER_STATUS_VOCABULARY` (status 語彙表)、`ValidatedFill` (約定の検証境界) |
 | `src/eip712.rs` | 370 | **移植物** — EIP-712 型定義、msgpack パック、action_hash |
-| `src/trigger.rs` | 520 | 価格・時間トリガーの待機ループ (`&dyn HlApi` シーム、`ValidatedMarketSnapshot` 検証込み) |
+| `src/trigger.rs` | 1041 | 価格・時間トリガーの待機ループ (`&dyn HlApi` シーム、`ValidatedMarketSnapshot` 検証込み) |
 | `src/format.rs` | 359 | 価格・数量の丸め (szDecimals、有効数字、方向制御)、テイカー指値の算出 |
 | `src/api.rs` | 292 | `HlApi` トレイト (テストシーム) と `ScriptedApi` (テスト用偽実装) |
 | `src/types.rs` | 292 | `Side` / `Tif` / `Cloid` / `Symbol` / `OrderBook` などのドメイン型 |
@@ -30,15 +32,16 @@ cargo fmt --check
 | `src/errors.rs` | 129 | `HlError` と `RejectionKind` (拒否メッセージの分類) |
 | `src/lib.rs` | 15 | 結合テストから内部モジュールを参照するためのライブラリターゲット |
 
-テストの内訳 (Issue #6 で `ValidatedMarketSnapshot` のテストを追加):
+テストの内訳 (Issue #7 で `ValidatedFill` / status 語彙 / W1 再送ポリシーのテストを追加):
 
 | ターゲット | 件数 | 内容 |
 |---|---|---|
-| `src/lib.rs` (単体) | 154 | 純関数の算術、丸め、応答解析、署名、`run_twap` のループレベルテスト、`ValidatedMarketSnapshot` の検証・トリガーの `ScriptedApi` テスト |
-| `src/main.rs` (単体) | 21 | CLI 引数の検証、`--help` の内容、起動シーケンス |
+| `src/lib.rs` (単体) | 206 | 純関数の算術、丸め、応答解析、署名、`run_twap` のループレベルテスト、`ValidatedMarketSnapshot` / `ValidatedFill` の検証、status 語彙の全件終端性テスト、トリガーの `ScriptedApi` テスト |
+| `src/main.rs` (単体) | 31 | CLI 引数の検証、`--help` の内容、起動シーケンス |
 | `tests/exchange_parse.rs` | 16 | mockito による `/exchange` 応答の解析と再試行方針 |
 | `tests/reconcile_and_probe.rs` | 19 | 曖昧な送信の照合、`userRole` 照会、トリガーの end-to-end |
 | `tests/signing_cross_check.rs` | 3 | Python SDK 由来の 10 ベクタに対する署名検証 |
+| `tests/status_vocabulary_conformance.rs` | 2 | **`#[ignore]`** — 実 Hyperliquid API に対する orderStatus / meta の疎通・形状スモークテスト |
 
 ## 署名コアの扱い (重要)
 
@@ -108,6 +111,62 @@ pub trait HlApi {
 5. **数量は切り捨てる** — 目標量を超過しないこと
 6. **終端ステータスのみを約定量として採用する** — `open` のまま計上しないこと
 7. **`--duration` 経過後は発注しない** — 最終スライスも例外にしないこと
+8. **取引所応答は信頼境界として検証する** (Issue #7) — `filled` は `0 <= filled <= intent.sz` を
+   満たし、`avgPx` は正の値でサイド別の指値内に収まること。`orderStatus` の `remaining` は
+   `0 <= remaining <= origSz` を満たすこと。いずれかを満たさない応答は握りつぶさず即座に hard-stop
+   すること (クランプ厳禁)
+
+## orderStatus ステータス表の更新手順 (Issue #7)
+
+`src/client.rs` の `ORDER_STATUS_VOCABULARY` (const配列 `(&str, bool)` のテーブル) が、
+Hyperliquid が返しうる全 `orderStatus` 値を terminal (`true`) / non-terminal (`false`) に
+分類した唯一の正とする一覧です。`OrderStatusFill::is_terminal()` はこの表を正規化
+(小文字化・"cancelled"→"canceled" のスペル統一) して照合するだけで、表にない値は
+**必ず non-terminal 扱いのまま fail-closed** になります (未知 status を terminal と
+誤認すると、まだ約定しうる注文の約定量を確定値として採用してしまい、次スライス以降が
+過剰発注になる — これが Issue #7 以前の実際のバグパターンでした)。
+
+Hyperliquid が新しい status を追加した場合の更新手順:
+
+1. 公式ドキュメント (https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint)
+   で新しい status 文字列と、それが「注文が二度と約定しない」ことを意味するか
+   ("terminal") を確認する。`*Rejected` (発注時点で拒否 = 生成されなかった) と
+   `*Canceled` (取消済み) は基本的にすべて terminal。`open` / `triggered` のような
+   「まだ生きている」状態のみ non-terminal
+2. `src/client.rs` の `ORDER_STATUS_VOCABULARY` にエントリを追加する
+   (`("newStatusName", true_or_false)`)
+3. `client::tests::every_official_status_has_terminal_semantics` の該当リスト
+   (`terminal` または `non_terminal` の配列) に同じ名前を追加する。このテストは
+   `ORDER_STATUS_VOCABULARY.len()` とテスト内リストの合計件数を突き合わせるため、
+   表に足してテストに足し忘れるとテスト自体が失敗する
+4. `cargo test --lib client::` で確認し、`cargo test --all-targets` をフルで通す
+5. 可能であれば `cargo test --test status_vocabulary_conformance -- --ignored --nocapture`
+   を手動実行し、実 API との疎通が壊れていないことも確認する (このテストはドリフトを
+   自動検出できるわけではない — 新 status を実際に踏むには本物の注文が必要なため。
+   あくまで「この client が今のレスポンス形状をまだ正しくパースできるか」の疎通確認)
+
+## orderStatus の read-after-write に関する注意 (Issue #7)
+
+**Hyperliquid の `orderStatus` には、`/exchange` 送信直後の read-after-write 保証が
+公式資料上どこにも明記されていません。** つまり `/exchange order` への POST が返ってきた
+直後に同じ注文を `orderStatus` で照会しても、その注文がまだ HL 側で可視化されておらず
+`unknownOid` が返る可能性がある、という前提を置く必要があります。
+
+これは W1 (曖昧な送信の再送判定) にとって重要です。`/exchange` はべき等でないため、
+POST がタイムアウト等で失敗した場合「実際に届いたが応答だけ失われた」のか
+「本当に届いていない」のかを `orderStatus` で確認してから再送を判断しますが、
+**`unknownOid` の 1 回の観測だけでは「本当に届いていない」ことの証明になりません**
+(read-after-write 保証がない以上、たまたま可視化が遅れているだけかもしれない)。
+
+そのため `src/twap.rs` の `reconcile_by_cloid` は単発の `unknownOid` では再送しません。
+連続 `UNKNOWN_OID_MIN_CONSECUTIVE` (3) 回以上の `unknownOid` 観測が、
+`UNKNOWN_OID_MIN_WINDOW` (2秒) 以上の壁時計時間にまたがって得られた場合のみ、
+「HL は本当にこの注文を受け取っていない」と判断して新しい nonce での再送を許可します。
+それ以外 — 観測回数不足、時間窓不足、途中で live/terminal な応答が混じった (streak が
+リセットされる)、リトライ上限 (`UNKNOWN_OID_MAX_ATTEMPTS`) に達した — はすべて
+outcome-unknown として hard-stop (exit code 1) します。二重約定は取り消せない一方、
+hard-stop はオペレーターが Hyperliquid 上で実際の約定を確認してから再実行すれば
+回復できるため、安全側に倒しています。
 
 ## 参考
 
