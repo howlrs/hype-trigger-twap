@@ -406,13 +406,17 @@ fn trigger_cfg(
     TriggerConfig {
         price,
         start_after,
-        // Short so the test finishes in real time without being flaky.
-        poll_interval: Duration::from_millis(20),
+        // C7: this file drives `wait_for_trigger` against a REAL (unpaused)
+        // clock over real (mockito) HTTP — a 20ms poll interval / 200ms
+        // grace margin already flaked once in CI (real HTTP round-trip
+        // latency + scheduler jitter can eat a meaningful fraction of a
+        // 20ms interval). Widened to a 200ms poll interval and a >=1s grace
+        // so scheduling/HTTP jitter cannot plausibly cross the threshold on
+        // its own, while still keeping every test here well under a few
+        // real seconds.
+        poll_interval: Duration::from_millis(200),
         max_book_age_ms: 3000,
-        // Real (unpaused) clock in this file — keep short so a persistent
-        // failure test finishes quickly instead of waiting out 30m of real
-        // time.
-        wait_network_grace: Duration::from_millis(200),
+        wait_network_grace: Duration::from_secs(1),
         expire_after: None,
     }
 }
@@ -555,7 +559,10 @@ async fn f4_time_wins_when_the_price_never_crosses() {
         .await;
 
     let client = read_only_client(&server);
-    let after = Duration::from_millis(200);
+    // C7: kept comfortably ABOVE `trigger_cfg`'s 200ms poll_interval so this
+    // is never a coincidental race against real HTTP round-trip time on the
+    // very first poll.
+    let after = Duration::from_secs(2);
     let reason = tokio::time::timeout(
         Duration::from_secs(10),
         wait_for_trigger(
@@ -577,13 +584,13 @@ async fn f4_time_wins_when_the_price_never_crosses() {
 #[tokio::test]
 async fn f4_persistent_poll_failures_hard_stop_the_wait_once_grace_is_exceeded() {
     // A persistently blind trigger must not sit silent forever (Issue #9:
-    // time-budgeted, not count-based). `trigger_cfg`'s grace is 200ms with a
-    // 20ms poll interval, so several 400s in a row exceed it.
+    // time-budgeted, not count-based). `trigger_cfg`'s grace is 1s with a
+    // 200ms poll interval, so several 400s in a row exceed it.
     let mut server = mockito::Server::new_async().await;
     // Each poll is a 400 (fatal, not retried inside the client), so one
     // response == one consecutive failure. `.expect(N)` here is a MINIMUM,
     // not exact — the grace is time-based, so the exact poll count needed to
-    // exceed it depends on real scheduling jitter around the 20ms interval.
+    // exceed it depends on real scheduling jitter around the 200ms interval.
     let m = server
         .mock("POST", "/info")
         .with_status(400)

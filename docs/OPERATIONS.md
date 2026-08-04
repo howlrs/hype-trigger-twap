@@ -506,8 +506,12 @@ override はできません — タイプミスの可能性を疑ってくださ
   「取引所が拒否」という表現にフォールバックします
 - **1 プロセス 1 銘柄です。** ポートフォリオ的な制御、既存ポジションの考慮
   (`reduce_only` は常に未設定)、HIP-3 の `dex:SYMBOL` 形式には対応していません
-- **テイカー専用です。** すべてのスライスがスプレッドを越え、テイカー手数料を支払います
-  (メイカー化は P1 として [issue #1](https://github.com/howlrs/hype-trigger-twap/issues/1) に起票済み)
+- **既定はテイカーですが、passive モードは実装済みです。** `--child-algo market`
+  (既定) はすべてのスライスがスプレッドを越え、テイカー手数料を支払います。
+  `--child-algo passive` はベスト bid/ask に ALO (post-only) 指値を置きますが、
+  スライス中の再クオートやタイムアウト時のテイカー切り替えは行いません —
+  未約定のまま次のスライスへ持ち越されるのみです
+  ([issue #1](https://github.com/howlrs/hype-trigger-twap/issues/1))
 - **testnet での実発注検証は未実施です。** Agent 署名注文に対する `orderStatus` の
   実挙動が唯一の未検証点です。初回は少額から始めてください
 - **単一ホスト内の単一 writer のみ保証します。** 同一ホスト・同一
@@ -515,12 +519,16 @@ override はできません — タイプミスの可能性を疑ってくださ
   またがる二重起動は検知できません。「単一 writer ロックと nonce の運用境界」
   節を参照し、trading process ごとに専用の API ウォレットを割り当ててください
 
-## 今後の予定 (P1)
+## 今後の予定
 
-**ベスト bid/ask 追従 (passive post-only)** — テイカー手数料とスリッページを削減するため、
-ベスト bid (ロング) / ベスト ask (ショート) に ALO (post-only) 指値を置いて追従するモードを
-追加します。実装方針と受け入れ条件は
-[issue #1](https://github.com/howlrs/hype-trigger-twap/issues/1) に記載しています。
+**対応済み: ベスト bid/ask 追従 (passive post-only)** — `--child-algo passive` で
+ベスト bid (ロング) / ベスト ask (ショート) に ALO (post-only) 指値を置いて
+テイカー手数料とスリッページを削減できます。ただし境界のみの再クオートに留まり
+(スライス中の再クオートは行わない)、タイムアウト時のテイカー切り替えフォールバックも
+未実装です。詳細は README の「Child-order algorithms」節、実装方針は
+[issue #1](https://github.com/howlrs/hype-trigger-twap/issues/1) を参照してください。
+
+今後の候補: スライス中の再クオート、タイムアウト時のテイカー切り替えフォールバック。
 
 当面スコープ外: WebSocket による約定取得、複数銘柄の同時執行、既存ポジションの考慮。
 (実行の再開・永続化は対応済みです — 「クラッシュ・再起動時の手順」を参照してください)

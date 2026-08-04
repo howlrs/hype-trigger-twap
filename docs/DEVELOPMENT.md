@@ -4,7 +4,7 @@
 
 ```bash
 cargo build --release
-cargo test                                  # 単体 + 結合テスト (289 件)
+cargo test                                  # 単体 + 結合テスト (424 件、うち 3 件は #[ignore])
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
@@ -20,30 +20,34 @@ cargo fmt --check
 
 | ファイル | 行数 | 役割 |
 |---|---|---|
-| `src/main.rs` | 1288 | CLI 定義 (clap)、起動シーケンス、トリガー発火直後のクロックずれ検証 (Issue #2、Finding 3 でこの位置に移動)、終了コード |
-| `src/twap.rs` | 3172 | スライスループ、サイジング、キャッチアップ、約定照合 (`ValidatedFill` 経由)、W1 unknownOid 安全再送ポリシー、`ExecutionDeadline` / `expiresAfter` / クロックずれ検証 (Issue #2)、板取得を残り期限でタイムアウトするラッパー (Issue #2 Finding 2)、レポート |
-| `src/client.rs` | 2043 | Hyperliquid REST クライアント (`/info`, `/exchange`)、応答解析、再試行方針、`ValidatedMarketSnapshot` (板の検証境界)、`ORDER_STATUS_VOCABULARY` (status 語彙表)、`ValidatedFill` (約定の検証境界)、`expiresAfter` の署名・送信 (Issue #2) |
-| `src/eip712.rs` | 370 | **移植物** — EIP-712 型定義、msgpack パック、action_hash (`expires_after` 引数を含む) |
+| `src/twap.rs` | 5751 | スライスループ、サイジング、キャッチアップ、約定照合 (`ValidatedFill` 経由)、W1 unknownOid 安全再送ポリシー、`ExecutionDeadline` / `expiresAfter` / クロックずれ検証 (Issue #2)、板取得を残り期限でタイムアウトするラッパー (Issue #2 Finding 2)、市場/passive 両アルゴリズムのスライス送信・累積 notional cap 再検証・ジャーナル連携、レポート |
+| `src/main.rs` | 3697 | CLI 定義 (clap)、起動シーケンス、トリガー発火直後のクロックずれ検証 (Issue #2、Finding 3 でこの位置に移動)、ロック/ジャーナル取得、`--resume` / `--abandon-incomplete-run` の再照合、終了コード |
+| `src/client.rs` | 2199 | Hyperliquid REST クライアント (`/info`, `/exchange`)、応答解析、再試行方針、`ValidatedMarketSnapshot` (板の検証境界)、`ORDER_STATUS_VOCABULARY` (status 語彙表)、`ValidatedFill` (約定の検証境界)、`expiresAfter` の署名・送信 (Issue #2) |
+| `src/journal.rs` | 1197 | クラッシュセーフな実行ジャーナル (Issue #4) — `Prepared`/`SubmittedUnknown`/`Acknowledged`/`Terminal` の JSONL 追記、`find_incomplete_run` (起動時の未完了検出、途切れた末尾行は許容しつつ真の破損は fail-closed)、`RunSummary` |
 | `src/trigger.rs` | 1041 | 価格・時間トリガーの待機ループ (`&dyn HlApi` シーム、`ValidatedMarketSnapshot` 検証込み) |
+| `src/risk.rs` | 661 | risk envelope (Issue #3) — スリッページ・限界値・notional cap (累積検証)・カスタムエンドポイントの https / loopback 検証 |
+| `src/lock.rs` | 648 | 単一 writer ロックと durable nonce HWM (Issue #5) — `flock` によるプロセス間排他、`NonceHwm::advance` (tmp+fsync+atomic rename) |
 | `src/format.rs` | 359 | 価格・数量の丸め (szDecimals、有効数字、方向制御)、テイカー指値の算出 |
+| `src/eip712.rs` | 370 | **移植物** — EIP-712 型定義、msgpack パック、action_hash (`expires_after` 引数を含む) |
 | `src/api.rs` | 306 | `HlApi` トレイト (テストシーム) と `ScriptedApi` (テスト用偽実装) |
 | `src/types.rs` | 292 | `Side` / `Tif` / `Cloid` / `Symbol` / `OrderBook` などのドメイン型 |
 | `src/signer.rs` | 274 | **移植物** — `Eip712AgentSigner` (alloy による署名、`expires_after` 引数を含む) |
 | `src/errors.rs` | 129 | `HlError` と `RejectionKind` (拒否メッセージの分類) |
-| `src/lib.rs` | 15 | 結合テストから内部モジュールを参照するためのライブラリターゲット |
+| `src/lib.rs` | 18 | 結合テストから内部モジュールを参照するためのライブラリターゲット |
 
-テストの内訳 (Issue #2 で `ExecutionDeadline` / `expiresAfter` / クロックずれ検証のテストを追加。
-レビュー修正 (Finding 1-3) で署名ベクタ生成スクリプトの実体化、板取得のタイムアウトラップ、
-クロックずれ検証の再配置に対するテストをさらに追加):
+テストの内訳 (issues #1-#10 の実装 (branch `feat/issues-1-10`) で journal/lock/risk の
+クラッシュセーフティ・累積 notional cap・passive (post-only) モード・loopback URL
+パース強化などに対するテストを大幅に追加。Issue #2 由来の `ExecutionDeadline` /
+`expiresAfter` / クロックずれ検証テストも含む):
 
 | ターゲット | 件数 | 内容 |
 |---|---|---|
-| `src/lib.rs` (単体) | 217 | 純関数の算術、丸め、応答解析、署名、`run_twap` のループレベルテスト、`ValidatedMarketSnapshot` / `ValidatedFill` の検証、status 語彙の全件終端性テスト、トリガーの `ScriptedApi` テスト、`ExecutionDeadline` / クロックずれ検証の単体テスト、期限を跨ぐ仮想時刻テスト (Issue #2)、単一の板取得が残り期限でタイムアウトされることを証明するテスト (Finding 2) |
-| `src/main.rs` (単体) | 33 | CLI 引数の検証、`--help` の内容、起動シーケンス、live time-only トリガーがデッドラインまでネットワークを叩かないことの回帰テスト、クロックずれ検証がトリガー発火直後に fail-closed することの call-site テスト (Finding 3) |
+| `src/lib.rs` (単体、`twap.rs`/`client.rs`/`journal.rs`/`lock.rs`/`risk.rs`/`trigger.rs`/`format.rs`/`types.rs`/`errors.rs` 等を含む) | 323 | 純関数の算術、丸め、応答解析、署名、`run_twap` のループレベルテスト (market/passive 両方)、`ValidatedMarketSnapshot` / `ValidatedFill` の検証、status 語彙の全件終端性テスト、トリガーの `ScriptedApi` テスト、`ExecutionDeadline` / クロックずれ検証、実行ジャーナルのクラッシュ復旧 (途切れた末尾行の許容・真の破損での fail-closed・run_id 衝突の排他制御)、nonce HWM のアトミック書き込み、risk envelope (累積 notional cap・loopback URL の userinfo バイパス対策) |
+| `src/main.rs` (単体) | 58 | CLI 引数の検証、`--help` の内容、起動シーケンス、`--resume` / `--abandon-incomplete-run` の再照合、live time-only トリガーがデッドラインまでネットワークを叩かないことの回帰テスト、クロックずれ検証がトリガー発火直後に fail-closed することの call-site テスト |
 | `tests/exchange_parse.rs` | 18 | mockito による `/exchange` 応答の解析と再試行方針、`expiresAfter` の body/署名一致 (Issue #2) |
 | `tests/reconcile_and_probe.rs` | 19 | 曖昧な送信の照合、`userRole` 照会、トリガーの end-to-end |
 | `tests/signing_cross_check.rs` | 3 | Python SDK 由来の 17 ベクタ (元 10 + `expiresAfter` 系 7、Issue #2) に対する署名検証 |
-| `tests/status_vocabulary_conformance.rs` | 2 | **`#[ignore]`** — 実 Hyperliquid API に対する orderStatus / meta の疎通・形状スモークテスト |
+| `tests/status_vocabulary_conformance.rs` | 3 | **すべて `#[ignore]`** — 実 Hyperliquid API に対する orderStatus / meta の疎通・形状スモークテスト |
 
 ## 署名コアの扱い (重要)
 
