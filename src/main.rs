@@ -828,7 +828,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     );
 
     // §8: the loop.
-    let plan = TwapPlan {
+    let original_plan = TwapPlan {
         symbol: symbol.clone(),
         side,
         asset_index: asset.asset_index,
@@ -855,14 +855,14 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     // if it were a 5-minute/1-slice run would silently reinterpret the
     // remaining schedule.
     let plan_hash = hype_trigger_twap::journal::hash_plan_params(&[
-        plan.symbol.as_str(),
-        &plan.side.to_string(),
-        &plan.per_slice.to_string(),
-        &plan.total_adjusted.to_string(),
-        &plan.slices.to_string(),
-        &plan.duration.as_secs().to_string(),
-        &plan.slippage_bps.to_string(),
-        &plan.max_notional_usd.to_string(),
+        original_plan.symbol.as_str(),
+        &original_plan.side.to_string(),
+        &original_plan.per_slice.to_string(),
+        &original_plan.total_adjusted.to_string(),
+        &original_plan.slices.to_string(),
+        &original_plan.duration.as_secs().to_string(),
+        &original_plan.slippage_bps.to_string(),
+        &original_plan.max_notional_usd.to_string(),
     ]);
 
     // Issue #4: open (or resume) the journal for a LIVE run only — read-only
@@ -872,6 +872,15 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     // two cases remain here: `--resume` re-opens the ALREADY-reconciled
     // run's journal for append and continues it, or a brand-new run starts
     // a fresh journal.
+    // Issue #4 Finding 1 fix: the amount already credited (via prior
+    // Terminal journal records) by the run being resumed, replayed from the
+    // ALREADY-reconciled journal below. `None` for a brand-new run (no prior
+    // fills to subtract). Used after the journal is opened to compute a
+    // continuation plan that targets only the remainder, so a `--resume`
+    // never re-executes the full original plan on top of fills the prior
+    // process already made.
+    let mut already_filled: Option<Decimal> = None;
+
     let mut journal = if cli.read_only {
         None
     } else if let Some(resume_id) = &cli.resume {
@@ -894,6 +903,13 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
                 ));
             }
         }
+        // Issue #4 Finding 1 fix: `records` here reflects the journal AFTER
+        // forced reconciliation ran above (reconciliation reopened/appended
+        // to the SAME file via `reconcile_incomplete_run`, which fsyncs
+        // every record it writes) — so this replay already includes every
+        // cloid's resolved Terminal outcome, not just what the prior
+        // (crashed) process itself observed.
+        already_filled = Some(hype_trigger_twap::journal::summarize(&records).total_filled());
         Some(
             hype_trigger_twap::journal::ExecutionJournal::open_existing(
                 &resolved_state_dir,
@@ -908,9 +924,9 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
             network: network.to_string(),
             agent: agent_address.clone(),
             master: master.clone(),
-            symbol: plan.symbol.clone(),
-            side: plan.side,
-            slices: plan.slices,
+            symbol: original_plan.symbol.clone(),
+            side: original_plan.side,
+            slices: original_plan.slices,
             plan_hash,
             started_at_unix_ms: hype_trigger_twap::twap::wall_clock_now_ms(),
         };
@@ -922,6 +938,110 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
             )
             .map_err(|e| format!("failed to start execution journal: {e}"))?,
         )
+    };
+
+    // Issue #4 Finding 1 fix: `--resume` must continue for the REMAINDER of
+    // the original plan, never re-execute it from scratch — a slice already
+    // journaled Terminal (a real fill) is excluded from
+    // `unresolved_cloids()`, so the forced reconciliation above does not by
+    // itself prevent double-placing it; only this continuation-plan
+    // computation does.
+    //
+    // Captured before `original_plan` is potentially moved into `plan`
+    // below (the no-resume arm), so the final report (after the run
+    // completes) can still be rendered against the ORIGINAL target.
+    let original_total_adjusted = original_plan.total_adjusted;
+    let original_total_requested = original_plan.total_requested;
+    //
+    // Continuation-plan computation: `remaining = original_total_adjusted -
+    // already_filled`. If the
+    // remainder cannot clear the same per-slice min-notional gate the
+    // original plan was sized against (using the same trigger-time `mid`),
+    // there is nothing left this run can legally place: skip straight to a
+    // durable FinalReport and exit 0 without ever placing a new order. This
+    // mirrors `PreflightError::PerSliceBelowMinNotional`'s gate (same
+    // `MIN_NOTIONAL_USD` constant, no new threshold invented).
+    let plan = match already_filled {
+        None => original_plan,
+        Some(filled) => {
+            let remaining = original_plan.total_adjusted - filled;
+            if remaining <= Decimal::ZERO || remaining * mid < MIN_NOTIONAL_USD {
+                tracing::info!(
+                    already_filled = %human(filled),
+                    original_total = %human(original_plan.total_adjusted),
+                    remaining = %human(remaining.max(Decimal::ZERO)),
+                    "--resume: remainder is already complete (or unplaceable below min notional); \
+                     nothing further will be executed"
+                );
+                if let Some(j) = journal.as_mut() {
+                    let _ = j.record(&hype_trigger_twap::journal::JournalRecord::FinalReport {
+                        completed: true,
+                        filled_total: filled.to_string(),
+                        outcome_unknown_cloids: Vec::new(),
+                        note: "resume: prior fills already satisfy (or leave an unplaceable \
+                               remainder of) the original plan; nothing further executed"
+                            .to_string(),
+                    });
+                }
+                let report = hype_trigger_twap::twap::TwapReport {
+                    symbol: original_plan.symbol.clone(),
+                    side: original_plan.side,
+                    total_requested: original_plan.total_requested,
+                    total_adjusted: original_plan.total_adjusted,
+                    filled,
+                    avg_px: None,
+                    slices_executed: 0,
+                    slices_skipped: 0,
+                    elapsed: Duration::ZERO,
+                    abort_reason: None,
+                    read_only: cli.read_only,
+                };
+                print!("{}", report.render());
+                return Ok(ExitCode::SUCCESS);
+            }
+            // Continuation plan: SAME per-slice size as the original plan
+            // (preserving the schedule's granularity), slices = ceil(
+            // remaining / per_slice) so the last slice absorbs whatever
+            // remainder is smaller than a full per-slice size — the same
+            // "final slice carries the residual" convention
+            // `target_at_slice`/`slice_order_size` already use for a normal
+            // (non-resumed) run. `total_adjusted` is set to exactly
+            // `remaining` so `run_twap_journaled`'s own early-finish check
+            // (`stats.filled >= plan.total_adjusted`) and min-notional gating
+            // on the final slice both apply to the true remainder, not the
+            // original total.
+            let per_slice = original_plan.per_slice;
+            let continuation_slices: u32 = {
+                let whole = (remaining / per_slice).floor();
+                let has_remainder = whole * per_slice < remaining;
+                let n = whole.to_string().parse::<u32>().unwrap_or(0) + u32::from(has_remainder);
+                n.max(1)
+            };
+            tracing::info!(
+                already_filled = %human(filled),
+                original_total = %human(original_plan.total_adjusted),
+                remaining = %human(remaining),
+                continuation_slices,
+                "--resume: continuing with a plan scoped to the remainder only"
+            );
+            TwapPlan {
+                symbol: original_plan.symbol.clone(),
+                side: original_plan.side,
+                asset_index: original_plan.asset_index,
+                sz_decimals: original_plan.sz_decimals,
+                per_slice,
+                total_adjusted: remaining,
+                total_requested: original_plan.total_requested,
+                slices: continuation_slices,
+                duration: original_plan.duration,
+                slippage_bps: original_plan.slippage_bps,
+                max_book_age_ms: original_plan.max_book_age_ms,
+                read_only: original_plan.read_only,
+                max_notional_usd: original_plan.max_notional_usd,
+                agent: original_plan.agent.clone(),
+                master: original_plan.master.clone(),
+            }
+        }
     };
 
     // Issue #4: SIGINT/SIGTERM cooperative shutdown. A tokio::sync::watch
@@ -983,10 +1103,18 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
                     "shutdown grace period exceeded; giving up with outcome_unknown"
                 );
                 if let Some(j) = journal.as_mut() {
+                    // Finding 2 fix: derive both fields from the ACTUAL
+                    // journal state at this moment, via `grace_timeout_report_fields`
+                    // (unit-tested directly below), rather than hardcoding
+                    // zero/empty, which silently discarded every real fill
+                    // and every genuinely-still-open cloid this run needed
+                    // to flag as outcome_unknown.
+                    let (filled_total, outcome_unknown_cloids) =
+                        grace_timeout_report_fields(&resolved_state_dir, j.run_id());
                     let _ = j.record(&hype_trigger_twap::journal::JournalRecord::FinalReport {
                         completed: false,
-                        filled_total: "0".into(),
-                        outcome_unknown_cloids: Vec::new(),
+                        filled_total: filled_total.to_string(),
+                        outcome_unknown_cloids,
                         note: format!(
                             "shutdown grace period ({:?}) exceeded before reconciliation finished",
                             cli.shutdown_grace
@@ -999,6 +1127,25 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     } else {
         run_fut.await
     };
+
+    // Issue #4 Finding 1 fix: a resumed run's `report` only reflects fills
+    // this process itself placed (the continuation plan, scoped to
+    // `remaining`) — the prior process's already-journaled fills must be
+    // folded back in so the PRINTED report (and its `total_adjusted`) read
+    // against the ORIGINAL plan the operator asked for, not the truncated
+    // continuation. The journal itself is already the source of truth for
+    // exactly-once accounting (`RunSummary::total_filled` sums each
+    // Terminal cloid once, whether journaled by this process or a prior
+    // one) — this only affects the human-readable summary.
+    let report = match already_filled {
+        Some(prior) => hype_trigger_twap::twap::TwapReport {
+            total_adjusted: original_total_adjusted,
+            total_requested: original_total_requested,
+            filled: prior + report.filled,
+            ..report
+        },
+        None => report,
+    };
     print!("{}", report.render());
 
     if report.exit_code() == 0 {
@@ -1006,6 +1153,35 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     } else {
         Ok(ExitCode::FAILURE)
     }
+}
+
+/// Finding 2 fix: the `(filled_total, outcome_unknown_cloids)` a
+/// grace-timeout `FinalReport` should carry, derived by replaying THIS
+/// run's own journal at the moment the grace period expired — rather than
+/// the pre-fix hardcoded `(0, [])`, which discarded every real fill and
+/// every genuinely-still-open cloid.
+///
+/// A read failure (journal file vanished, malformed, ...) falls back to
+/// `(0, [])` with a warning rather than panicking — the grace-timeout path
+/// is already the "giving up" branch; best-effort accounting here is still
+/// strictly better than the pre-fix behaviour, which was ALWAYS `(0, [])`.
+fn grace_timeout_report_fields(
+    state_root: &std::path::Path,
+    run_id: &str,
+) -> (Decimal, Vec<hype_trigger_twap::types::Cloid>) {
+    hype_trigger_twap::journal::ExecutionJournal::read_all(state_root, run_id)
+        .map(|records| {
+            let summary = hype_trigger_twap::journal::summarize(&records);
+            (summary.total_filled(), summary.unresolved_cloids())
+        })
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                "grace-timeout FinalReport: failed to replay this run's own journal for \
+                 accounting; falling back to zero/empty"
+            );
+            (Decimal::ZERO, Vec::new())
+        })
 }
 
 /// Issue #4: force-reconcile every submitted/unknown cloid in an incomplete
@@ -1038,10 +1214,35 @@ async fn reconcile_incomplete_run(
     .map_err(|e| e.to_string())?;
     let summary = hype_trigger_twap::journal::summarize(&records);
 
+    // Finding 3 fix: recover the TRUE original `slice_idx` for each
+    // unresolved cloid from its own `Prepared` record (joined by cloid) in
+    // the SAME prior journal, rather than writing a `0` placeholder. Every
+    // cloid this function ever reconciles was, by construction, placed by
+    // this same run's own `place_slice_reconciled` (which always journals
+    // `Prepared` before the network send — see src/twap.rs), so the join
+    // always succeeds for any cloid actually reachable via
+    // `unresolved_cloids()`; the `unwrap_or(0)` fallback exists only for a
+    // theoretically malformed/hand-edited journal missing its own Prepared
+    // record; see `docs` note in this function's caller-facing report if
+    // that ever fires in practice.
+    let slice_idx_by_cloid: std::collections::HashMap<hype_trigger_twap::types::Cloid, u32> =
+        records
+            .iter()
+            .filter_map(|r| match r {
+                hype_trigger_twap::journal::JournalRecord::Prepared {
+                    slice_idx, cloid, ..
+                } => Some((*cloid, *slice_idx)),
+                _ => None,
+            })
+            .collect();
+
     for cloid in summary.unresolved_cloids() {
-        hype_trigger_twap::twap::reconcile_unresolved_cloid(client, plan, cloid, journal)
-            .await
-            .map_err(|e| e.to_string())?;
+        let slice_idx = slice_idx_by_cloid.get(&cloid).copied().unwrap_or(0);
+        hype_trigger_twap::twap::reconcile_unresolved_cloid(
+            client, plan, cloid, slice_idx, journal,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -1942,6 +2143,93 @@ mod tests {
         }
     }
 
+    /// **Finding 2 regression test.** Before the fix, a grace-timeout
+    /// `FinalReport` hardcoded `filled_total: "0"` and
+    /// `outcome_unknown_cloids: []` regardless of what the run had actually
+    /// done — silently discarding real fills and hiding genuinely-unresolved
+    /// cloids from the operator. This test seeds a journal with a prior
+    /// Terminal fill (slice 1, 3 HYPE) AND a still-unresolved
+    /// SubmittedUnknown cloid (slice 2) — i.e. exactly the state the journal
+    /// would be in if the grace timer fired while slice 2 was ambiguous —
+    /// then asserts `grace_timeout_report_fields` (the function the
+    /// grace-timeout branch in `run_with_cli` calls) reports the REAL
+    /// filled total and the REAL unresolved cloid, not zero/empty.
+    #[test]
+    fn grace_timeout_report_fields_reflect_actual_journal_state_not_zero_or_empty() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+        let filled_cloid = hype_trigger_twap::types::Cloid::new();
+        let unresolved_cloid = hype_trigger_twap::types::Cloid::new();
+
+        let mut j = hype_trigger_twap::journal::ExecutionJournal::start(
+            &state_dir,
+            "run-grace-timeout".into(),
+            hype_trigger_twap::journal::RunHeader {
+                run_id: "run-grace-timeout".into(),
+                network: "testnet".into(),
+                agent: Some(hype_trigger_twap::types::Address::new(AGENT)),
+                master: Some(hype_trigger_twap::types::Address::new(MASTER)),
+                symbol: hype_trigger_twap::types::Symbol::new("HYPE"),
+                side: hype_trigger_twap::types::Side::Long,
+                slices: 2,
+                plan_hash: "irrelevant".into(),
+                started_at_unix_ms: 0,
+            },
+        )
+        .unwrap();
+        j.record(&hype_trigger_twap::journal::JournalRecord::Prepared {
+            slice_idx: 1,
+            cloid: filled_cloid,
+            nonce: None,
+            symbol: hype_trigger_twap::types::Symbol::new("HYPE"),
+            side: hype_trigger_twap::types::Side::Long,
+            px: "50".into(),
+            sz: "3".into(),
+        })
+        .unwrap();
+        j.record(&hype_trigger_twap::journal::JournalRecord::Terminal {
+            slice_idx: 1,
+            cloid: filled_cloid,
+            status: "filled".into(),
+            filled_sz: "3".into(),
+            avg_px: Some("50".into()),
+        })
+        .unwrap();
+        j.record(&hype_trigger_twap::journal::JournalRecord::Prepared {
+            slice_idx: 2,
+            cloid: unresolved_cloid,
+            nonce: None,
+            symbol: hype_trigger_twap::types::Symbol::new("HYPE"),
+            side: hype_trigger_twap::types::Side::Long,
+            px: "50".into(),
+            sz: "2".into(),
+        })
+        .unwrap();
+        j.record(
+            &hype_trigger_twap::journal::JournalRecord::SubmittedUnknown {
+                slice_idx: 2,
+                cloid: unresolved_cloid,
+            },
+        )
+        .unwrap();
+        // No FinalReport: this is the still-open state a grace-timeout
+        // would fire against.
+
+        let (filled_total, outcome_unknown_cloids) =
+            grace_timeout_report_fields(&state_dir, "run-grace-timeout");
+
+        assert_eq!(
+            filled_total,
+            rust_decimal::Decimal::from(3),
+            "must reflect the ACTUAL prior fill (3), not the hardcoded 0"
+        );
+        assert_eq!(
+            outcome_unknown_cloids,
+            vec![unresolved_cloid],
+            "must list the ACTUAL still-unresolved cloid, not an empty list"
+        );
+    }
+
     fn live_cli(extra: &[&str], state_dir: &std::path::Path) -> Vec<String> {
         let mut args: Vec<String> = vec![
             "hype-twap".into(),
@@ -2325,6 +2613,287 @@ mod tests {
         assert!(
             summary.unresolved_cloids().is_empty(),
             "the resumed cloid must be resolved, not left dangling: {records:?}"
+        );
+    }
+
+    /// `--usd`/`--slices` args for a TWO-slice plan (`$100` at mid `50` →
+    /// 2 HYPE total, 1 HYPE/slice) — used by the Finding 1 regression test
+    /// below, which needs a resumable run with a real remainder left after
+    /// one slice's worth of prior fill.
+    fn live_cli_two_slice(extra: &[&str], state_dir: &std::path::Path) -> Vec<String> {
+        let mut args: Vec<String> = vec![
+            "hype-twap".into(),
+            "--symbol".into(),
+            "HYPE".into(),
+            "--side".into(),
+            "long".into(),
+            "--usd".into(),
+            "100".into(),
+            "--duration".into(),
+            "2s".into(),
+            "--slices".into(),
+            "2".into(),
+            "--max-notional-usd".into(),
+            "1000000".into(),
+            "--allow-custom-endpoints".into(),
+            "--read-only".into(),
+            "false".into(),
+            "--state-dir".into(),
+            state_dir.display().to_string(),
+        ];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        args
+    }
+
+    /// **Finding 1 (CRITICAL) regression test.** Before the fix, `--resume`
+    /// rebuilt the ORIGINAL plan (`total_adjusted` = the full 2-slice
+    /// target) and started `run_twap_journaled` fresh at `slice_idx=1` with
+    /// zero in-memory `filled` — so a prior run's slice-1 fill (already
+    /// journaled `Terminal`, therefore excluded from
+    /// `unresolved_cloids()` and invisible to forced reconciliation) was
+    /// silently re-executed on top of, doubling the total placed.
+    ///
+    /// Seeds a prior journal with BOTH:
+    /// - a `Terminal`, partially-filled cloid for slice 1 (1 of 2 HYPE,
+    ///   simulating "slice 1 filled, then the process crashed") — this is
+    ///   the path Finding 1 is specifically about: a fill the ORIGINAL
+    ///   implementation's `--resume` tests never seeded, so this exact bug
+    ///   was never exercised or caught before now.
+    /// - a `SubmittedUnknown` cloid for slice 2 (simulating "slice 2 was
+    ///   sent, then the process crashed before reading the response") — so
+    ///   both the reconciliation path AND the continuation-plan path are
+    ///   exercised together in one run, per the finding's explicit
+    ///   requirement.
+    ///
+    /// Asserts, via a mockito body-matcher + `.expect(1)` call-count on
+    /// `/exchange`, that the resumed run places EXACTLY ONE new order of
+    /// size `1` (the remainder: 2 HYPE total − 1 HYPE already filled), never
+    /// the full original 2 HYPE — and that the final accounting (prior
+    /// journaled fill + this run's own newly-executed fill) sums to exactly
+    /// the original 2 HYPE target, each fill counted exactly once.
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn resume_continues_only_the_remainder_not_the_full_original_plan() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+        let slice1_cloid = hype_trigger_twap::types::Cloid::new();
+        let slice2_cloid = hype_trigger_twap::types::Cloid::new();
+
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+
+        // Derive the real plan_hash for this 2-slice/$100 plan the same way
+        // the existing --resume tests do: a throwaway probe run against its
+        // own state dir, reading the hash back out of its own header.
+        let probe_state_dir = tmp.path().join("probe-state");
+        {
+            let mut probe_server = mockito::Server::new_async().await;
+            mock_full_live_run(&mut probe_server).await;
+            std::env::set_var("HL_INFO_URL", format!("{}/info", probe_server.url()));
+            std::env::set_var(
+                "HL_EXCHANGE_URL",
+                format!("{}/exchange", probe_server.url()),
+            );
+            let probe_args = live_cli_two_slice(&["--network", "testnet"], &probe_state_dir);
+            run_with_cli(Cli::try_parse_from(&probe_args).unwrap())
+                .await
+                .expect("probe run to derive plan_hash must succeed");
+        }
+        let probe_run_id = std::fs::read_dir(probe_state_dir.join("runs"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name()
+            .into_string()
+            .unwrap();
+        let probe_records =
+            hype_trigger_twap::journal::ExecutionJournal::read_all(&probe_state_dir, &probe_run_id)
+                .unwrap();
+        let matching_plan_hash = probe_records
+            .iter()
+            .find_map(|r| match r {
+                hype_trigger_twap::journal::JournalRecord::Header(h) => Some(h.plan_hash.clone()),
+                _ => None,
+            })
+            .unwrap();
+
+        // Seed the incomplete run: slice 1 already Terminal/filled (1 HYPE),
+        // slice 2 SubmittedUnknown (ambiguous — needs reconciliation).
+        {
+            let mut j = hype_trigger_twap::journal::ExecutionJournal::start(
+                &state_dir,
+                "run-to-resume-partial".into(),
+                hype_trigger_twap::journal::RunHeader {
+                    run_id: "run-to-resume-partial".into(),
+                    network: "testnet".into(),
+                    agent: Some(hype_trigger_twap::types::Address::new(AGENT)),
+                    master: Some(hype_trigger_twap::types::Address::new(MASTER)),
+                    symbol: hype_trigger_twap::types::Symbol::new("HYPE"),
+                    side: hype_trigger_twap::types::Side::Long,
+                    slices: 2,
+                    plan_hash: matching_plan_hash,
+                    started_at_unix_ms: 0,
+                },
+            )
+            .unwrap();
+            j.record(&hype_trigger_twap::journal::JournalRecord::Prepared {
+                slice_idx: 1,
+                cloid: slice1_cloid,
+                nonce: None,
+                symbol: hype_trigger_twap::types::Symbol::new("HYPE"),
+                side: hype_trigger_twap::types::Side::Long,
+                px: "50".into(),
+                sz: "1".into(),
+            })
+            .unwrap();
+            j.record(&hype_trigger_twap::journal::JournalRecord::Terminal {
+                slice_idx: 1,
+                cloid: slice1_cloid,
+                status: "filled".into(),
+                filled_sz: "1".into(),
+                avg_px: Some("50".into()),
+            })
+            .unwrap();
+            j.record(&hype_trigger_twap::journal::JournalRecord::Prepared {
+                slice_idx: 2,
+                cloid: slice2_cloid,
+                nonce: None,
+                symbol: hype_trigger_twap::types::Symbol::new("HYPE"),
+                side: hype_trigger_twap::types::Side::Long,
+                px: "50".into(),
+                sz: "1".into(),
+            })
+            .unwrap();
+            j.record(
+                &hype_trigger_twap::journal::JournalRecord::SubmittedUnknown {
+                    slice_idx: 2,
+                    cloid: slice2_cloid,
+                },
+            )
+            .unwrap();
+        }
+
+        // NOTE: deliberately NOT reusing `mock_full_live_run` here (unlike
+        // the other --resume tests) — its `/exchange` mock has no body
+        // matcher and no `.expect()`, so mockito treats it as perpetually
+        // "missing hits" and prefers it over ANY later, more specific
+        // `/exchange` mock regardless of registration order. This test
+        // needs the `/exchange` mock itself to be the size assertion, so
+        // meta/userRole/l2Book are registered individually instead.
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({"type": "meta"})))
+            .with_status(200)
+            .with_body(r#"{"universe":[{"name":"HYPE","szDecimals":2,"maxLeverage":10,"onlyIsolated":false}]}"#)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "userRole"}),
+            ))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"role":"agent","data":{{"user":"{MASTER}"}}}}"#
+            ))
+            .create_async()
+            .await;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "l2Book"}),
+            ))
+            .with_status(200)
+            .with_body(book_body_at("HYPE", "49.9", "50.1", now_ms))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        // Forced reconciliation for slice 2's ambiguous cloid: HL reports it
+        // as never received (unknownOid), so it resolves to a zero-fill
+        // Terminal, NOT a resend on this codepath (resume/abandon never
+        // resend — only a live run's own place_slice_reconciled may).
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "orderStatus", "oid": slice2_cloid.to_hex_string()}),
+            ))
+            .with_status(200)
+            .with_body(r#"{"status":"unknownOid"}"#)
+            .expect_at_least(2) // W1 policy requires >=2 consecutive unknownOid observations
+            .create_async()
+            .await;
+        // The continuation's own new place: MUST be size 1 (the remainder:
+        // 2 total - 1 already filled), never size 2 (the full original
+        // total). `.expect(1)`: exactly one new order is placed — asserted
+        // explicitly below via `.assert_async()`, since mockito's
+        // `.expect(n)` is only CHECKED when a caller asks it to (it is not
+        // enforced automatically on drop). This is the ONLY `/exchange`
+        // mock on this server, so an unexpected size-2 (full-original-plan)
+        // body would simply 501 rather than silently match a fallback.
+        let exchange_mock = server
+            .mock("POST", "/exchange")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "action": { "orders": [{ "s": "1" }] }
+            })))
+            .with_status(200)
+            .with_body(
+                r#"{"status":"ok","response":{"type":"order","data":{"statuses":[
+                    {"filled":{"oid":99,"totalSz":"1","avgPx":"50"}}]}}}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+
+        let args = live_cli_two_slice(
+            &["--network", "testnet", "--resume", "run-to-resume-partial"],
+            &state_dir,
+        );
+        let cli = Cli::try_parse_from(&args).unwrap();
+        let result = run_with_cli(cli).await;
+
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+
+        result.expect("resume continuing only the remainder must succeed");
+
+        // Explicitly assert the `/exchange` mock's call-count expectation:
+        // exactly one new order was placed, sized to the remainder only.
+        // The pre-fix double-execution bug (placing the full original 2
+        // HYPE on top of the already-filled 1 HYPE) would either fail
+        // body-matching (a size-2 order would not match this mock's
+        // `s: "1"` matcher, surfacing as an unmatched-request 501) or, if
+        // some other body shape happened to match, would trip THIS
+        // assertion by calling the mock more than once.
+        exchange_mock.assert_async().await;
+
+        // Final accounting: prior journaled fill (1, slice 1) + this run's
+        // own newly-executed fill (1, slice 2's remainder) sums to EXACTLY
+        // the original 2 HYPE target — each fill counted exactly once.
+        let records = hype_trigger_twap::journal::ExecutionJournal::read_all(
+            &state_dir,
+            "run-to-resume-partial",
+        )
+        .unwrap();
+        let summary = hype_trigger_twap::journal::summarize(&records);
+        assert_eq!(
+            summary.total_filled(),
+            rust_decimal::Decimal::from(2),
+            "resumed run must account for exactly the original 2 HYPE target, \
+             each fill counted once: {records:?}"
+        );
+        assert!(
+            summary.unresolved_cloids().is_empty(),
+            "every cloid must be resolved by the end of the resumed run: {records:?}"
         );
     }
 
