@@ -43,6 +43,7 @@ humantime = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
+fd-lock = "4.0.4"
 
 [dev-dependencies]
 mockito = "1.7.2"
