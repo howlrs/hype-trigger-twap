@@ -313,6 +313,8 @@ pub enum PreflightError {
     PerSliceBelowMinNotional { notional: Decimal, min: Decimal },
     #[error("total size must be > 0, got {0}")]
     NonPositiveTotal(Decimal),
+    #[error("mid price must be > 0, got {0} (empty or crossed book?)")]
+    NonPositiveMid(Decimal),
 }
 
 /// Result of pre-flight sizing.
@@ -359,7 +361,7 @@ pub fn compute_sizing(
 /// Convert a USD notional into a coin quantity at `mid` (§3 `--usd`).
 pub fn usd_to_coin(usd: Decimal, mid: Decimal) -> Result<Decimal, PreflightError> {
     if mid <= Decimal::ZERO {
-        return Err(PreflightError::NonPositiveTotal(mid));
+        return Err(PreflightError::NonPositiveMid(mid));
     }
     Ok(usd / mid)
 }
@@ -2040,6 +2042,32 @@ mod tests {
     }
 
     #[test]
+    fn usd_conversion_at_zero_mid_returns_non_positive_mid_with_exact_message() {
+        let err = usd_to_coin(dec!(1500), dec!(0)).unwrap_err();
+        assert!(
+            matches!(err, PreflightError::NonPositiveMid(m) if m == dec!(0)),
+            "expected NonPositiveMid(0), got {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "mid price must be > 0, got 0 (empty or crossed book?)"
+        );
+    }
+
+    #[test]
+    fn usd_conversion_at_negative_mid_returns_non_positive_mid_with_exact_message() {
+        let err = usd_to_coin(dec!(1500), dec!(-5)).unwrap_err();
+        assert!(
+            matches!(err, PreflightError::NonPositiveMid(m) if m == dec!(-5)),
+            "expected NonPositiveMid(-5), got {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "mid price must be > 0, got -5 (empty or crossed book?)"
+        );
+    }
+
+    #[test]
     fn usd_flow_end_to_end_matches_spec_example() {
         // --usd 1500 at mid 30 → 50 coins over 10 slices → 5 per slice.
         let coin = usd_to_coin(dec!(1500), dec!(30)).unwrap();
@@ -2992,6 +3020,71 @@ mod loop_tests {
             took <= Duration::from_millis(500),
             "retry budget was not capped by the deadline: took {took:?}"
         );
+    }
+
+    // === Issue #10: an empty-sided book (empty bids and/or asks) is folded
+    // into ValidatedMarketSnapshot::validate's failure path, which
+    // fetch_fresh_book already retries via the same "invalid or stale book"
+    // loop it uses for coin-mismatch / crossed / stale books — a transient
+    // empty book must NOT instant-abort at the caller.
+
+    fn empty_bid_book() -> OrderBook {
+        OrderBook {
+            coin: "HYPE".to_string(),
+            bids: vec![],
+            asks: vec![BookLevel {
+                px: dec!(50.1),
+                sz: dec!(1000),
+                n: 1,
+            }],
+            time_ms: 0,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fetch_fresh_book_retries_through_transient_empty_book_within_budget() {
+        // Two empty-bid responses (within the STALE_BOOK_RETRIES budget),
+        // then a normal book: the run must continue and return the healthy
+        // snapshot rather than aborting on the first empty response.
+        let api = ScriptedApi::new()
+            .push_book(Ok(empty_bid_book()))
+            .push_book(Ok(empty_bid_book()))
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)));
+
+        let snapshot = fetch_fresh_book(&api, &Symbol::new("HYPE"), 0, None)
+            .await
+            .expect("transient empty book must be retried and eventually succeed");
+
+        assert_eq!(snapshot.best_bid, dec!(49.9));
+        assert_eq!(snapshot.best_ask, dec!(50.1));
+        // 2 failed attempts + 1 success = 3 book calls total.
+        assert_eq!(api.calls().len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fetch_fresh_book_aborts_with_exhausted_retries_message_after_persistent_empty_book() {
+        // Every scripted response is empty-sided: STALE_BOOK_RETRIES retries
+        // must all be spent, and the final error must read as an
+        // exhausted-retries condition, not a single-shot failure.
+        let api = ScriptedApi::new().with_default_book(empty_bid_book());
+
+        let err = fetch_fresh_book(&api, &Symbol::new("HYPE"), 0, None)
+            .await
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!(
+                "book still invalid after {STALE_BOOK_RETRIES} retries"
+            )),
+            "expected an exhausted-retries style message, got: {msg}"
+        );
+        assert!(
+            msg.contains("empty bid side"),
+            "expected the underlying empty-bid-side cause to be preserved, got: {msg}"
+        );
+        // attempt 0..=STALE_BOOK_RETRIES → STALE_BOOK_RETRIES + 1 calls total.
+        assert_eq!(api.calls().len() as u32, STALE_BOOK_RETRIES + 1);
     }
 
     // === Issue #2 acceptance criterion 2: an ambiguous-send reconciliation
