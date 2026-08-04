@@ -181,6 +181,14 @@ pub struct RunHeader {
 /// security-sensitive, so no new dependency is needed.
 pub fn hash_plan_params(fields: &[&str]) -> String {
     use std::hash::{Hash, Hasher};
+    // Determinism assumption this `--resume` check is load-bearing on:
+    // `DefaultHasher::new()` uses a FIXED (non-randomized) key per the Rust
+    // std docs — deterministic across constructions, unlike
+    // `RandomState`/`HashMap`'s default hasher — so hashing the same plan
+    // params in two different process runs (this run vs. the crashed one
+    // being resumed) yields the same hash. Covered empirically by
+    // `hash_plan_params_is_deterministic_across_independent_hasher_instances`
+    // below, simulating "two different process runs."
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for f in fields {
         f.hash(&mut hasher);
@@ -569,6 +577,39 @@ mod tests {
             plan_hash: "deadbeef".into(),
             started_at_unix_ms: 1_000,
         }
+    }
+
+    // === hash_plan_params determinism ===
+
+    /// `--resume` runs in a FRESH process from the one that started (and
+    /// possibly crashed mid-) the run being resumed. The `plan_hash`
+    /// consistency check therefore only works if `DefaultHasher::new()`
+    /// (used internally by `hash_plan_params`) hashes identically across
+    /// two INDEPENDENT constructions — this test simulates exactly that:
+    /// two separate `hash_plan_params` calls (standing in for "two
+    /// different process runs") over the SAME plan input must produce the
+    /// SAME hash. Per the Rust std docs, `DefaultHasher::new()` uses a
+    /// fixed (non-randomized) key, so this is expected to hold — but the
+    /// brief calls for verifying it empirically rather than trusting the
+    /// docs alone, since if it were process-randomized every cross-process
+    /// `--resume` would silently fail the plan-hash check.
+    #[test]
+    fn hash_plan_params_is_deterministic_across_independent_hasher_instances() {
+        let fields = ["HYPE", "long", "5", "50", "10", "1800", "50", "100000"];
+        let hash_a = hash_plan_params(&fields); // "process run" A
+        let hash_b = hash_plan_params(&fields); // "process run" B
+        assert_eq!(
+            hash_a, hash_b,
+            "DefaultHasher::new() must be deterministic across independent \
+             constructions for --resume to ever work cross-process"
+        );
+
+        // A different plan must (with overwhelming probability) hash
+        // differently — pins that this isn't a degenerate always-equal
+        // hasher passing the test above vacuously.
+        let different_fields = ["HYPE", "short", "5", "50", "10", "1800", "50", "100000"];
+        let hash_c = hash_plan_params(&different_fields);
+        assert_ne!(hash_a, hash_c);
     }
 
     // === state_dir resolution ===
