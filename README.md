@@ -51,6 +51,40 @@ hype-twap --symbol ETH --side short --usd 5000 --duration 2h --slices 20 \
   --trigger-price 3000 --trigger-when below --network testnet --read-only false
 ```
 
+## How this compares to Hyperliquid's built-in TWAP
+
+Hyperliquid has a native TWAP order type (the "TWAP" tab in the UI; `twapOrder`
+/ `twapCancel` in the API). For many jobs it is the better tool — it runs on
+the exchange itself, so there is no process for you to keep alive. This tool
+exists for the cases it doesn't cover. Native-TWAP facts below are from the
+[official docs](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/order-types);
+where the docs are silent, the row says "not documented" rather than guessing.
+
+| | Native Hyperliquid TWAP | `hype-twap` |
+|---|---|---|
+| Where it runs | On the exchange: submit once, then nothing to keep alive on your side | On your machine: the process must stay up for the whole window (crash recovery via `--resume`) |
+| Sub-order cadence | Fixed, at least 30 s apart, derived from size ÷ duration — the interval itself is not settable | `duration / slices` — any interval, bounded in practice by the $10 per-slice minimum notional |
+| Window / size bounds | 5 minutes – 7 days, at least $100 total | Any duration; total must be ≥ $10 × slices |
+| Slippage control | Fixed 3% cap per sub-order | `--slippage-bps` cushion (default 20 bps), warn threshold at 1000 bps, hard cap at 10000 bps |
+| Catch-up on under-fill | Later sub-orders grow up to 3× to catch up; a long shortfall may never fully catch up | The full shortfall carries into later slices (see "Sizing" below) |
+| Triggers | Trigger Price starts the TWAP; Max/Min Price ends it (both mark-price based) | Price trigger (`--trigger-price` + `--trigger-when`) OR a time trigger (`--start-after`), whichever fires first; `--expire-after` walks away placing nothing |
+| Maker execution | No post-only option documented (sub-orders do not fill during post-only-only upgrade windows, i.e. they take) | `--child-algo passive` posts an ALO limit at the touch and pays maker fees |
+| Size randomization | Optional: each sub-order randomized ±20% | None — slices are uniform and predictable |
+| Extra risk rails | Exchange margin checks | Also `--max-notional-usd` (mandatory in live mode), read-only dry-run by default, book staleness/sanity validation before every slice |
+| Visibility to third parties | Fills are *labeled* as TWAP activity: `userTwapSliceFills` returns any address's TWAP slice fills to any caller | Slices are ordinary IOC/ALO orders — still visible per-address as normal fills (all Hyperliquid fills are), but not flagged as a TWAP |
+| Audit trail | Exchange-side history via the API | Local fsynced JSONL journal of every order intent and outcome, plus a final report |
+
+Reach for the **native TWAP** when you want set-and-forget execution that
+survives your machine, a window longer than your uptime, or per-sub-order size
+randomization.
+
+Reach for **this tool** when you need what the native TWAP doesn't offer:
+sub-30-second or otherwise exact slice cadence, a time-OR-price start trigger
+with a bounded wait (`--expire-after`), maker (post-only) child orders, a
+tighter slippage bound than 3%, totals under $100, a dry-run rehearsal of the
+exact plan, order flow that is not labeled as TWAP activity, or a local,
+append-only record of everything that was sent.
+
 ## Flags
 
 | Flag | Type / values | Default | Meaning |
