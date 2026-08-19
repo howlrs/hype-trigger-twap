@@ -104,7 +104,10 @@ append-only record of everything that was sent.
 | `--max-book-age-ms` | u64 | `3000` | Reject a book snapshot older than this. `0` disables ONLY the max-age check — every book (trigger polls, pre-flight, each slice) still has to pass semantic validation (matching symbol, positive prices/sizes, uncrossed and correctly-ordered levels) and a fixed 2s future-timestamp tolerance, unconditionally. |
 | `--trigger-poll-secs` | u64 | `2` | Poll interval while waiting for the trigger. |
 | `--expire-after` | humantime | none | Terminate the wait, placing **nothing**, if no trigger condition fires within this duration. See "Trigger semantics" below. |
-| `--child-algo` | `market` \| `passive` | `market` | Per-slice order algorithm. `market` (default, unchanged behaviour) sends an IOC taker limit. `passive` sends a post-only (ALO) limit resting at the best bid/ask instead. See "Child-order algorithms" below. |
+| `--child-algo` | `market` \| `passive` \| `follow` | `market` | Per-slice order algorithm. `market` (default, unchanged behaviour) sends an IOC taker limit. `passive` sends a post-only (ALO) limit resting at the best bid/ask instead. `follow` is `passive` plus mid-slice re-quoting. See "Child-order algorithms" below. |
+| `--follow-poll-secs` | u64 | `2` | `--child-algo follow` only: seconds between book polls inside a slice's follow loop. Ignored (with a warning) by other child algos. |
+| `--follow-repost-secs` | u64 | `10` | `--child-algo follow` only: minimum seconds between reposts of the resting order within one slice, counted from that slice's last place. Ignored (with a warning) by other child algos. |
+| `--follow-threshold-bps` | decimal | `1.0` | `--child-algo follow` only: minimum relative distance (bps) the touch must move away from the resting price before a repost is worth burning queue priority for. Ignored (with a warning) by other child algos. |
 | `--max-notional-usd` | decimal (USD) | none | **MANDATORY when `--read-only false`** (breaking change from 0.1.0). The maximum USD notional any single slice may target; re-checked before every slice as a cumulative run-level envelope (already-filled notional + this slice's notional), never per-slice in isolation. Not required in read-only mode. |
 | `--allow-high-slippage` | bool | `false` | Unsafe override: allow `--slippage-bps` above the 1000 bps warn threshold. Does **not** lift the unconditional ≥10000 bps hard cap or the non-positive-limit-price rejection. |
 | `--allow-custom-endpoints` | bool | `false` | Unsafe override: allow `HL_INFO_URL` / `HL_EXCHANGE_URL` to be overridden in **live** mode. The override URL must be `https://` unless it is loopback (`127.0.0.1`/`localhost`, no userinfo) — used only by the test seam. Has no effect in read-only mode. |
@@ -308,7 +311,36 @@ never leaves an order resting on the book after the process exits.
 
 Re-quoting only happens at slice boundaries. If the touch moves mid-slice, the
 resting order is left alone until the next boundary — there is no intra-slice
-chasing in this release.
+chasing under `--child-algo passive`. `--child-algo follow` (below) adds that.
+
+`--child-algo follow` is `passive` plus **mid-slice re-quoting**: after the
+slice's initial ALO is placed (or an initial ALO reject leaves nothing
+resting), the loop polls the book every `--follow-poll-secs` and follows the
+touch until the slice ends:
+
+- If our order is still **at the touch**, nothing happens — this preserves
+  queue priority.
+- If the touch **moves through** our price (i.e. the book has very likely
+  traded through our level), the order is settled **immediately** — no
+  threshold or throttle gates this, since a fill is the whole point.
+- If the touch **moves away**, a repost only happens once **both**
+  `--follow-threshold-bps` (hysteresis, so 1-tick noise doesn't burn queue
+  priority) and `--follow-repost-secs` (a minimum time between reposts for
+  this slice) are satisfied. A repost is cancel → settle → re-place at the
+  new touch, reusing the exact same place/settle/journal machinery as the
+  initial place — a fresh cloid, `Prepared` fsynced before the send, and the
+  same ALO-reject-is-a-normal-skip handling.
+- A re-place always re-runs `decide_slice` (so it can stop early once the
+  slice's target is met, or pause following if the remainder would be below
+  the minimum notional — the shortfall carries to the next slice, same as
+  the boundary case) and the same risk checks (limit price, cumulative
+  notional cap) every other place in this tool goes through.
+- `--follow-poll-secs`, `--follow-repost-secs`, and `--follow-threshold-bps`
+  are ignored (with a warning) by any child algo other than `follow`.
+- There is still no taker fallback — `follow` never crosses the spread, and
+  a run that never gets filled at the touch can still finish partial.
+- `--read-only` prints the same boundary "would place" line as `passive`;
+  mid-slice reposting is **not simulated** in dry-run.
 
 ## Error handling
 
@@ -410,12 +442,13 @@ the shortfall; a normal run reaches its last slice inside the window anyway.
   just falls back to the generic "exchange rejected" wording.
 - **One symbol per process.** No portfolio logic, no existing-position
   awareness (`reduce_only` is never set), no HIP-3 `dex:SYMBOL` prefixes.
-- **Taker by default; passive is opt-in.** `--child-algo market` (the
-  default) crosses the spread and pays taker fees on every slice.
-  `--child-algo passive` posts at the touch instead (see "Child-order
-  algorithms" above) but does not re-quote mid-slice or fall back to a
-  taker sweep — a slice that never fills is simply skipped and its
-  shortfall carries into the next slice.
+- **Taker by default; passive/follow are opt-in.** `--child-algo market`
+  (the default) crosses the spread and pays taker fees on every slice.
+  `--child-algo passive` posts at the touch instead and holds for the full
+  slice interval; `--child-algo follow` adds mid-slice re-quoting on top of
+  that (see "Child-order algorithms" above). Neither falls back to a taker
+  sweep — a slice that never fills is simply skipped and its shortfall
+  carries into the next slice.
 - **Single-host single-writer only.** A local advisory lock (keyed by
   `network + agent address`) makes a second live process for the same agent
   on the SAME host fail fast, before any order. It has no visibility across
@@ -429,9 +462,12 @@ an ALO limit at the touch (best bid for a long, best ask for a short) and
 holds it for the full slice interval — see "Child-order algorithms" above.
 This is deliberately **boundary-only**: it does not re-quote mid-slice as the
 book moves, and it does not fall back to a taker sweep if the slice interval
-elapses unfilled (the shortfall carries to the next slice instead). Mid-slice
-re-quoting and a time-boxed taker-sweep fallback remain open follow-up work,
-not yet implemented.
+elapses unfilled (the shortfall carries to the next slice instead).
+
+**Shipped: mid-slice re-quoting.** `--child-algo follow` builds on `passive`
+by polling the book within a slice and re-quoting the resting order to keep
+following the touch (see "Child-order algorithms" above). A time-boxed
+taker-sweep fallback remains open follow-up work, not yet implemented.
 
 Also out of scope for now: WebSocket fills, multi-symbol execution, and
 existing-position awareness. (Run resume/persistence — previously listed

@@ -72,7 +72,10 @@ hype-twap --symbol ETH --side short --usd 5000 --duration 2h --slices 20 \
 | `--trigger-poll-secs` | 整数 | `2` | トリガー待ち中の板ポーリング間隔 (秒) |
 | `--wait-network-grace` | 期間 (`30m`, `1h`) | `30m` | トリガー待ち中の連続ポーリング失敗 (通信エラーまたは空板) を許容する継続時間。最初の失敗時刻からの経過で判定し、1 回でも成功すればリセットします。`0` は不可 |
 | `--expire-after` | 期間 | なし | 期間内にどのトリガーも発火しなければ、何も発注せずに終了します (exit code 3)。`--start-after` (フォールバック**開始**) とは異なり、こちらは打ち切り。同一 tick ではトリガーが優先。`0` は不可。`--start-after` 併用時は `expire_after > start_after` が必須。トリガー未指定 (即時開始) との併用は不可 |
-| `--child-algo` | `market` \| `passive` | `market` | スライスごとの子注文アルゴリズム。`market` (既定・従来と同一挙動) は IOC 成行相当の指値を送信します。`passive` は板の反対側を跨がない ALO (post-only) 指値をベスト bid/ask に置きます。詳細は後述の「passive (post-only) モード」を参照 |
+| `--child-algo` | `market` \| `passive` \| `follow` | `market` | スライスごとの子注文アルゴリズム。`market` (既定・従来と同一挙動) は IOC 成行相当の指値を送信します。`passive` は板の反対側を跨がない ALO (post-only) 指値をベスト bid/ask に置きます。`follow` は `passive` にスライス内の再クオートを加えたものです。詳細は後述の「passive (post-only) モード」「follow (mid-slice re-quoting) モード」を参照 |
+| `--follow-poll-secs` | 整数 | `2` | `--child-algo follow` 専用。スライス内の再クオートループが板をポーリングする間隔 (秒)。他の `--child-algo` では無視されます (警告あり) |
+| `--follow-repost-secs` | 整数 | `10` | `--child-algo follow` 専用。1 スライス内で再発注してよい最短間隔 (秒)。そのスライスの直近の発注時刻からの経過で判定します。他の `--child-algo` では無視されます (警告あり) |
+| `--follow-threshold-bps` | 数値 | `1.0` | `--child-algo follow` 専用。touch が resting 価格からこのベーシスポイント以上離れない限り再クオートしません (ヒステリシス)。他の `--child-algo` では無視されます (警告あり) |
 | `--state-dir` | パス | なし (`$XDG_STATE_HOME/hype-twap`、未設定なら `~/.local/state/hype-twap`) | 実行状態 (ジャーナル / ロック / nonce HWM) を保存するルートディレクトリ (Issue #4)。`--read-only` の実行はここに一切触れません — ディレクトリもジャーナルも作成されません |
 | `--resume` | 文字列 (run id) | なし | 指定した run id の未完了 run を再開します (Issue #4)。その run のジャーナルに記録された submitted/unknown な cloid をすべて `orderStatus` で照合してから実行を継続します。既にジャーナルに記録済みの約定は再送されません。`--abandon-incomplete-run` とは排他です |
 | `--abandon-incomplete-run` | フラグ | `false` | 同一 network+agent で検出された未完了 run を強制的に照合 (`orderStatus`) したうえで放棄し、**続行はしません** (Issue #4)。`--resume` とは排他です |
@@ -204,7 +207,74 @@ resting 中の注文がある場合、それを cancel して確定させる cle
 ### スコープ外
 
 スライス**内**でのリアルタイム追従 (touch が動いた瞬間に即 cancel → 再quote)
-は本バージョンでは実装していません。再quote はスライス境界でのみ行われます。
+は `--child-algo passive` では実装していません。再quote はスライス境界での
+み行われます。スライス内の追従が必要な場合は次節の `--child-algo follow`
+を使ってください。
+
+## follow (mid-slice re-quoting) モード
+
+`--child-algo follow` は `passive` と同じ発注・確定・journal・risk check を
+すべてそのまま再利用したうえで (別実装を持ちません)、**スライス内**で touch を
+追従して再クオートします。
+
+### 挙動
+
+スライスの初回 ALO を発注した後 (あるいは初回 ALO が拒否されて resting が
+`None` のまま始まった後)、スライス終了まで以下のループを回します。
+
+1. **ポーリング間隔**: `--follow-poll-secs` (既定2秒) ごとに板を取得します。
+   シャットダウン信号とは既存のスライス間スリープと同じ形で競合させ、
+   シグナル受信時は即座にループを抜けます (settle 中のフューチャーは
+   常に完走させ、途中で cancel することはありません)。
+2. **`ExecutionDeadline` の再確認**: 各 tick で期限超過をチェックし、
+   超過していれば新規発注を一切行わずループを抜けます (resting は
+   境界/cleanup の settle に委ねます)。板取得は
+   `fetch_fresh_book(..., Some(&exec_deadline))` を使い、一時的な取得
+   失敗は warn ログを出してその tick をスキップするだけです (resting
+   中の ALO はそのまま生き続けます)。次スライス境界の板取得失敗は
+   従来どおり中断扱いのままです。
+3. **再クオート判定**: `touch` = Long ならベスト bid、Short ならベスト
+   ask。`px` = resting 中の指値。
+   - resting が `None` (初回発注、または直前の再発注が ALO 拒否された
+     場合): このtickで再度発注を試みます (下記のスロットル対象)。
+   - `touch == px`: 何もしません (touch 上にいるため、キュー優先度を
+     維持します)。
+   - **touch が離れていく方向に動いた** (Long: `touch > px` / Short:
+     `touch < px`): `--follow-threshold-bps` 以上の相対距離 **かつ**
+     このスライスの直近発注から `--follow-repost-secs` 以上経過して
+     いる場合のみ、`settle_resting_child` で確定約定量を取得してから
+     (部分約定は必ず1回だけ計上)、新しい touch で再発注します
+     (新しい cloid・Prepared を send 前に fsync・同じ ALO 拒否=正常
+     skip の扱い)。
+   - **touch が resting の指値を突き抜けた** (Long: `touch < px` /
+     Short: `touch > px`): 板が resting の指値の水準を通過したという
+     ことは、その注文はほぼ確実に約定済みです。閾値・スロットルに
+     関係なく**即座に** settle し、そのうえで再発注するかどうかを
+     判定します (再発注自体はスロットル・risk check・min notional
+     ゲートに従います)。
+4. **サイジングの再計算**: 新しい touch で `decide_slice` を再実行します。
+   - `SkipAhead` (目標達成): 追従を終了し、スライス終了まで待ちます。
+   - `SkipBelowMinNotional`: 「残量が min notional 未満のため次スライス
+     まで追従を一時停止」とログを出し、不足分は次スライスの catch-up
+     サイジングに繰り越されます。
+   - `Place(sz)`: `RiskEnvelope::validate_limit_price` と累積名目額上限の
+     再チェック (`stats.notional + sz*px` vs cap、超過時は中断) を
+     スライス冒頭と同じ手順で通してから、`exec_deadline.check_before_send`
+     を再確認して発注します。
+5. **ALO 拒否の可視化**: スライス内での連続 ALO 拒否回数をカウントし、
+   5 回連続するごとに warn ログを出します (板が急速に動く相場での
+   execution shortfall を可視化するため)。約定または resting 成功で
+   リセットされます。
+6. **`--read-only`**: `passive` と同様、スライス境界の "would place" 行を
+   1回だけ出力し、フル約定を仮定してスライス終了までスリープします。
+   follow のスライス内再クオートは dry-run では**シミュレートされません**
+   (出力行にその旨の注記が付きます)。
+
+### スコープ外
+
+taker へのフォールバック (最終的に約定しない場合に taker に切り替える機能)
+は `follow` でも実装していません — `follow` は常に post-only のまま touch を
+追い続けるだけで、スプレッドを跨ぐことは決してありません。
 
 ## risk envelope (Issue #3)
 
