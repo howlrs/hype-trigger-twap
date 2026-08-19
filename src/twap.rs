@@ -1623,6 +1623,45 @@ enum FollowLoopExit {
     ShutdownRequested,
 }
 
+/// Outcome of a single [`place_follow_child`] attempt. Distinguishes the
+/// three cases that used to be collapsed into `Ok(None)`: a plain ALO
+/// reject (retry later, subject to the caller's throttle) vs. the two
+/// "stop re-quoting for the rest of this slice" outcomes (`TargetMet`,
+/// `BelowMinNotional`) — conflating these caused the follow loop to
+/// over-count `slices_skipped` on every retry tick and to keep polling
+/// after the slice's target was already met or its remainder was
+/// unexecutable.
+enum FollowPlace {
+    /// Placed and resting.
+    Placed(RestingChild),
+    /// A normal ALO reject (post-only would have crossed); retry later.
+    AloRejected,
+    /// The slice's target is already met (was `SkipAhead`); stop
+    /// re-quoting for the remainder of this slice.
+    TargetMet,
+    /// Remaining size is below min notional (was `SkipBelowMinNotional`);
+    /// stop re-quoting for the remainder of this slice, shortfall carried
+    /// by catch-up sizing on a later slice.
+    BelowMinNotional,
+}
+
+/// Shared bookkeeping for a plain ALO reject inside the follow loop: bump
+/// the consecutive-reject counter and emit the "repeated ALO rejects"
+/// warning every 5th occurrence. Deliberately does NOT touch
+/// `slices_skipped` — an ALO reject is a retry-later outcome, not a
+/// skipped slice.
+fn note_alo_reject(consecutive_alo_rejects: &mut u32, slice_idx: u32, context: &str) {
+    *consecutive_alo_rejects += 1;
+    if consecutive_alo_rejects.is_multiple_of(5) {
+        tracing::warn!(
+            slice = slice_idx,
+            consecutive_alo_rejects = *consecutive_alo_rejects,
+            "follow: repeated ALO rejects {context} \
+             (execution shortfall risk in a fast-moving market)"
+        );
+    }
+}
+
 /// `ChildAlgo::Follow`'s within-slice mid-slice re-quoting loop.
 ///
 /// Polls the book on `plan.follow_poll_secs` cadence (raced against
@@ -1633,10 +1672,13 @@ enum FollowLoopExit {
 /// place/settle/journal implementation for Follow, only a different
 /// decision of WHEN to call them.
 ///
-/// `resting`/`stats`/`slices_skipped` are the CALLER's own loop-local state,
-/// threaded through by mutable reference so a fill credited inside this
-/// function flows through the identical `stats.add` accounting the rest of
+/// `resting`/`stats` are the CALLER's own loop-local state, threaded
+/// through by mutable reference so a fill credited inside this function
+/// flows through the identical `stats.add` accounting the rest of
 /// `run_twap_journaled` uses — never a second, parallel accounting path.
+/// This loop never mutates `slices_skipped` itself — that accounting is
+/// solely the top-of-slice arm's, at most once per slice; see
+/// `FollowPlace`.
 #[allow(clippy::too_many_arguments)]
 async fn run_follow_loop(
     client: &dyn HlApi,
@@ -1646,7 +1688,6 @@ async fn run_follow_loop(
     slice_end: tokio::time::Instant,
     resting: &mut Option<RestingChild>,
     stats: &mut FillStats,
-    slices_skipped: &mut u32,
     mut journal: Option<&mut ExecutionJournal>,
     shutdown: Option<&mut ShutdownSignal>,
 ) -> Result<FollowLoopExit, String> {
@@ -1759,26 +1800,27 @@ async fn run_follow_loop(
             )
             .await
             {
-                Ok(Some(child)) => {
+                Ok(FollowPlace::Placed(child)) => {
                     *resting = Some(child);
                     last_place_at = tokio::time::Instant::now();
                     consecutive_alo_rejects = 0;
                 }
-                Ok(None) => {
-                    // SkipAhead / SkipBelowMinNotional / ALO-rejected-again:
-                    // nothing to carry forward from THIS tick; try again
-                    // next tick (subject to the same throttle).
-                    *slices_skipped += 1;
+                Ok(FollowPlace::AloRejected) => {
+                    // Nothing to carry forward from THIS tick; try again
+                    // next tick (subject to the same throttle). Does NOT
+                    // touch `slices_skipped` — see `FollowPlace`.
                     last_place_at = tokio::time::Instant::now();
-                    consecutive_alo_rejects += 1;
-                    if consecutive_alo_rejects.is_multiple_of(5) {
-                        tracing::warn!(
-                            slice = slice_idx,
-                            consecutive_alo_rejects,
-                            "follow: repeated ALO rejects while trying to re-enter the book \
-                             (execution shortfall risk in a fast-moving market)"
-                        );
-                    }
+                    note_alo_reject(
+                        &mut consecutive_alo_rejects,
+                        slice_idx,
+                        "while trying to re-enter the book",
+                    );
+                }
+                Ok(FollowPlace::TargetMet | FollowPlace::BelowMinNotional) => {
+                    // Stop re-quoting for the remainder of this slice: sleep
+                    // until `slice_end`, racing shutdown, same as the
+                    // poll-cadence sleep above.
+                    return sleep_until_slice_end_or_shutdown(slice_end, shutdown).await;
                 }
                 Err(reason) => return Err(reason),
             }
@@ -1877,23 +1919,22 @@ async fn run_follow_loop(
                 )
                 .await
                 {
-                    Ok(Some(child)) => {
+                    Ok(FollowPlace::Placed(child)) => {
                         *resting = Some(child);
                         last_place_at = tokio::time::Instant::now();
                         consecutive_alo_rejects = 0;
                     }
-                    Ok(None) => {
-                        *slices_skipped += 1;
+                    Ok(FollowPlace::AloRejected) => {
+                        // Does NOT touch `slices_skipped` — see `FollowPlace`.
                         last_place_at = tokio::time::Instant::now();
-                        consecutive_alo_rejects += 1;
-                        if consecutive_alo_rejects.is_multiple_of(5) {
-                            tracing::warn!(
-                                slice = slice_idx,
-                                consecutive_alo_rejects,
-                                "follow: repeated ALO rejects while reposting at the moving \
-                                 touch (execution shortfall risk in a fast-moving market)"
-                            );
-                        }
+                        note_alo_reject(
+                            &mut consecutive_alo_rejects,
+                            slice_idx,
+                            "while reposting at the moving touch",
+                        );
+                    }
+                    Ok(FollowPlace::TargetMet | FollowPlace::BelowMinNotional) => {
+                        return sleep_until_slice_end_or_shutdown(slice_end, shutdown).await;
                     }
                     Err(reason) => return Err(reason),
                 }
@@ -1906,18 +1947,48 @@ async fn run_follow_loop(
     }
 }
 
+/// Stop re-quoting for the remainder of the current slice: sleep until
+/// `slice_end`, racing against shutdown exactly like the follow loop's own
+/// poll-cadence sleep does, then report how the wait ended. Shared by both
+/// `TargetMet` and `BelowMinNotional` call sites in `run_follow_loop` —
+/// neither should keep polling the book once the slice's remaining size is
+/// either already met or unexecutable this slice.
+async fn sleep_until_slice_end_or_shutdown(
+    slice_end: tokio::time::Instant,
+    shutdown: Option<&mut ShutdownSignal>,
+) -> Result<FollowLoopExit, String> {
+    let sleep_for = slice_end.saturating_duration_since(tokio::time::Instant::now());
+    match shutdown {
+        Some(sd) if sd.is_triggered() => Ok(FollowLoopExit::ShutdownRequested),
+        Some(sd) => {
+            let mut sd_wait = sd.clone();
+            tokio::select! {
+                _ = tokio::time::sleep(sleep_for) => Ok(FollowLoopExit::SliceEndReached),
+                _ = sd_wait.wait() => Ok(FollowLoopExit::ShutdownRequested),
+            }
+        }
+        None => {
+            tokio::time::sleep(sleep_for).await;
+            Ok(FollowLoopExit::SliceEndReached)
+        }
+    }
+}
+
 /// Re-place inside the follow loop: recompute sizing via `decide_slice` at
 /// the new touch (item 4), run the SAME pre-place gates the top of the
 /// slice loop runs (`RiskEnvelope::validate_limit_price`, the CUMULATIVE
 /// notional cap re-check), then place via `place_alo_child`.
 ///
-/// `Ok(Some(child))` — placed and resting.
-/// `Ok(None)` — nothing placed this tick: target already met
-/// (`SkipAhead`, follow loop should stop trying to place and just ride out
-/// the slice), below min notional (pause following until next slice, per
-/// item 4's `SkipBelowMinNotional` instruction — the shortfall is carried by
-/// the normal catch-up sizing on a later slice), or a normal ALO reject
-/// (retry later, subject to the caller's own throttle).
+/// `Placed` — placed and resting.
+/// `TargetMet` — nothing placed this tick: target already met (was
+/// `SkipAhead`); the follow loop should stop trying to place and just ride
+/// out the rest of the slice.
+/// `BelowMinNotional` — nothing placed this tick: remaining size is below
+/// min notional (was `SkipBelowMinNotional`); pause following until next
+/// slice — the shortfall is carried by the normal catch-up sizing on a
+/// later slice.
+/// `AloRejected` — a normal ALO reject (post-only would have crossed);
+/// retry later, subject to the caller's own throttle.
 /// `Err(reason)` — fatal: risk envelope breach, notional cap breach, or a
 /// non-ALO exchange rejection/transport failure from `place_alo_child`.
 async fn place_follow_child(
@@ -1928,7 +1999,7 @@ async fn place_follow_child(
     new_px: Decimal,
     stats: &FillStats,
     journal: Option<&mut ExecutionJournal>,
-) -> Result<Option<RestingChild>, String> {
+) -> Result<FollowPlace, String> {
     // Item 4: recompute via decide_slice, exactly like the top of the slice
     // loop does, at the NEW touch price and the CURRENT cumulative fill.
     let decision = decide_slice(
@@ -1944,7 +2015,7 @@ async fn place_follow_child(
         SliceDecision::Place(sz) => sz,
         SliceDecision::SkipAhead => {
             tracing::info!(slice = slice_idx, "follow: target met; stopping re-quotes");
-            return Ok(None);
+            return Ok(FollowPlace::TargetMet);
         }
         SliceDecision::SkipBelowMinNotional { sz, notional } => {
             tracing::info!(
@@ -1954,7 +2025,7 @@ async fn place_follow_child(
                 "follow: remaining below min notional; pausing follow until next slice \
                  (carried by catch-up)"
             );
-            return Ok(None);
+            return Ok(FollowPlace::BelowMinNotional);
         }
     };
 
@@ -1999,8 +2070,8 @@ async fn place_follow_child(
     )
     .await?
     {
-        AloPlaceOutcome::Resting(child) => Ok(Some(child)),
-        AloPlaceOutcome::RejectedSkip => Ok(None),
+        AloPlaceOutcome::Resting(child) => Ok(FollowPlace::Placed(child)),
+        AloPlaceOutcome::RejectedSkip => Ok(FollowPlace::AloRejected),
     }
 }
 
@@ -2452,11 +2523,13 @@ pub async fn run_twap_journaled(
 
                 // Mid-slice re-quoting (README roadmap item): poll the book
                 // and keep the resting order following the touch until this
-                // slice's deadline. `resting`/`stats`/`slices_executed`/
-                // `slices_skipped` are all threaded through by mutable
-                // reference so the follow loop accounts fills through the
-                // EXACT SAME `stats.add` path as everywhere else in this
-                // function — no second accounting path.
+                // slice's deadline. `resting`/`stats` are threaded through
+                // by mutable reference so the follow loop accounts fills
+                // through the EXACT SAME `stats.add` path as everywhere
+                // else in this function — no second accounting path.
+                // `slices_skipped` is NOT threaded through: the follow loop
+                // never mutates it, that accounting stays solely the
+                // top-of-slice arm's (at most once per slice, above).
                 match run_follow_loop(
                     client,
                     plan,
@@ -2465,7 +2538,6 @@ pub async fn run_twap_journaled(
                     slice_end,
                     &mut resting,
                     &mut stats,
-                    &mut slices_skipped,
                     journal.as_deref_mut(),
                     shutdown.as_mut(),
                 )
@@ -5710,6 +5782,11 @@ mod loop_tests {
                 3,
                 "two rejected retries plus the eventual successful place"
             );
+            assert_eq!(
+                report.slices_skipped, 1,
+                "the top-of-slice arm's own accounting counts the initial ALO reject once; \
+                 the follow loop's own two ALO-reject retries must NOT inflate this further"
+            );
         }
 
         /// 6) `ExecutionDeadline` passes mid-slice -> no further places from
@@ -5910,6 +5987,174 @@ mod loop_tests {
                 places,
                 vec![dec!(10), dec!(10.01)],
                 "slice 2's order size must include the residual carried from slice 1"
+            );
+            assert_eq!(
+                report.slices_skipped, 0,
+                "the follow loop's BelowMinNotional outcome must not increment \
+                 slices_skipped — slice 1 DID place and rest an order, it is not \
+                 a skipped slice"
+            );
+        }
+
+        /// `place_follow_child`'s `BelowMinNotional` outcome (via the
+        /// resting=None repost branch, i.e. `decide_slice` returning
+        /// `SkipBelowMinNotional` on a RETRY attempt rather than at the
+        /// initial place) must pause re-quoting for the rest of the slice:
+        /// no further book-driven place attempts, no false "repeated ALO
+        /// reject" warning (this is not an ALO reject), `slices_skipped`
+        /// unchanged by the follow loop's own contribution, and the
+        /// shortfall carries into the next slice's sizing.
+        #[tokio::test(start_paused = true)]
+        async fn skip_below_min_notional_on_a_retry_pauses_follow_for_the_rest_of_the_slice() {
+            let mut p = base_follow_plan();
+            p.slices = 2;
+            p.duration = Duration::from_secs(20);
+            p.per_slice = dec!(10);
+            p.total_adjusted = dec!(20);
+            p.total_requested = dec!(20);
+            p.follow_poll_secs = 2;
+            p.follow_repost_secs = 2;
+
+            let api = ScriptedApi::new()
+                // Slice 1: initial place is rejected outright (resting stays
+                // None), so the follow loop keeps retrying on the
+                // resting=None branch, subject to the repost throttle.
+                .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+                .push_place(alo_rejected())
+                // t=2s: repost throttle (2s) clears — retry. This time the
+                // price has collapsed so the remaining size (10) is worth
+                // less than the min-notional gate at the new touch;
+                // `decide_slice` returns SkipBelowMinNotional ->
+                // `FollowPlace::BelowMinNotional` -> the loop must pause
+                // (sleep to slice_end) rather than keep polling.
+                .push_book(Ok(book_at(dec!(0.001), dec!(0.002))))
+                // No further book fetch or place is scripted for the rest of
+                // slice 1 — if the fix regresses and the loop keeps polling
+                // or retrying, the queues run dry and panic.
+                //
+                // Slice 2: fresh book fetch at a recovered price, full 20
+                // catch-up size is well above the gate again.
+                .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+                .push_place(resting(2))
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(20),
+                    Some(dec!(49.9)),
+                    "canceled",
+                    OrderId(2),
+                    None,
+                    "HYPE",
+                    "B",
+                ))));
+
+            let report = run_twap(&api, &p).await;
+
+            assert_eq!(report.abort_reason, None);
+            assert_eq!(report.filled, dec!(20));
+            assert_eq!(
+                api.place_count(),
+                2,
+                "the rejected initial place, then the paused slice's follow loop must NOT \
+                 retry again this slice, then slice 2's catch-up place"
+            );
+            let places: Vec<Decimal> = api
+                .place_calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    Call::Place { sz, .. } => Some(sz),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                places,
+                vec![dec!(10), dec!(20)],
+                "the full shortfall from slice 1 (nothing filled) must carry into slice 2's size"
+            );
+            assert_eq!(
+                report.slices_skipped, 1,
+                "only the top-of-slice arm's initial-ALO-reject accounting counts here \
+                 (once); the follow loop's own BelowMinNotional pause must not add to it"
+            );
+        }
+
+        /// `place_follow_child`'s `TargetMet` outcome (`decide_slice`
+        /// returning `SkipAhead` on a repost attempt, reached when a
+        /// partial settle satisfies THIS SLICE's cumulative target while
+        /// the RUN's overall `total_adjusted` is not yet met, so the
+        /// `stats.filled >= plan.total_adjusted` short-circuit does not
+        /// apply and `place_follow_child` is actually invoked) must idle
+        /// the follow loop until `slice_end` — using the test harness's
+        /// virtual/paused time — with no further book-driven decide/place
+        /// calls during the idle period, and the next slice starts on
+        /// schedule.
+        #[tokio::test(start_paused = true)]
+        async fn skip_ahead_on_a_retry_idles_until_slice_end_and_next_slice_starts_on_schedule() {
+            let mut p = base_follow_plan();
+            p.slices = 2;
+            p.duration = Duration::from_secs(20);
+            p.per_slice = dec!(10);
+            p.total_adjusted = dec!(20);
+            p.total_requested = dec!(20);
+            p.follow_poll_secs = 2;
+            p.follow_repost_secs = 2;
+
+            let api = ScriptedApi::new()
+                // Slice 1: initial place rests.
+                .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+                .push_place(resting(1))
+                // t=2s: touch moves away past threshold and the repost
+                // throttle (2s) has elapsed -> cancel, settle. The settle
+                // reports a FULL fill of slice 1's own target (10), so
+                // `stats.filled` becomes 10 — equal to slice 1's own
+                // cumulative target but still under the RUN's
+                // `total_adjusted` (20), so the `>= total_adjusted`
+                // short-circuit does NOT fire and the repost path calls
+                // `place_follow_child`, which now sees `decide_slice`
+                // return SkipAhead for slice 1 (target 10, filled 10).
+                .push_book(Ok(book_at(dec!(50.4), dec!(50.6))))
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(10),
+                    Some(dec!(49.9)),
+                    "canceled",
+                    OrderId(1),
+                    None,
+                    "HYPE",
+                    "B",
+                ))))
+                // No further book fetch or place is scripted for the rest of
+                // slice 1 — if the fix regresses and the loop keeps polling
+                // or retrying after TargetMet, the queues run dry and panic.
+                //
+                // Slice 2: fresh book fetch, remaining 10 placed and settled
+                // on schedule, proving the next slice started on time.
+                .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+                .push_place(resting(2))
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(10),
+                    Some(dec!(49.9)),
+                    "canceled",
+                    OrderId(2),
+                    None,
+                    "HYPE",
+                    "B",
+                ))));
+
+            let report = run_twap(&api, &p).await;
+
+            assert_eq!(report.abort_reason, None);
+            assert_eq!(report.filled, dec!(20));
+            assert_eq!(
+                api.place_count(),
+                2,
+                "TargetMet on the repost attempt must stop re-quoting for the rest of \
+                 slice 1 (no further place calls) until slice 2 starts on schedule"
+            );
+            assert_eq!(
+                report.slices_skipped, 0,
+                "slice 1 DID place and fully settle an order; TargetMet reached only on \
+                 the repost attempt must not be counted as a skipped slice"
             );
         }
 
