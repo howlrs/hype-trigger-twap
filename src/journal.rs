@@ -413,20 +413,45 @@ pub struct RunSummary {
     /// slices were placed.
     pub cloids: Vec<(Cloid, CloidState)>,
     pub final_report_seen: bool,
+    /// `outcome_unknown_cloids` carried by the LAST `FinalReport` record in
+    /// the journal (an append-only journal can carry more than one — Issue
+    /// #20: a `--resume`/`--abandon-incomplete-run` that reconciles a
+    /// previously-unknown-cloid run and then continues/closes it appends a
+    /// FRESH FinalReport rather than rewriting the first one). `None` until
+    /// at least one `FinalReport` has been seen; `Some(vec![])` once one has
+    /// been seen with an empty list. Last-one-wins: each `FinalReport`
+    /// record overwrites this, so after a full replay it always reflects
+    /// the most recent one, never an earlier one.
+    pub last_final_report_unknown_cloids: Option<Vec<Cloid>>,
     pub abandoned: bool,
 }
 
 impl RunSummary {
     /// A run is "incomplete" (per the Issue #4 startup-blocking acceptance
-    /// criterion) if it has a header, is not abandoned, has no
-    /// `FinalReport`, AND has at least one cloid that is not yet `Terminal`.
+    /// criterion, extended by Issue #20) if it has a header, is not
+    /// abandoned, AND EITHER:
+    /// - has no `FinalReport` at all (original behaviour: a crash mid-run,
+    ///   with at least one cloid not yet `Terminal`), OR
+    /// - its LAST `FinalReport` (by journal order) carries a non-empty
+    ///   `outcome_unknown_cloids` — a settle-failure abort that journaled a
+    ///   FinalReport but left dangling `Prepared`/`Acknowledged` cloids
+    ///   un-reconciled (Issue #20). This branch does NOT additionally
+    ///   require `self.cloids` to have an unresolved entry — the
+    ///   FinalReport's own list is authoritative for this case, since it is
+    ///   exactly the set `find_incomplete_run`'s caller must reconcile.
     pub fn is_incomplete(&self) -> bool {
-        if self.header.is_none() || self.abandoned || self.final_report_seen {
+        if self.header.is_none() || self.abandoned {
             return false;
         }
-        self.cloids
-            .iter()
-            .any(|(_, st)| !matches!(st, CloidState::Terminal { .. }))
+        if !self.final_report_seen {
+            return self
+                .cloids
+                .iter()
+                .any(|(_, st)| !matches!(st, CloidState::Terminal { .. }));
+        }
+        self.last_final_report_unknown_cloids
+            .as_ref()
+            .is_some_and(|unknown| !unknown.is_empty())
     }
 
     /// Sum of every `Terminal` cloid's `filled_sz` — the resume accounting
@@ -512,7 +537,16 @@ pub fn summarize(records: &[JournalRecord]) -> RunSummary {
                     },
                 );
             }
-            JournalRecord::FinalReport { .. } => summary.final_report_seen = true,
+            JournalRecord::FinalReport {
+                outcome_unknown_cloids,
+                ..
+            } => {
+                summary.final_report_seen = true;
+                // Last-one-wins: a later FinalReport (Issue #20 resume/
+                // abandon continuation) overwrites whatever an earlier one
+                // in this same journal left here.
+                summary.last_final_report_unknown_cloids = Some(outcome_unknown_cloids.clone());
+            }
             JournalRecord::Abandoned { .. } => summary.abandoned = true,
         }
     }
