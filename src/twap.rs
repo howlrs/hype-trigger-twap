@@ -245,11 +245,22 @@ pub fn check_clock_skew(local_wall_now_ms: i64, server_ts_ms: i64) -> Result<(),
 /// of the NEXT slice, before that slice's own quote is placed — see
 /// `docs/DESIGN.md` for the full rationale and the in-flight-cap invariant
 /// this enforces.
+///
+/// `Follow`: identical to `Passive` for placement, settlement, journaling and
+/// every risk check — it reuses the exact same helpers (`RestingChild`,
+/// `settle_resting_child`, the Prepared/Acknowledged/Terminal journal
+/// sequence, `is_alo_reject`). The only difference is WITHIN a slice: instead
+/// of sleeping straight through to the slice boundary once the initial ALO
+/// is resting, the loop polls the book on a cadence and re-quotes the
+/// resting order to keep following the touch (README roadmap "mid-slice
+/// re-quoting"). See `run_follow_loop` for the full state machine. No taker
+/// fallback — out of scope for this variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChildAlgo {
     #[default]
     Market,
     Passive,
+    Follow,
 }
 
 /// Everything the loop needs, resolved before the first slice.
@@ -287,6 +298,18 @@ pub struct TwapPlan {
     /// Child-order algorithm for every slice (Issue #1). Defaults to
     /// `Market`, which reproduces pre-Issue-#1 behaviour exactly.
     pub child_algo: ChildAlgo,
+    /// `ChildAlgo::Follow` only: seconds between book polls inside a slice's
+    /// follow loop. Ignored by `Market`/`Passive`.
+    pub follow_poll_secs: u64,
+    /// `ChildAlgo::Follow` only: minimum seconds between reposts of the
+    /// resting order (throttle), counted from this SLICE's last place.
+    /// Ignored by `Market`/`Passive`.
+    pub follow_repost_secs: u64,
+    /// `ChildAlgo::Follow` only: minimum relative distance (in basis points)
+    /// the touch must move AWAY from our resting price before a repost is
+    /// worth burning queue priority for (hysteresis). Ignored by
+    /// `Market`/`Passive`.
+    pub follow_threshold_bps: Decimal,
 }
 
 impl TwapPlan {
@@ -850,6 +873,165 @@ async fn settle_resting_child(
         sz: vf.filled_sz,
         px: vf.avg_px.unwrap_or(resting.px),
     })
+}
+
+/// Outcome of one ALO (post-only) place attempt via [`place_alo_child`].
+enum AloPlaceOutcome {
+    /// The order rested; `resting` is what the caller should carry forward
+    /// (as `run_twap_journaled`'s single in-flight slot, or a follow loop's
+    /// tracked resting order).
+    Resting(RestingChild),
+    /// A KNOWN, normal post-only rejection (Issue #1 PM decision) — already
+    /// journaled as a zero-fill Terminal. Not an error; the caller decides
+    /// whether/when to retry.
+    RejectedSkip,
+}
+
+/// Place one ALO (post-only) child order: journal `Prepared` (fsynced BEFORE
+/// the send), re-check `exec_deadline` immediately before sending, then send
+/// and journal the result — the exact sequence `run_twap_journaled`'s
+/// `ChildAlgo::Passive` arm used before this was extracted, now shared with
+/// `ChildAlgo::Follow`'s initial place AND every repost inside its follow
+/// loop (`run_follow_loop`). Every invariant that applied to a single
+/// Passive place — Prepared-before-send, deadline re-check, ALO-reject is a
+/// normal zero-fill skip, a `Filled` outcome is never trusted, a transport
+/// failure is journaled `SubmittedUnknown` and treated as fatal for this
+/// run (recovery is `--resume`) — applies identically to every call site.
+///
+/// `Err(String)` carries a ready-to-use `abort_reason` message; callers
+/// short-circuit the slice loop (or the follow loop) on it exactly as the
+/// original inline code did via `break`.
+#[allow(clippy::too_many_arguments)]
+async fn place_alo_child(
+    client: &dyn HlApi,
+    plan: &TwapPlan,
+    exec_deadline: &ExecutionDeadline,
+    slice_idx: u32,
+    cloid: Cloid,
+    px: Decimal,
+    order_sz: Decimal,
+    mut journal: Option<&mut ExecutionJournal>,
+) -> Result<AloPlaceOutcome, String> {
+    let intent = OrderIntent {
+        cloid,
+        symbol: plan.symbol.clone(),
+        side: plan.side,
+        px,
+        sz: order_sz,
+        tif: Tif::Alo,
+        reduce_only: false,
+    };
+
+    // Issue #1 Finding 1 fix: durably record intent+cloid BEFORE the send
+    // that could have an ambiguous outcome.
+    if let Some(j) = journal.as_deref_mut() {
+        if let Err(e) = j.record(&JournalRecord::Prepared {
+            slice_idx,
+            cloid,
+            nonce: None,
+            symbol: intent.symbol.clone(),
+            side: intent.side,
+            px: intent.px.to_string(),
+            sz: intent.sz.to_string(),
+        }) {
+            return Err(format!(
+                "slice {slice_idx}: journal write (Prepared) failed: {e}"
+            ));
+        }
+    }
+
+    // A1 fix: re-check the ExecutionDeadline immediately before the send.
+    if let Err(e) = exec_deadline.check_before_send(tokio::time::Instant::now()) {
+        return Err(format!("slice {slice_idx}: {e}"));
+    }
+
+    match client
+        .place_order_once(&intent, plan.asset_index, exec_deadline.expires_after_ms())
+        .await
+    {
+        Ok((_, PlaceOutcome::Resting { oid })) => {
+            if let Some(j) = journal.as_deref_mut() {
+                if let Err(e) = j.record(&JournalRecord::Acknowledged {
+                    slice_idx,
+                    cloid,
+                    oid: Some(oid.0),
+                    status: "resting".into(),
+                }) {
+                    return Err(format!(
+                        "slice {slice_idx}: journal write (Acknowledged) failed: {e}"
+                    ));
+                }
+            }
+            tracing::info!(
+                slice = slice_idx,
+                sz = %human(order_sz),
+                px = %human(px),
+                oid = %oid,
+                cloid = %cloid,
+                "ALO resting"
+            );
+            Ok(AloPlaceOutcome::Resting(RestingChild {
+                cloid,
+                oid,
+                requested_sz: order_sz,
+                px,
+                slice_idx,
+            }))
+        }
+        // ALO is post-only — HL never matches it immediately, so a `Filled`
+        // outcome here would mean HL crossed a post-only order, which this
+        // binary does not trust.
+        Ok((_, outcome @ PlaceOutcome::Filled { .. })) => Err(format!(
+            "slice {slice_idx}: ALO placement returned an unexpected Filled outcome \
+             ({outcome:?}) — a post-only order should never match immediately; refusing to \
+             trust this response"
+        )),
+        Err(HlError::Exchange { code, message }) => {
+            if is_alo_reject(code.as_deref(), &message) {
+                // A rejected ALO never landed — a KNOWN zero-fill outcome,
+                // so close the cloid out immediately as a zero-fill Terminal
+                // rather than leaving it dangling as unresolved.
+                if let Err(e) = journal_terminal(
+                    journal.as_deref_mut(),
+                    slice_idx,
+                    cloid,
+                    "aloRejected",
+                    Decimal::ZERO,
+                    None,
+                ) {
+                    return Err(format!(
+                        "slice {slice_idx}: journal write (Terminal, aloRejected) failed: {e}"
+                    ));
+                }
+                tracing::info!(
+                    slice = slice_idx,
+                    cloid = %cloid,
+                    message = %message,
+                    "ALO rejected (post-only would have crossed); skipping this place"
+                );
+                Ok(AloPlaceOutcome::RejectedSkip)
+            } else {
+                let kind = RejectionKind::classify(&message);
+                Err(format!(
+                    "slice {slice_idx} rejected by exchange [{}]: {message} — {}",
+                    code.unwrap_or_else(|| "?".into()),
+                    kind.advice()
+                ))
+            }
+        }
+        Err(e) => {
+            // Transport failure: the send outcome is genuinely unknown —
+            // journal it as `SubmittedUnknown` so a future `--resume` knows
+            // this cloid needs `orderStatus` reconciliation rather than
+            // being silently forgotten. No in-run resend for an ambiguous
+            // ALO send (out of scope); the run aborts and `--resume` is the
+            // recovery path.
+            if let Some(j) = journal {
+                let _ = j.record(&JournalRecord::SubmittedUnknown { slice_idx, cloid });
+            }
+            Err(format!("slice {slice_idx} failed: {e}"))
+        }
+    }
 }
 
 /// How many times a place may be re-signed and re-sent after an AMBIGUOUS
@@ -1423,6 +1605,476 @@ impl ShutdownSignal {
     }
 }
 
+/// How [`run_follow_loop`] finished.
+enum FollowLoopExit {
+    /// Ran (or fast-forwarded through skip states) until `slice_end`.
+    SliceEndReached,
+    /// The `ExecutionDeadline` elapsed strictly BEFORE `slice_end` (i.e. the
+    /// run's `--duration` ran out mid-slice, not just this slice's own
+    /// interval) — the caller must surface an abort exactly like the
+    /// existing top-of-loop deadline check does for the NEXT slice, since
+    /// on the FINAL slice there is no next iteration to catch it.
+    DeadlinePassed,
+    /// Shutdown was signalled during a poll-cadence sleep; the caller must
+    /// treat this exactly like the existing inter-slice shutdown check
+    /// (abort, no further slices scheduled) — any settle already in flight
+    /// when this returns has ALREADY run to completion (never cancelled
+    /// mid-flight), matching the run-level shutdown contract.
+    ShutdownRequested,
+}
+
+/// Outcome of a single [`place_follow_child`] attempt. Distinguishes the
+/// three cases that used to be collapsed into `Ok(None)`: a plain ALO
+/// reject (retry later, subject to the caller's throttle) vs. the two
+/// "stop re-quoting for the rest of this slice" outcomes (`TargetMet`,
+/// `BelowMinNotional`) — conflating these caused the follow loop to
+/// over-count `slices_skipped` on every retry tick and to keep polling
+/// after the slice's target was already met or its remainder was
+/// unexecutable.
+enum FollowPlace {
+    /// Placed and resting.
+    Placed(RestingChild),
+    /// A normal ALO reject (post-only would have crossed); retry later.
+    AloRejected,
+    /// The slice's target is already met (was `SkipAhead`); stop
+    /// re-quoting for the remainder of this slice.
+    TargetMet,
+    /// Remaining size is below min notional (was `SkipBelowMinNotional`);
+    /// stop re-quoting for the remainder of this slice, shortfall carried
+    /// by catch-up sizing on a later slice.
+    BelowMinNotional,
+}
+
+/// Shared bookkeeping for a plain ALO reject inside the follow loop: bump
+/// the consecutive-reject counter and emit the "repeated ALO rejects"
+/// warning every 5th occurrence. Deliberately does NOT touch
+/// `slices_skipped` — an ALO reject is a retry-later outcome, not a
+/// skipped slice.
+fn note_alo_reject(consecutive_alo_rejects: &mut u32, slice_idx: u32, context: &str) {
+    *consecutive_alo_rejects += 1;
+    if consecutive_alo_rejects.is_multiple_of(5) {
+        tracing::warn!(
+            slice = slice_idx,
+            consecutive_alo_rejects = *consecutive_alo_rejects,
+            "follow: repeated ALO rejects {context} \
+             (execution shortfall risk in a fast-moving market)"
+        );
+    }
+}
+
+/// `ChildAlgo::Follow`'s within-slice mid-slice re-quoting loop.
+///
+/// Polls the book on `plan.follow_poll_secs` cadence (raced against
+/// shutdown, same pattern as the existing inter-slice sleep) until
+/// `slice_end`. Every place/settle inside this loop reuses the EXACT SAME
+/// helpers the top-level slice loop uses for Passive
+/// (`place_alo_child`/`settle_resting_child`) — there is no second
+/// place/settle/journal implementation for Follow, only a different
+/// decision of WHEN to call them.
+///
+/// `resting`/`stats` are the CALLER's own loop-local state, threaded
+/// through by mutable reference so a fill credited inside this function
+/// flows through the identical `stats.add` accounting the rest of
+/// `run_twap_journaled` uses — never a second, parallel accounting path.
+/// This loop never mutates `slices_skipped` itself — that accounting is
+/// solely the top-of-slice arm's, at most once per slice; see
+/// `FollowPlace`.
+#[allow(clippy::too_many_arguments)]
+async fn run_follow_loop(
+    client: &dyn HlApi,
+    plan: &TwapPlan,
+    exec_deadline: &ExecutionDeadline,
+    slice_idx: u32,
+    slice_end: tokio::time::Instant,
+    resting: &mut Option<RestingChild>,
+    stats: &mut FillStats,
+    mut journal: Option<&mut ExecutionJournal>,
+    shutdown: Option<&mut ShutdownSignal>,
+) -> Result<FollowLoopExit, String> {
+    let poll_interval = Duration::from_secs(plan.follow_poll_secs);
+    // Throttle state, PER SLICE: the time of this slice's last place (initial
+    // or repost) and a consecutive-ALO-reject counter for shortfall
+    // visibility (brief's item 5). Both reset implicitly on function entry
+    // since a new slice's follow loop is a fresh call.
+    let mut last_place_at = tokio::time::Instant::now();
+    let mut consecutive_alo_rejects: u32 = 0;
+
+    loop {
+        if tokio::time::Instant::now() >= slice_end {
+            return Ok(FollowLoopExit::SliceEndReached);
+        }
+
+        // Race the poll sleep against shutdown, identical in shape to the
+        // existing inter-slice `select!` — an interrupt during a (short)
+        // poll wait is noticed immediately rather than only at the top of
+        // the next tick.
+        let sleep_for =
+            poll_interval.min(slice_end.saturating_duration_since(tokio::time::Instant::now()));
+        match shutdown {
+            Some(ref sd) if sd.is_triggered() => return Ok(FollowLoopExit::ShutdownRequested),
+            Some(ref sd) => {
+                let mut sd_wait = (*sd).clone();
+                tokio::select! {
+                    _ = tokio::time::sleep(sleep_for) => {}
+                    _ = sd_wait.wait() => return Ok(FollowLoopExit::ShutdownRequested),
+                }
+            }
+            None => tokio::time::sleep(sleep_for).await,
+        }
+
+        if tokio::time::Instant::now() >= slice_end {
+            return Ok(FollowLoopExit::SliceEndReached);
+        }
+
+        // Deadline re-check (item 2): once past, no new places — leave
+        // whatever is resting for the boundary/cleanup settle to pick up.
+        // Reached only when `now < slice_end` (the check above already
+        // returned otherwise), so this is always a genuine EARLY exit, not
+        // slice_end/deadline coinciding on the run's final slice.
+        if exec_deadline.has_passed(tokio::time::Instant::now()) {
+            return Ok(FollowLoopExit::DeadlinePassed);
+        }
+
+        let snapshot = match fetch_fresh_book(
+            client,
+            &plan.symbol,
+            plan.max_book_age_ms,
+            Some(exec_deadline),
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                // §9 (docs/DEVELOPMENT.md): `fetch_fresh_book` bounds its
+                // OWN internal retry budget AND the in-flight call itself by
+                // the remaining `ExecutionDeadline` — an error surfacing
+                // here because the deadline elapsed mid-fetch must be
+                // treated as a deadline exit (no further sends), never as
+                // an ordinary transient failure to warn-and-retry past.
+                if exec_deadline.has_passed(tokio::time::Instant::now()) {
+                    tracing::info!(
+                        slice = slice_idx,
+                        error = %e,
+                        "follow: execution deadline elapsed while fetching the book; \
+                         stopping the follow loop, no further places"
+                    );
+                    return Ok(FollowLoopExit::DeadlinePassed);
+                }
+                // Item 2: a genuinely transient book failure mid-slice must
+                // NOT abort the run — the resting ALO (if any) keeps
+                // working regardless of whether we can currently re-quote
+                // it. Only the NEXT SLICE's boundary fetch (the existing
+                // top-of-loop `fetch_fresh_book` call, unchanged by this
+                // feature) still aborts on failure, exactly as it did
+                // before Follow existed.
+                tracing::warn!(
+                    slice = slice_idx,
+                    error = %e,
+                    "follow: book fetch failed this tick; skipping the tick, \
+                     the resting order (if any) is unaffected"
+                );
+                continue;
+            }
+        };
+        let touch = match plan.side {
+            Side::Long => snapshot.best_bid,
+            Side::Short => snapshot.best_ask,
+        };
+
+        // === No resting order: (re)try placing ===
+        let Some(child) = resting.as_ref() else {
+            if tokio::time::Instant::now().saturating_duration_since(last_place_at)
+                < Duration::from_secs(plan.follow_repost_secs)
+            {
+                continue;
+            }
+            let new_px = round_price(touch, plan.sz_decimals, plan.side);
+            match place_follow_child(
+                client,
+                plan,
+                exec_deadline,
+                slice_idx,
+                new_px,
+                stats,
+                journal.as_deref_mut(),
+            )
+            .await
+            {
+                Ok(FollowPlace::Placed(child)) => {
+                    *resting = Some(child);
+                    last_place_at = tokio::time::Instant::now();
+                    consecutive_alo_rejects = 0;
+                }
+                Ok(FollowPlace::AloRejected) => {
+                    // Nothing to carry forward from THIS tick; try again
+                    // next tick (subject to the same throttle). Does NOT
+                    // touch `slices_skipped` — see `FollowPlace`.
+                    last_place_at = tokio::time::Instant::now();
+                    note_alo_reject(
+                        &mut consecutive_alo_rejects,
+                        slice_idx,
+                        "while trying to re-enter the book",
+                    );
+                }
+                Ok(FollowPlace::TargetMet | FollowPlace::BelowMinNotional) => {
+                    // Stop re-quoting for the remainder of this slice: sleep
+                    // until `slice_end`, racing shutdown, same as the
+                    // poll-cadence sleep above.
+                    return sleep_until_slice_end_or_shutdown(slice_end, shutdown).await;
+                }
+                Err(reason) => return Err(reason),
+            }
+            continue;
+        };
+
+        // === Touch moved THROUGH us: our order is very likely fully
+        // filled (Long: touch < px means the book's best bid dropped below
+        // our resting price, i.e. trades happened AT or through our level;
+        // Short: touch > px is the mirror). Settle IMMEDIATELY — no
+        // threshold, no repost throttle for the settle itself. ===
+        let child_px = child.px;
+        let moved_through = match plan.side {
+            Side::Long => touch < child_px,
+            Side::Short => touch > child_px,
+        };
+        if moved_through {
+            // `resting` is `Some` here — this branch is only reached via the
+            // `let Some(child) = resting.as_ref() else { .. }` guard above,
+            // which already `continue`d on `None`.
+            let Some(settled) = resting.take() else {
+                unreachable!("resting was Some via the guard above")
+            };
+            match settle_resting_child(client, plan, settled, journal.as_deref_mut()).await {
+                Ok(SliceOutcome { sz, px: fill_px }) => {
+                    if sz > Decimal::ZERO {
+                        stats.add(sz, fill_px);
+                    }
+                }
+                Err(e) => {
+                    return Err(format!(
+                    "slice {slice_idx}: follow: failed to settle after the touch moved through \
+                     our resting price: {e}"
+                ))
+                }
+            }
+            if stats.filled >= plan.total_adjusted {
+                return Ok(FollowLoopExit::SliceEndReached);
+            }
+            // Re-place still respects the repost throttle (checked at the
+            // top of the next tick via the `resting.is_none()` branch) —
+            // matching item 3's "re-place still respects the repost
+            // throttle" instruction. Do NOT place again on this same tick;
+            // let the next tick's `None` branch decide, so the throttle
+            // clock (`last_place_at`, unchanged here) still governs it.
+            continue;
+        }
+
+        // === Touch moved AWAY from us: repost only past BOTH the
+        // hysteresis threshold and the repost-secs throttle. ===
+        let moved_away = match plan.side {
+            Side::Long => touch > child.px,
+            Side::Short => touch < child.px,
+        };
+        if moved_away {
+            let distance_bps = if child.px > Decimal::ZERO {
+                (touch - child.px).abs() / child.px * dec!(10_000)
+            } else {
+                Decimal::ZERO
+            };
+            let past_threshold = distance_bps >= plan.follow_threshold_bps;
+            let past_repost_throttle = tokio::time::Instant::now()
+                .saturating_duration_since(last_place_at)
+                >= Duration::from_secs(plan.follow_repost_secs);
+            if past_threshold && past_repost_throttle {
+                // `resting` is `Some` here for the same reason as the
+                // moved-through branch above.
+                let Some(settled) = resting.take() else {
+                    unreachable!("resting was Some via the guard above")
+                };
+                match settle_resting_child(client, plan, settled, journal.as_deref_mut()).await {
+                    Ok(SliceOutcome { sz, px: fill_px }) => {
+                        if sz > Decimal::ZERO {
+                            stats.add(sz, fill_px);
+                        }
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                        "slice {slice_idx}: follow: failed to settle before reposting at a new \
+                         touch: {e}"
+                    ))
+                    }
+                }
+                if stats.filled >= plan.total_adjusted {
+                    return Ok(FollowLoopExit::SliceEndReached);
+                }
+                let new_px = round_price(touch, plan.sz_decimals, plan.side);
+                match place_follow_child(
+                    client,
+                    plan,
+                    exec_deadline,
+                    slice_idx,
+                    new_px,
+                    stats,
+                    journal.as_deref_mut(),
+                )
+                .await
+                {
+                    Ok(FollowPlace::Placed(child)) => {
+                        *resting = Some(child);
+                        last_place_at = tokio::time::Instant::now();
+                        consecutive_alo_rejects = 0;
+                    }
+                    Ok(FollowPlace::AloRejected) => {
+                        // Does NOT touch `slices_skipped` — see `FollowPlace`.
+                        last_place_at = tokio::time::Instant::now();
+                        note_alo_reject(
+                            &mut consecutive_alo_rejects,
+                            slice_idx,
+                            "while reposting at the moving touch",
+                        );
+                    }
+                    Ok(FollowPlace::TargetMet | FollowPlace::BelowMinNotional) => {
+                        return sleep_until_slice_end_or_shutdown(slice_end, shutdown).await;
+                    }
+                    Err(reason) => return Err(reason),
+                }
+            }
+            continue;
+        }
+
+        // touch == child.px: at the touch already, keep queue priority, do
+        // nothing this tick.
+    }
+}
+
+/// Stop re-quoting for the remainder of the current slice: sleep until
+/// `slice_end`, racing against shutdown exactly like the follow loop's own
+/// poll-cadence sleep does, then report how the wait ended. Shared by both
+/// `TargetMet` and `BelowMinNotional` call sites in `run_follow_loop` —
+/// neither should keep polling the book once the slice's remaining size is
+/// either already met or unexecutable this slice.
+async fn sleep_until_slice_end_or_shutdown(
+    slice_end: tokio::time::Instant,
+    shutdown: Option<&mut ShutdownSignal>,
+) -> Result<FollowLoopExit, String> {
+    let sleep_for = slice_end.saturating_duration_since(tokio::time::Instant::now());
+    match shutdown {
+        Some(sd) if sd.is_triggered() => Ok(FollowLoopExit::ShutdownRequested),
+        Some(sd) => {
+            let mut sd_wait = sd.clone();
+            tokio::select! {
+                _ = tokio::time::sleep(sleep_for) => Ok(FollowLoopExit::SliceEndReached),
+                _ = sd_wait.wait() => Ok(FollowLoopExit::ShutdownRequested),
+            }
+        }
+        None => {
+            tokio::time::sleep(sleep_for).await;
+            Ok(FollowLoopExit::SliceEndReached)
+        }
+    }
+}
+
+/// Re-place inside the follow loop: recompute sizing via `decide_slice` at
+/// the new touch (item 4), run the SAME pre-place gates the top of the
+/// slice loop runs (`RiskEnvelope::validate_limit_price`, the CUMULATIVE
+/// notional cap re-check), then place via `place_alo_child`.
+///
+/// `Placed` — placed and resting.
+/// `TargetMet` — nothing placed this tick: target already met (was
+/// `SkipAhead`); the follow loop should stop trying to place and just ride
+/// out the rest of the slice.
+/// `BelowMinNotional` — nothing placed this tick: remaining size is below
+/// min notional (was `SkipBelowMinNotional`); pause following until next
+/// slice — the shortfall is carried by the normal catch-up sizing on a
+/// later slice.
+/// `AloRejected` — a normal ALO reject (post-only would have crossed);
+/// retry later, subject to the caller's own throttle.
+/// `Err(reason)` — fatal: risk envelope breach, notional cap breach, or a
+/// non-ALO exchange rejection/transport failure from `place_alo_child`.
+async fn place_follow_child(
+    client: &dyn HlApi,
+    plan: &TwapPlan,
+    exec_deadline: &ExecutionDeadline,
+    slice_idx: u32,
+    new_px: Decimal,
+    stats: &FillStats,
+    journal: Option<&mut ExecutionJournal>,
+) -> Result<FollowPlace, String> {
+    // Item 4: recompute via decide_slice, exactly like the top of the slice
+    // loop does, at the NEW touch price and the CURRENT cumulative fill.
+    let decision = decide_slice(
+        slice_idx,
+        plan.slices,
+        plan.per_slice,
+        plan.total_adjusted,
+        stats.filled,
+        plan.sz_decimals,
+        new_px,
+    );
+    let order_sz = match decision {
+        SliceDecision::Place(sz) => sz,
+        SliceDecision::SkipAhead => {
+            tracing::info!(slice = slice_idx, "follow: target met; stopping re-quotes");
+            return Ok(FollowPlace::TargetMet);
+        }
+        SliceDecision::SkipBelowMinNotional { sz, notional } => {
+            tracing::info!(
+                slice = slice_idx,
+                sz = %human(sz),
+                notional = %human(notional),
+                "follow: remaining below min notional; pausing follow until next slice \
+                 (carried by catch-up)"
+            );
+            return Ok(FollowPlace::BelowMinNotional);
+        }
+    };
+
+    // Same pre-place gates the top-of-slice code runs, re-evaluated at the
+    // NEW touch (bid/ask are not separately available here beyond `new_px`
+    // itself, so `validate_limit_price` is checked against `new_px` on both
+    // sides — it only rejects a non-positive price, which is bid/ask-shape
+    // independent).
+    if let Err(e) =
+        RiskEnvelope::validate_limit_price(new_px, plan.side, plan.slippage_bps, new_px, new_px)
+    {
+        return Err(format!(
+            "slice {slice_idx}: follow: risk envelope rejected the re-quoted limit price: {e}"
+        ));
+    }
+    let slice_notional_estimate = order_sz * new_px;
+    let cumulative_notional_estimate = stats.notional + slice_notional_estimate;
+    if let Err(e) =
+        RiskEnvelope::check_notional_cap(cumulative_notional_estimate, plan.max_notional_usd)
+    {
+        return Err(format!(
+            "slice {slice_idx}: follow: risk envelope rejected the re-quoted notional \
+             (cumulative {} + this order {} would exceed the cap): {e}",
+            human(stats.notional),
+            human(slice_notional_estimate)
+        ));
+    }
+    if let Err(e) = exec_deadline.check_before_send(tokio::time::Instant::now()) {
+        return Err(format!("slice {slice_idx}: {e}"));
+    }
+
+    let cloid = Cloid::new();
+    match place_alo_child(
+        client,
+        plan,
+        exec_deadline,
+        slice_idx,
+        cloid,
+        new_px,
+        order_sz,
+        journal,
+    )
+    .await?
+    {
+        AloPlaceOutcome::Resting(child) => Ok(FollowPlace::Placed(child)),
+        AloPlaceOutcome::RejectedSkip => Ok(FollowPlace::AloRejected),
+    }
+}
+
 /// Run the TWAP loop with optional crash-safety journaling and cooperative
 /// shutdown (Issue #4).
 ///
@@ -1578,7 +2230,12 @@ pub async fn run_twap_journaled(
             ChildAlgo::Market => {
                 taker_limit_price(bid, ask, plan.side, plan.slippage_bps, plan.sz_decimals)
             }
-            ChildAlgo::Passive => {
+            // Follow quotes at the touch exactly like Passive for its
+            // initial place — the mid-slice re-quoting happens AFTER this
+            // slice's own place/settle machinery runs, inside
+            // `run_follow_loop`, which recomputes the touch itself on every
+            // tick rather than reusing this `px`.
+            ChildAlgo::Passive | ChildAlgo::Follow => {
                 let touch = match plan.side {
                     Side::Long => bid,
                     Side::Short => ask,
@@ -1672,12 +2329,12 @@ pub async fn run_twap_journaled(
         let cloid = Cloid::new();
         let tif = match plan.child_algo {
             ChildAlgo::Market => Tif::Ioc,
-            ChildAlgo::Passive => Tif::Alo,
+            ChildAlgo::Passive | ChildAlgo::Follow => Tif::Alo,
         };
 
         if plan.read_only {
             println!(
-                "[READ-ONLY] would place: slice {}/{} {} {} {} @ {} ({}, cloid {}, mid {})",
+                "[READ-ONLY] would place: slice {}/{} {} {} {} @ {} ({}, cloid {}, mid {}){}",
                 slice_idx,
                 plan.slices,
                 plan.side,
@@ -1690,11 +2347,17 @@ pub async fn run_twap_journaled(
                     Tif::Gtc => "GTC",
                 },
                 cloid,
-                human(snapshot.mid)
+                human(snapshot.mid),
+                if plan.child_algo == ChildAlgo::Follow {
+                    " [follow: mid-slice reposting is NOT simulated in dry-run]"
+                } else {
+                    ""
+                }
             );
             // Assume a full fill so the dry run walks the same slice path
-            // for both algorithms — a real passive run's fill is never
-            // guaranteed, but read-only never sends anything to observe.
+            // for both algorithms — a real passive/follow run's fill is
+            // never guaranteed, but read-only never sends anything to
+            // observe.
             stats.add(order_sz, px);
             slices_executed += 1;
             sleep_until(slice_end).await;
@@ -1782,156 +2445,140 @@ pub async fn run_twap_journaled(
                     "placing ALO (post-only) slice"
                 );
 
-                // Issue #1 Finding 1 fix: durably record intent+cloid BEFORE
-                // the send that could have an ambiguous outcome — the same
-                // "Prepared fsynced before the POST" guarantee
-                // `place_slice_reconciled` gives market mode (Issue #4). A
-                // crash between this fsync and the send completing leaves a
-                // durable record that `--resume` can reconcile via
-                // `orderStatus`, closing the gap this finding reported (a
-                // killed passive run's resting order used to be completely
-                // invisible to the journal).
-                if let Some(j) = journal.as_deref_mut() {
-                    if let Err(e) = j.record(&JournalRecord::Prepared {
-                        slice_idx,
-                        cloid,
-                        nonce: None,
-                        symbol: intent.symbol.clone(),
-                        side: intent.side,
-                        px: intent.px.to_string(),
-                        sz: intent.sz.to_string(),
-                    }) {
-                        abort_reason = Some(format!(
-                            "slice {slice_idx}: journal write (Prepared) failed: {e}"
-                        ));
-                        break;
-                    }
-                }
-
-                // A1 fix: re-check the ExecutionDeadline immediately before
-                // the send, same guarantee `place_slice_reconciled` gives
-                // market mode via its own `check_before_send` call. Without
-                // this, a book fetch that consumes nearly the whole
-                // remaining deadline (bounded by `fetch_fresh_book`'s own
-                // internal timeout, Issue #2 finding 2) could return
-                // successfully just under the wire and fall straight through
-                // to this send with the deadline already elapsed, relying
-                // only on exchange-side `expiresAfter` as a backstop.
-                if let Err(e) = exec_deadline.check_before_send(tokio::time::Instant::now()) {
-                    abort_reason = Some(format!("slice {slice_idx}: {e}"));
-                    break;
-                }
-
-                // Issue #1 PM decision: an ALO rejection (e.g.
-                // `badAloPxRejected` — the touch moved across our signed
-                // price between snapshot and send, so the order would have
-                // crossed and taken instead of resting) is a NORMAL
-                // post-only outcome, not an error. It is credited as a
-                // zero-fill skip and the shortfall carries forward via the
-                // usual catch-up sizing on the NEXT slice — the run must
-                // never abort on this. Any other exchange rejection is still
-                // fatal, unchanged from market mode.
-                match client
-                    .place_order_once(&intent, plan.asset_index, exec_deadline.expires_after_ms())
-                    .await
+                match place_alo_child(
+                    client,
+                    plan,
+                    &exec_deadline,
+                    slice_idx,
+                    cloid,
+                    px,
+                    order_sz,
+                    journal.as_deref_mut(),
+                )
+                .await
                 {
-                    Ok((_, PlaceOutcome::Resting { oid })) => {
-                        if let Some(j) = journal.as_deref_mut() {
-                            if let Err(e) = j.record(&JournalRecord::Acknowledged {
-                                slice_idx,
-                                cloid,
-                                oid: Some(oid.0),
-                                status: "resting".into(),
-                            }) {
-                                abort_reason = Some(format!(
-                                    "slice {slice_idx}: journal write (Acknowledged) failed: {e}"
-                                ));
-                                break;
-                            }
-                        }
-                        resting = Some(RestingChild {
-                            cloid,
-                            oid,
-                            requested_sz: order_sz,
-                            px,
-                            slice_idx,
-                        });
+                    Ok(AloPlaceOutcome::Resting(child)) => {
+                        resting = Some(child);
                         slices_executed += 1;
                         tracing::info!(
                             slice = slice_idx,
-                            sz = %human(order_sz),
-                            px = %human(px),
-                            oid = %oid,
                             "ALO resting; will settle at the next slice boundary"
                         );
                     }
-                    // ALO is post-only — HL never matches it immediately, so
-                    // a `Filled` outcome here would mean HL crossed a
-                    // post-only order, which this binary does not trust.
-                    Ok((_, outcome @ PlaceOutcome::Filled { .. })) => {
-                        abort_reason = Some(format!(
-                            "slice {slice_idx}: ALO placement returned an unexpected Filled \
-                             outcome ({outcome:?}) — a post-only order should never match \
-                             immediately; refusing to trust this response"
-                        ));
-                        break;
+                    Ok(AloPlaceOutcome::RejectedSkip) => {
+                        slices_skipped += 1;
+                        tracing::info!(
+                            slice = slice_idx,
+                            "ALO rejected (post-only would have crossed); \
+                             skipping this slice, catch-up will carry the shortfall"
+                        );
                     }
-                    Err(HlError::Exchange { code, message }) => {
-                        if is_alo_reject(code.as_deref(), &message) {
-                            // A rejected ALO never landed — it is not
-                            // `Prepared`-only in the journal sense of "we
-                            // don't know," it is a KNOWN zero-fill outcome,
-                            // so close the cloid out immediately as a
-                            // zero-fill Terminal rather than leaving it
-                            // dangling as unresolved for a future --resume.
-                            if let Err(e) = journal_terminal(
-                                journal.as_deref_mut(),
-                                slice_idx,
-                                cloid,
-                                "aloRejected",
-                                Decimal::ZERO,
-                                None,
-                            ) {
-                                abort_reason = Some(format!(
-                                    "slice {slice_idx}: journal write (Terminal, aloRejected) \
-                                     failed: {e}"
-                                ));
-                                break;
-                            }
-                            slices_skipped += 1;
-                            tracing::info!(
-                                slice = slice_idx,
-                                message = %message,
-                                "ALO rejected (post-only would have crossed); \
-                                 skipping this slice, catch-up will carry the shortfall"
-                            );
-                        } else {
-                            let kind = RejectionKind::classify(&message);
-                            abort_reason = Some(format!(
-                                "slice {slice_idx} rejected by exchange [{}]: {message} — {}",
-                                code.unwrap_or_else(|| "?".into()),
-                                kind.advice()
-                            ));
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        // Transport failure: the send outcome is genuinely
-                        // unknown (same ambiguity class `place_slice_reconciled`
-                        // handles for market mode) — journal it as
-                        // `SubmittedUnknown` so a future `--resume` knows
-                        // this cloid needs `orderStatus` reconciliation
-                        // rather than being silently forgotten. This binary
-                        // does not attempt an in-run resend for an ambiguous
-                        // passive send (out of this finding's scope); the
-                        // run aborts and `--resume` is the recovery path.
-                        if let Some(j) = journal.as_deref_mut() {
-                            let _ = j.record(&JournalRecord::SubmittedUnknown { slice_idx, cloid });
-                        }
-                        abort_reason = Some(format!("slice {slice_idx} failed: {e}"));
+                    Err(reason) => {
+                        abort_reason = Some(reason);
                         break;
                     }
                 }
+            }
+            ChildAlgo::Follow => {
+                tracing::info!(
+                    slice = slice_idx,
+                    slices = plan.slices,
+                    sz = %human(order_sz),
+                    px = %human(px),
+                    cloid = %cloid,
+                    "placing ALO (post-only) slice [follow]"
+                );
+
+                match place_alo_child(
+                    client,
+                    plan,
+                    &exec_deadline,
+                    slice_idx,
+                    cloid,
+                    px,
+                    order_sz,
+                    journal.as_deref_mut(),
+                )
+                .await
+                {
+                    Ok(AloPlaceOutcome::Resting(child)) => {
+                        resting = Some(child);
+                        slices_executed += 1;
+                    }
+                    Ok(AloPlaceOutcome::RejectedSkip) => {
+                        // Initial ALO rejected: no resting order to follow
+                        // yet this slice. The follow loop below still runs
+                        // (it will keep RETRYING the place on later ticks,
+                        // subject to the repost throttle) rather than
+                        // falling straight through to a plain sleep — an
+                        // initial reject is exactly the "no resting order"
+                        // case `run_follow_loop` already handles every tick.
+                        slices_skipped += 1;
+                    }
+                    Err(reason) => {
+                        abort_reason = Some(reason);
+                        break;
+                    }
+                }
+
+                // Mid-slice re-quoting (README roadmap item): poll the book
+                // and keep the resting order following the touch until this
+                // slice's deadline. `resting`/`stats` are threaded through
+                // by mutable reference so the follow loop accounts fills
+                // through the EXACT SAME `stats.add` path as everywhere
+                // else in this function — no second accounting path.
+                // `slices_skipped` is NOT threaded through: the follow loop
+                // never mutates it, that accounting stays solely the
+                // top-of-slice arm's (at most once per slice, above).
+                match run_follow_loop(
+                    client,
+                    plan,
+                    &exec_deadline,
+                    slice_idx,
+                    slice_end,
+                    &mut resting,
+                    &mut stats,
+                    journal.as_deref_mut(),
+                    shutdown.as_mut(),
+                )
+                .await
+                {
+                    Ok(FollowLoopExit::SliceEndReached) => {}
+                    // §7 (docs/DEVELOPMENT.md): "no orders after --duration"
+                    // — for every OTHER child algo this is caught by the
+                    // NEXT slice's top-of-loop deadline check. On the FINAL
+                    // slice there is no next iteration to catch it, so a
+                    // deadline that elapsed inside this slice's own follow
+                    // loop is surfaced here explicitly, matching the
+                    // message shape the top-of-loop check already uses.
+                    Ok(FollowLoopExit::DeadlinePassed) => {
+                        abort_reason = Some(format!(
+                            "duration {} elapsed at slice {slice_idx}/{}",
+                            humantime::format_duration(plan.duration),
+                            plan.slices
+                        ));
+                        break;
+                    }
+                    Ok(FollowLoopExit::ShutdownRequested) => {
+                        abort_reason = Some(format!(
+                            "shutdown requested during follow loop for slice {slice_idx}/{}",
+                            plan.slices
+                        ));
+                        break;
+                    }
+                    Err(reason) => {
+                        abort_reason = Some(reason);
+                        break;
+                    }
+                }
+                // `run_follow_loop` already advanced (monotonic virtual/real)
+                // time to `slice_end` via its own poll-cadence sleeps, so
+                // the shared inter-slice `sleep_until(slice_end)` below is a
+                // no-op for this arm — falling through to it (rather than
+                // `continue`) keeps the "target reached; finishing early"
+                // check and the shutdown re-check below in the SAME single
+                // code path every other child algo uses, instead of a
+                // second copy inside this arm.
             }
         }
 
@@ -2583,6 +3230,10 @@ mod loop_tests {
                 Some(Address::new(MASTER))
             },
             child_algo: ChildAlgo::Market,
+            // Follow-agnostic defaults (unused unless child_algo == Follow).
+            follow_poll_secs: 2,
+            follow_repost_secs: 10,
+            follow_threshold_bps: dec!(1.0),
         }
     }
 
@@ -2590,6 +3241,14 @@ mod loop_tests {
     fn plan_passive(read_only: bool) -> TwapPlan {
         TwapPlan {
             child_algo: ChildAlgo::Passive,
+            ..plan(read_only)
+        }
+    }
+
+    /// Same as `plan()` but with `child_algo: Follow`.
+    fn plan_follow(read_only: bool) -> TwapPlan {
+        TwapPlan {
+            child_algo: ChildAlgo::Follow,
             ..plan(read_only)
         }
     }
@@ -4836,6 +5495,913 @@ mod loop_tests {
                 }
             }
             assert_eq!(api.place_count(), 10);
+        }
+    }
+
+    // === README roadmap: `ChildAlgo::Follow` mid-slice re-quoting ===
+    //
+    // `plan_follow()` drives the SAME `run_twap`/`run_twap_journaled` entry
+    // points as market/passive — the initial ALO place, settle, journaling
+    // and every risk check reuse the exact Passive helpers
+    // (`place_alo_child`/`settle_resting_child`); only the WITHIN-slice
+    // behaviour differs (`run_follow_loop`). Single-slice plans are used
+    // throughout so `slice_end` is the run's own duration, keeping the
+    // scripted book sequence easy to reason about tick-by-tick.
+    mod follow_tests {
+        use super::*;
+        use crate::journal::summarize;
+
+        fn resting(oid: u64) -> Result<PlaceOutcome, HlError> {
+            Ok(PlaceOutcome::Resting { oid: OrderId(oid) })
+        }
+
+        fn alo_rejected() -> Result<PlaceOutcome, HlError> {
+            Err(HlError::Exchange {
+                code: Some("order_error".into()),
+                message: "Post only order would have immediately matched, bad ALO px \
+                          (badAloPxRejected)"
+                    .into(),
+            })
+        }
+
+        /// One slice, long, 10 coin @ szDecimals=2, follow-poll every 2s,
+        /// repost-secs 10, threshold 1bps — tuned so a handful of book
+        /// ticks fit comfortably inside a short duration under
+        /// `start_paused` virtual time.
+        fn base_follow_plan() -> TwapPlan {
+            let mut p = plan_follow(false);
+            p.slices = 1;
+            p.duration = Duration::from_secs(60);
+            p.per_slice = dec!(10);
+            p.total_adjusted = dec!(10);
+            p.total_requested = dec!(10);
+            p.follow_poll_secs = 2;
+            p.follow_repost_secs = 10;
+            p.follow_threshold_bps = dec!(1.0);
+            p
+        }
+
+        /// 1) Touch moves away beyond threshold after repost-secs elapsed
+        /// -> cancel -> settle -> re-place at the new touch; a partial fill
+        /// observed at settle time is credited exactly once.
+        #[tokio::test(start_paused = true)]
+        async fn touch_moves_away_past_threshold_and_repost_secs_triggers_requote() {
+            let p = base_follow_plan();
+
+            let api = ScriptedApi::new()
+                // Initial book fetch (top of slice loop) + initial place.
+                .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+                .push_place(resting(1))
+                // Tick at t=2s: touch unchanged, no action.
+                .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+                // Tick at t=4s..t=8s: still unchanged (repost-secs=10 not
+                // elapsed yet even once the price does move).
+                .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+                .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+                // Tick at t=8s: touch moves to 50.4 (bid up from 49.9), well
+                // past 1bps, but repost-secs (10s since t=0 place) not yet
+                // elapsed.
+                .push_book(Ok(book_at(dec!(50.4), dec!(50.6))))
+                // Tick at t=10s: repost-secs elapsed AND still past
+                // threshold -> cancel, settle (partial fill of 3), re-place
+                // at the new touch (50.4).
+                .push_book(Ok(book_at(dec!(50.4), dec!(50.6))))
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(3),
+                    Some(dec!(49.9)),
+                    "canceled",
+                    OrderId(1),
+                    None,
+                    "HYPE",
+                    "B",
+                ))))
+                .push_place(resting(2))
+                // Remaining ticks ride out to slice_end unchanged.
+                .with_default_book(book_at(dec!(50.4), dec!(50.6)))
+                // End-of-run cleanup: cancel + settle the second resting order.
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(7),
+                    Some(dec!(50.4)),
+                    "canceled",
+                    OrderId(2),
+                    None,
+                    "HYPE",
+                    "B",
+                ))));
+
+            let report = run_twap(&api, &p).await;
+
+            assert_eq!(report.abort_reason, None);
+            assert_eq!(
+                report.filled,
+                dec!(10),
+                "3 (settled at repost) + 7 (settled at cleanup) = 10, each fill counted once"
+            );
+            let place_pxs: Vec<Decimal> = api
+                .place_calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    Call::Place { px, .. } => Some(px),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                place_pxs,
+                vec![dec!(49.9), dec!(50.4)],
+                "the repost must be signed at the NEW touch"
+            );
+        }
+
+        /// 2) Touch moves away but stays under threshold-bps -> no cancel,
+        /// queue priority is kept (only the initial place + cleanup cancel
+        /// are observed).
+        #[tokio::test(start_paused = true)]
+        async fn touch_moves_away_below_threshold_keeps_queue_priority() {
+            let mut p = base_follow_plan();
+            // A move from 49.9 to 49.905 is ~1bps of 49.9 — set the
+            // threshold comfortably above that so it never triggers.
+            p.follow_threshold_bps = dec!(50.0);
+
+            let api = ScriptedApi::new()
+                .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+                .push_place(resting(1))
+                // Small drift, well under 50bps, for the rest of the slice.
+                .with_default_book(book_at(dec!(49.905), dec!(50.105)))
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(10),
+                    Some(dec!(49.9)),
+                    "canceled",
+                    OrderId(1),
+                    None,
+                    "HYPE",
+                    "B",
+                ))));
+
+            let report = run_twap(&api, &p).await;
+
+            assert_eq!(report.abort_reason, None);
+            assert_eq!(
+                api.place_count(),
+                1,
+                "no repost when the move stays under the threshold"
+            );
+            assert_eq!(report.filled, dec!(10));
+        }
+
+        /// 3) Touch moves away >= threshold but repost-secs has NOT yet
+        /// elapsed -> no action yet (only the eventual cleanup cancel).
+        #[tokio::test(start_paused = true)]
+        async fn touch_moves_away_past_threshold_but_before_repost_secs_no_action_yet() {
+            let mut p = base_follow_plan();
+            p.duration = Duration::from_secs(8); // shorter than repost_secs=10
+            p.follow_poll_secs = 2;
+            p.follow_repost_secs = 10;
+            p.follow_threshold_bps = dec!(1.0);
+
+            let api = ScriptedApi::new()
+                .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+                .push_place(resting(1))
+                // The touch jumps immediately and stays moved, but the
+                // slice ends at t=8s, before the 10s repost throttle ever
+                // clears.
+                .with_default_book(book_at(dec!(50.4), dec!(50.6)))
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(10),
+                    Some(dec!(49.9)),
+                    "canceled",
+                    OrderId(1),
+                    None,
+                    "HYPE",
+                    "B",
+                ))));
+
+            let report = run_twap(&api, &p).await;
+
+            assert_eq!(report.abort_reason, None);
+            assert_eq!(
+                api.place_count(),
+                1,
+                "the repost throttle must block a requote before repost-secs elapses"
+            );
+            assert_eq!(report.filled, dec!(10));
+        }
+
+        /// 4) Touch moves THROUGH our resting price (Long: best_bid drops
+        /// below px) -> immediate settle, no threshold/throttle gating the
+        /// settle itself. A fully-filled terminal status means SkipAhead on
+        /// the re-place decision -> no re-place, slice completes with the
+        /// touch-through fill alone.
+        #[tokio::test(start_paused = true)]
+        async fn touch_moves_through_px_settles_immediately_and_skips_ahead_if_fully_filled() {
+            let p = base_follow_plan();
+
+            let api = ScriptedApi::new()
+                .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+                .push_place(resting(1))
+                // Tick at t=2s: the touch drops BELOW our resting px (49.9)
+                // — the book traded through our level, so our order is very
+                // likely fully filled. Settle immediately, no threshold/
+                // throttle check.
+                .push_book(Ok(book_at(dec!(49.5), dec!(49.7))))
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(10),
+                    Some(dec!(49.9)),
+                    "filled",
+                    OrderId(1),
+                    None,
+                    "HYPE",
+                    "B",
+                ))))
+                // No further place: SkipAhead. Remaining ticks just poll
+                // the book with nothing to do.
+                .with_default_book(book_at(dec!(49.5), dec!(49.7)));
+
+            let report = run_twap(&api, &p).await;
+
+            assert_eq!(report.abort_reason, None);
+            assert_eq!(report.filled, dec!(10));
+            assert_eq!(
+                api.place_count(),
+                1,
+                "SkipAhead after the touch-through settle must not re-place"
+            );
+        }
+
+        /// 5) ALO reject inside the follow loop -> resting stays None ->
+        /// retried at a later tick (subject to the repost throttle); a
+        /// slice can end with resting=None and the run completes cleanly
+        /// (the next slice boundary, or end-of-run cleanup, handles None
+        /// safely — proven here via the two-slice case where slice 2's
+        /// boundary settle is skipped because nothing is resting).
+        #[tokio::test(start_paused = true)]
+        async fn alo_reject_inside_follow_loop_retries_at_a_later_tick() {
+            let mut p = base_follow_plan();
+            p.duration = Duration::from_secs(20);
+            p.follow_poll_secs = 2;
+            p.follow_repost_secs = 4;
+
+            let api = ScriptedApi::new()
+                // Initial place is rejected outright.
+                .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+                .push_place(alo_rejected())
+                // Ticks before repost-secs (4s) elapses since the initial
+                // (failed) place: no retry attempted yet.
+                .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+                // t=4s: repost throttle clears, retry — rejected again.
+                .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+                .push_place(alo_rejected())
+                // t=6s: still throttled.
+                .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+                // t=8s: throttle clears, retry — this one rests.
+                .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+                .push_place(resting(9))
+                // Ride out the rest of the slice unchanged, then cleanup.
+                .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(10),
+                    Some(dec!(49.9)),
+                    "canceled",
+                    OrderId(9),
+                    None,
+                    "HYPE",
+                    "B",
+                ))));
+
+            let report = run_twap(&api, &p).await;
+
+            assert_eq!(report.abort_reason, None);
+            assert_eq!(report.filled, dec!(10));
+            assert_eq!(
+                api.place_count(),
+                3,
+                "two rejected retries plus the eventual successful place"
+            );
+            assert_eq!(
+                report.slices_skipped, 1,
+                "the top-of-slice arm's own accounting counts the initial ALO reject once; \
+                 the follow loop's own two ALO-reject retries must NOT inflate this further"
+            );
+        }
+
+        /// 6) `ExecutionDeadline` passes mid-slice -> no further places from
+        /// the follow loop; whatever is resting is settled by the final
+        /// cleanup, never left leaked.
+        #[tokio::test(start_paused = true)]
+        async fn exec_deadline_passes_mid_slice_stops_new_places_cleanup_still_settles() {
+            struct SlowBookApi {
+                inner: ScriptedApi,
+            }
+            #[async_trait::async_trait]
+            impl HlApi for SlowBookApi {
+                async fn fetch_l2_book(&self, s: &Symbol) -> Result<OrderBook, HlError> {
+                    let r = self.inner.fetch_l2_book(s).await;
+                    // First call (top-of-slice) resolves fast; make the
+                    // SECOND book fetch (first follow-loop tick) consume
+                    // enough time to blow through the run's short duration.
+                    if self.inner.place_count() >= 1 {
+                        tokio::time::sleep(Duration::from_secs(65)).await;
+                    }
+                    r
+                }
+                async fn place_order_once(
+                    &self,
+                    i: &OrderIntent,
+                    a: u32,
+                    e: u64,
+                ) -> Result<(u64, PlaceOutcome), HlError> {
+                    self.inner.place_order_once(i, a, e).await
+                }
+                async fn cancel_by_cloid(&self, i: &CancelIntent, a: u32) -> Result<(), HlError> {
+                    self.inner.cancel_by_cloid(i, a).await
+                }
+                async fn fetch_order_status(
+                    &self,
+                    u: &Address,
+                    o: OrderId,
+                ) -> Result<Option<OrderStatusFill>, HlError> {
+                    self.inner.fetch_order_status(u, o).await
+                }
+                async fn fetch_order_status_by_cloid(
+                    &self,
+                    u: &Address,
+                    c: Cloid,
+                ) -> Result<Option<OrderStatusFill>, HlError> {
+                    self.inner.fetch_order_status_by_cloid(u, c).await
+                }
+            }
+
+            let mut p = base_follow_plan();
+            p.duration = Duration::from_secs(60);
+
+            let inner = ScriptedApi::new()
+                .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+                .push_place(resting(1))
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(4),
+                    Some(dec!(49.9)),
+                    "canceled",
+                    OrderId(1),
+                    None,
+                    "HYPE",
+                    "B",
+                ))));
+            let api = SlowBookApi { inner };
+
+            let report = run_twap(&api, &p).await;
+
+            assert_eq!(
+                api.inner.place_count(),
+                1,
+                "no new place once the execution deadline has passed"
+            );
+            assert_eq!(
+                report.filled,
+                dec!(4),
+                "final cleanup must still settle the resting order"
+            );
+            let reason = report.abort_reason.expect("must abort on deadline");
+            assert!(reason.contains("elapsed"), "{reason}");
+        }
+
+        /// 7) A repost that would breach the cumulative notional cap must
+        /// abort the run (run-level envelope), never silently clamp or skip
+        /// it.
+        #[tokio::test(start_paused = true)]
+        async fn requote_that_would_breach_notional_cap_aborts() {
+            let mut p = base_follow_plan();
+            p.duration = Duration::from_secs(20);
+            p.follow_poll_secs = 2;
+            p.follow_repost_secs = 2;
+            p.follow_threshold_bps = dec!(1.0);
+            // Cap set so the INITIAL place (10 @ 49.9 = 499) fits, but a
+            // repost at a much higher touch (10 @ 5000 = 50000) does not.
+            p.max_notional_usd = dec!(600);
+
+            let api = ScriptedApi::new()
+                .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+                .push_place(resting(1))
+                // t=2s: touch jumps far away, past threshold and past the
+                // (2s) repost throttle -> settle then attempt to re-place,
+                // which must hit the notional cap check before any send.
+                .push_book(Ok(book_at(dec!(5000), dec!(5001))))
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(0),
+                    None,
+                    "canceled",
+                    OrderId(1),
+                    None,
+                    "HYPE",
+                    "B",
+                ))));
+
+            let report = run_twap(&api, &p).await;
+
+            let reason = report
+                .abort_reason
+                .expect("must abort on notional cap breach");
+            assert!(reason.contains("notional"), "{reason}");
+            assert_eq!(
+                api.place_count(),
+                1,
+                "the capped repost must never actually be sent"
+            );
+        }
+
+        /// 8) A partial fill from a touch-through settle leaves a remainder
+        /// below min notional -> follow pauses re-quoting for the rest of
+        /// THIS slice; the shortfall is carried forward and the NEXT
+        /// slice's order size includes it (catch-up).
+        #[tokio::test(start_paused = true)]
+        async fn remaining_below_min_notional_pauses_follow_and_carries_to_next_slice() {
+            let mut p = plan_follow(false);
+            p.slices = 2;
+            p.duration = Duration::from_secs(20);
+            p.per_slice = dec!(10);
+            p.total_adjusted = dec!(20);
+            p.total_requested = dec!(20);
+            p.follow_poll_secs = 2;
+            p.follow_repost_secs = 2;
+            p.follow_threshold_bps = dec!(1.0);
+
+            let api = ScriptedApi::new()
+                // Slice 1: initial place of 10 @ 49.9.
+                .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+                .push_place(resting(1))
+                // t=2s: touch moves through us — settle immediately. Almost
+                // everything fills (9.9999...), leaving a residual whose
+                // notional at the current price is under the min-notional
+                // gate. `decide_slice` returns SkipBelowMinNotional, so no
+                // re-place happens for the rest of slice 1.
+                .push_book(Ok(book_at(dec!(49.5), dec!(49.7))))
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(9.99),
+                    Some(dec!(49.9)),
+                    "filled",
+                    OrderId(1),
+                    None,
+                    "HYPE",
+                    "B",
+                ))))
+                // Remaining slice-1 ticks: nothing resting, nothing to do —
+                // repeatedly attempting to place would run into the SAME
+                // SkipBelowMinNotional decision every time (paused, per the
+                // brief), so no further place calls occur.
+                .with_default_book(book_at(dec!(49.5), dec!(49.7)))
+                // Slice 2: fresh book fetch, catch-up size 20 - 9.99 = 10.01
+                // is now well above the min-notional gate — placed and
+                // rests for the rest of slice 2, then cleaned up.
+                .push_place(resting(2))
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(10.01),
+                    Some(dec!(49.5)),
+                    "canceled",
+                    OrderId(2),
+                    None,
+                    "HYPE",
+                    "B",
+                ))));
+
+            let report = run_twap(&api, &p).await;
+
+            assert_eq!(report.abort_reason, None);
+            assert_eq!(report.filled, dec!(20));
+            let places: Vec<Decimal> = api
+                .place_calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    Call::Place { sz, .. } => Some(sz),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                places,
+                vec![dec!(10), dec!(10.01)],
+                "slice 2's order size must include the residual carried from slice 1"
+            );
+            assert_eq!(
+                report.slices_skipped, 0,
+                "the follow loop's BelowMinNotional outcome must not increment \
+                 slices_skipped — slice 1 DID place and rest an order, it is not \
+                 a skipped slice"
+            );
+        }
+
+        /// `place_follow_child`'s `BelowMinNotional` outcome (via the
+        /// resting=None repost branch, i.e. `decide_slice` returning
+        /// `SkipBelowMinNotional` on a RETRY attempt rather than at the
+        /// initial place) must pause re-quoting for the rest of the slice:
+        /// no further book-driven place attempts, no false "repeated ALO
+        /// reject" warning (this is not an ALO reject), `slices_skipped`
+        /// unchanged by the follow loop's own contribution, and the
+        /// shortfall carries into the next slice's sizing.
+        #[tokio::test(start_paused = true)]
+        async fn skip_below_min_notional_on_a_retry_pauses_follow_for_the_rest_of_the_slice() {
+            let mut p = base_follow_plan();
+            p.slices = 2;
+            p.duration = Duration::from_secs(20);
+            p.per_slice = dec!(10);
+            p.total_adjusted = dec!(20);
+            p.total_requested = dec!(20);
+            p.follow_poll_secs = 2;
+            p.follow_repost_secs = 2;
+
+            let api = ScriptedApi::new()
+                // Slice 1: initial place is rejected outright (resting stays
+                // None), so the follow loop keeps retrying on the
+                // resting=None branch, subject to the repost throttle.
+                .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+                .push_place(alo_rejected())
+                // t=2s: repost throttle (2s) clears — retry. This time the
+                // price has collapsed so the remaining size (10) is worth
+                // less than the min-notional gate at the new touch;
+                // `decide_slice` returns SkipBelowMinNotional ->
+                // `FollowPlace::BelowMinNotional` -> the loop must pause
+                // (sleep to slice_end) rather than keep polling.
+                .push_book(Ok(book_at(dec!(0.001), dec!(0.002))))
+                // No further book fetch or place is scripted for the rest of
+                // slice 1 — if the fix regresses and the loop keeps polling
+                // or retrying, the queues run dry and panic.
+                //
+                // Slice 2: fresh book fetch at a recovered price, full 20
+                // catch-up size is well above the gate again.
+                .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+                .push_place(resting(2))
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(20),
+                    Some(dec!(49.9)),
+                    "canceled",
+                    OrderId(2),
+                    None,
+                    "HYPE",
+                    "B",
+                ))));
+
+            let report = run_twap(&api, &p).await;
+
+            assert_eq!(report.abort_reason, None);
+            assert_eq!(report.filled, dec!(20));
+            assert_eq!(
+                api.place_count(),
+                2,
+                "the rejected initial place, then the paused slice's follow loop must NOT \
+                 retry again this slice, then slice 2's catch-up place"
+            );
+            let places: Vec<Decimal> = api
+                .place_calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    Call::Place { sz, .. } => Some(sz),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                places,
+                vec![dec!(10), dec!(20)],
+                "the full shortfall from slice 1 (nothing filled) must carry into slice 2's size"
+            );
+            assert_eq!(
+                report.slices_skipped, 1,
+                "only the top-of-slice arm's initial-ALO-reject accounting counts here \
+                 (once); the follow loop's own BelowMinNotional pause must not add to it"
+            );
+        }
+
+        /// `place_follow_child`'s `TargetMet` outcome (`decide_slice`
+        /// returning `SkipAhead` on a repost attempt, reached when a
+        /// partial settle satisfies THIS SLICE's cumulative target while
+        /// the RUN's overall `total_adjusted` is not yet met, so the
+        /// `stats.filled >= plan.total_adjusted` short-circuit does not
+        /// apply and `place_follow_child` is actually invoked) must idle
+        /// the follow loop until `slice_end` — using the test harness's
+        /// virtual/paused time — with no further book-driven decide/place
+        /// calls during the idle period, and the next slice starts on
+        /// schedule.
+        #[tokio::test(start_paused = true)]
+        async fn skip_ahead_on_a_retry_idles_until_slice_end_and_next_slice_starts_on_schedule() {
+            let mut p = base_follow_plan();
+            p.slices = 2;
+            p.duration = Duration::from_secs(20);
+            p.per_slice = dec!(10);
+            p.total_adjusted = dec!(20);
+            p.total_requested = dec!(20);
+            p.follow_poll_secs = 2;
+            p.follow_repost_secs = 2;
+
+            let api = ScriptedApi::new()
+                // Slice 1: initial place rests.
+                .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+                .push_place(resting(1))
+                // t=2s: touch moves away past threshold and the repost
+                // throttle (2s) has elapsed -> cancel, settle. The settle
+                // reports a FULL fill of slice 1's own target (10), so
+                // `stats.filled` becomes 10 — equal to slice 1's own
+                // cumulative target but still under the RUN's
+                // `total_adjusted` (20), so the `>= total_adjusted`
+                // short-circuit does NOT fire and the repost path calls
+                // `place_follow_child`, which now sees `decide_slice`
+                // return SkipAhead for slice 1 (target 10, filled 10).
+                .push_book(Ok(book_at(dec!(50.4), dec!(50.6))))
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(10),
+                    Some(dec!(49.9)),
+                    "canceled",
+                    OrderId(1),
+                    None,
+                    "HYPE",
+                    "B",
+                ))))
+                // No further book fetch or place is scripted for the rest of
+                // slice 1 — if the fix regresses and the loop keeps polling
+                // or retrying after TargetMet, the queues run dry and panic.
+                //
+                // Slice 2: fresh book fetch, remaining 10 placed and settled
+                // on schedule, proving the next slice started on time.
+                .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+                .push_place(resting(2))
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(10),
+                    Some(dec!(49.9)),
+                    "canceled",
+                    OrderId(2),
+                    None,
+                    "HYPE",
+                    "B",
+                ))));
+
+            let report = run_twap(&api, &p).await;
+
+            assert_eq!(report.abort_reason, None);
+            assert_eq!(report.filled, dec!(20));
+            assert_eq!(
+                api.place_count(),
+                2,
+                "TargetMet on the repost attempt must stop re-quoting for the rest of \
+                 slice 1 (no further place calls) until slice 2 starts on schedule"
+            );
+            assert_eq!(
+                report.slices_skipped, 0,
+                "slice 1 DID place and fully settle an order; TargetMet reached only on \
+                 the repost attempt must not be counted as a skipped slice"
+            );
+        }
+
+        /// 9) `--read-only` + follow sends nothing beyond book fetches — no
+        /// place/cancel/status calls at all, mirroring the existing passive
+        /// read-only test. Mid-slice reposting is never simulated in
+        /// dry-run.
+        #[tokio::test(start_paused = true)]
+        async fn read_only_follow_sends_nothing() {
+            let api = ScriptedApi::new().with_default_book(book_at(dec!(49.9), dec!(50.1)));
+            let report = run_twap(&api, &plan_follow(true)).await;
+
+            assert_eq!(api.place_count(), 0, "read-only must never call place");
+            assert!(
+                api.calls().iter().all(|c| matches!(c, Call::Book { .. })),
+                "read-only must issue no calls beyond book fetches: {:?}",
+                api.calls()
+            );
+            assert_eq!(report.abort_reason, None);
+            assert_eq!(report.filled, report.total_adjusted);
+        }
+
+        // === Journal/resume audit regression test ===
+        //
+        // Audit verdict (see module doc + PR description): `journal::summarize`
+        // and every replay/reconcile helper key their state entirely on
+        // `Cloid`, never on `slice_idx` — `slice_idx` is carried only as
+        // per-cloid metadata (`HashMap<Cloid, u32>` in
+        // `main.rs::reconcile_incomplete_run`, never the reverse). A Follow
+        // slice journaling MULTIPLE Prepared/Ack/Terminal cloid groups under
+        // ONE slice_idx therefore already replays and resumes correctly with
+        // no code change required. This test proves it directly: 3 repost
+        // cycles (Prepared->Ack->Terminal partial-fill x2) then a 3rd
+        // Prepared->Ack with NO Terminal (simulated crash mid-flight), all
+        // under slice_idx=1.
+        #[tokio::test(start_paused = true)]
+        async fn journal_replay_resumes_multiple_cloids_under_one_slice_idx() {
+            let tmp = journal_tests_temp_dir();
+            let cloid1 = Cloid::new();
+            let cloid2 = Cloid::new();
+            let dangling_cloid = Cloid::new();
+
+            {
+                let mut journal = ExecutionJournal::start(
+                    tmp.path(),
+                    "run-follow-multi-cloid".into(),
+                    journal_tests_header(),
+                )
+                .unwrap();
+                // Repost cycle 1: Prepared -> Ack -> Terminal (partial fill 3).
+                journal
+                    .record(&JournalRecord::Prepared {
+                        slice_idx: 1,
+                        cloid: cloid1,
+                        nonce: None,
+                        symbol: Symbol::new("HYPE"),
+                        side: Side::Long,
+                        px: "49.9".into(),
+                        sz: "10".into(),
+                    })
+                    .unwrap();
+                journal
+                    .record(&JournalRecord::Acknowledged {
+                        slice_idx: 1,
+                        cloid: cloid1,
+                        oid: Some(1),
+                        status: "resting".into(),
+                    })
+                    .unwrap();
+                journal
+                    .record(&JournalRecord::Terminal {
+                        slice_idx: 1,
+                        cloid: cloid1,
+                        status: "canceled".into(),
+                        filled_sz: "3".into(),
+                        avg_px: Some("49.9".into()),
+                    })
+                    .unwrap();
+                // Repost cycle 2: Prepared -> Ack -> Terminal (partial fill 4),
+                // SAME slice_idx=1, a DIFFERENT cloid.
+                journal
+                    .record(&JournalRecord::Prepared {
+                        slice_idx: 1,
+                        cloid: cloid2,
+                        nonce: None,
+                        symbol: Symbol::new("HYPE"),
+                        side: Side::Long,
+                        px: "50.4".into(),
+                        sz: "7".into(),
+                    })
+                    .unwrap();
+                journal
+                    .record(&JournalRecord::Acknowledged {
+                        slice_idx: 1,
+                        cloid: cloid2,
+                        oid: Some(2),
+                        status: "resting".into(),
+                    })
+                    .unwrap();
+                journal
+                    .record(&JournalRecord::Terminal {
+                        slice_idx: 1,
+                        cloid: cloid2,
+                        status: "canceled".into(),
+                        filled_sz: "4".into(),
+                        avg_px: Some("50.4".into()),
+                    })
+                    .unwrap();
+                // Repost cycle 3: Prepared -> Ack, then the process "crashes"
+                // (no Terminal ever written) — SAME slice_idx=1 again.
+                journal
+                    .record(&JournalRecord::Prepared {
+                        slice_idx: 1,
+                        cloid: dangling_cloid,
+                        nonce: None,
+                        symbol: Symbol::new("HYPE"),
+                        side: Side::Long,
+                        px: "50.4".into(),
+                        sz: "3".into(),
+                    })
+                    .unwrap();
+                journal
+                    .record(&JournalRecord::Acknowledged {
+                        slice_idx: 1,
+                        cloid: dangling_cloid,
+                        oid: Some(3),
+                        status: "resting".into(),
+                    })
+                    .unwrap();
+            }
+
+            let records = ExecutionJournal::read_all(tmp.path(), "run-follow-multi-cloid").unwrap();
+            let summary = summarize(&records);
+
+            // All three cloids are visible, in first-seen order, despite
+            // sharing one slice_idx.
+            assert_eq!(summary.cloids.len(), 3);
+            assert_eq!(
+                summary.cloids.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
+                vec![cloid1, cloid2, dangling_cloid]
+            );
+
+            // Only the dangling (crashed) cloid is unresolved.
+            assert_eq!(summary.unresolved_cloids(), vec![dangling_cloid]);
+
+            // Every terminal fill under the shared slice_idx sums correctly
+            // (3 + 4 = 7), each counted exactly once.
+            assert_eq!(summary.total_filled(), dec!(7));
+
+            // --resume's reconciliation: force-resolve the dangling cloid,
+            // exactly as main.rs::reconcile_incomplete_run does for every
+            // entry in unresolved_cloids().
+            let reconcile_api = ScriptedApi::new()
+                // Still live on the resume probe -> active cancel+poll path.
+                .push_status(Ok(Some(status_full(
+                    dec!(0),
+                    None,
+                    "open",
+                    OrderId(3),
+                    Some(dangling_cloid),
+                    "HYPE",
+                    "B",
+                ))))
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(3),
+                    Some(dec!(50.4)),
+                    "canceled",
+                    OrderId(3),
+                    Some(dangling_cloid),
+                    "HYPE",
+                    "B",
+                ))));
+
+            let mut resume_plan = plan_follow(false);
+            resume_plan.slices = 1;
+
+            let mut journal =
+                ExecutionJournal::open_existing(tmp.path(), "run-follow-multi-cloid").unwrap();
+            let prepared = PreparedIntent {
+                symbol: Symbol::new("HYPE"),
+                side: Side::Long,
+                px: dec!(50.4),
+                sz: dec!(3),
+            };
+            reconcile_unresolved_cloid(
+                &reconcile_api,
+                &resume_plan,
+                dangling_cloid,
+                1, // slice_idx recovered from the dangling cloid's OWN Prepared record
+                &prepared,
+                &mut journal,
+            )
+            .await
+            .expect("resuming the dangling cloid from a multi-cloid slice must succeed");
+
+            let final_records =
+                ExecutionJournal::read_all(tmp.path(), "run-follow-multi-cloid").unwrap();
+            let final_summary = summarize(&final_records);
+
+            assert!(
+                final_summary.unresolved_cloids().is_empty(),
+                "all three cloids under slice_idx=1 must be resolved after resume"
+            );
+            // 3 (cycle 1) + 4 (cycle 2) + 3 (recovered dangling cycle 3) = 10,
+            // the full per-slice target, summed across cloids that all share
+            // one slice_idx.
+            assert_eq!(final_summary.total_filled(), dec!(10));
+        }
+
+        /// Hand-rolled temp dir, mirroring `journal_tests::TempDir` — this
+        /// module cannot see that PRIVATE inner type across `mod`
+        /// boundaries, so it gets its own copy rather than exposing one.
+        struct FollowTestTempDir(std::path::PathBuf);
+        impl FollowTestTempDir {
+            fn new() -> Self {
+                let dir = std::env::temp_dir().join(format!(
+                    "hype-twap-twaprs-follow-journal-test-{}",
+                    uuid::Uuid::now_v7()
+                ));
+                std::fs::create_dir_all(&dir).unwrap();
+                Self(dir)
+            }
+            fn path(&self) -> &std::path::Path {
+                &self.0
+            }
+        }
+        impl Drop for FollowTestTempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        fn journal_tests_temp_dir() -> FollowTestTempDir {
+            FollowTestTempDir::new()
+        }
+        fn journal_tests_header() -> crate::journal::RunHeader {
+            crate::journal::RunHeader {
+                run_id: "test-run".into(),
+                network: "testnet".into(),
+                agent: Some(Address::new(AGENT)),
+                master: Some(Address::new(MASTER)),
+                symbol: Symbol::new("HYPE"),
+                side: Side::Long,
+                slices: 1,
+                plan_hash: "test-hash".into(),
+                started_at_unix_ms: 0,
+            }
         }
     }
 

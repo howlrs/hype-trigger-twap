@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use secrecy::SecretString;
 
 use hype_trigger_twap::client::{HlClient, HlConfig, Network, Role, ValidatedMarketSnapshot};
@@ -119,6 +120,7 @@ enum ChildAlgoArg {
     #[default]
     Market,
     Passive,
+    Follow,
 }
 
 impl From<ChildAlgoArg> for ChildAlgo {
@@ -126,6 +128,7 @@ impl From<ChildAlgoArg> for ChildAlgo {
         match a {
             ChildAlgoArg::Market => ChildAlgo::Market,
             ChildAlgoArg::Passive => ChildAlgo::Passive,
+            ChildAlgoArg::Follow => ChildAlgo::Follow,
         }
     }
 }
@@ -283,10 +286,32 @@ struct Cli {
     /// Child-order algorithm for each slice (Issue #1). `market` (default)
     /// reproduces pre-Issue-#1 behaviour exactly: an IOC taker limit at
     /// mid +/- slippage-bps. `passive` places a post-only (ALO) limit at the
-    /// best bid (long) / best ask (short) and waits the full slice interval;
-    /// see README/docs/DESIGN.md for the semantics.
+    /// best bid (long) / best ask (short) and waits the full slice interval.
+    /// `follow` is `passive` plus mid-slice re-quoting: it polls the book and
+    /// re-quotes the resting order to keep following the touch until the
+    /// slice ends (`--follow-poll-secs`/`--follow-repost-secs`/
+    /// `--follow-threshold-bps` tune this; no taker fallback). See
+    /// README/docs/DESIGN.md for the semantics.
     #[arg(long, value_enum, default_value = "market")]
     child_algo: ChildAlgoArg,
+
+    /// `--child-algo follow` only: seconds between book polls inside a
+    /// slice's follow loop. Ignored (with a warning) by other child algos.
+    #[arg(long, default_value_t = 2)]
+    follow_poll_secs: u64,
+
+    /// `--child-algo follow` only: minimum seconds between reposts of the
+    /// resting order within one slice (throttle, counted from that slice's
+    /// last place). Ignored (with a warning) by other child algos.
+    #[arg(long, default_value_t = 10)]
+    follow_repost_secs: u64,
+
+    /// `--child-algo follow` only: minimum relative distance (basis points)
+    /// the touch must move AWAY from our resting price before a repost is
+    /// worth burning queue priority for (hysteresis). Ignored (with a
+    /// warning) by other child algos.
+    #[arg(long, default_value = "1.0")]
+    follow_threshold_bps: Decimal,
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -354,6 +379,36 @@ impl Cli {
                     "--expire-after requires a trigger (--trigger-price or --start-after); it is meaningless with immediate start".into(),
                 );
             }
+        }
+        if self.follow_poll_secs == 0 {
+            return Err("--follow-poll-secs must be > 0".into());
+        }
+        if self.follow_repost_secs == 0 {
+            return Err("--follow-repost-secs must be > 0".into());
+        }
+        if self.follow_threshold_bps < Decimal::ZERO {
+            return Err(format!(
+                "--follow-threshold-bps must be >= 0, got {}",
+                self.follow_threshold_bps
+            ));
+        }
+        // The follow-* flags are meaningless for any other child-algo — warn
+        // (not error) rather than reject, since a non-default value here is
+        // far more likely to be a leftover flag from switching child-algos
+        // than an operator mistake worth hard-failing on. Compared against
+        // each flag's own `default_value`/`default_value_t`, so this only
+        // fires when a value was actually given that differs from what a
+        // `follow` run would silently assume anyway.
+        if self.child_algo != ChildAlgoArg::Follow
+            && (self.follow_poll_secs != 2
+                || self.follow_repost_secs != 10
+                || self.follow_threshold_bps != dec!(1.0))
+        {
+            tracing::warn!(
+                "--follow-poll-secs/--follow-repost-secs/--follow-threshold-bps are ignored \
+                 with --child-algo {:?} (only --child-algo follow uses them)",
+                self.child_algo
+            );
         }
         Ok(())
     }
@@ -702,6 +757,9 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
             agent: agent_address.clone(),
             master: master.clone(),
             child_algo: cli.child_algo.into(),
+            follow_poll_secs: cli.follow_poll_secs,
+            follow_repost_secs: cli.follow_repost_secs,
+            follow_threshold_bps: cli.follow_threshold_bps,
         };
 
         if let Some(resume_id) = &cli.resume {
@@ -944,6 +1002,9 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         agent: agent_address.clone(),
         master: master.clone(),
         child_algo: cli.child_algo.into(),
+        follow_poll_secs: cli.follow_poll_secs,
+        follow_repost_secs: cli.follow_repost_secs,
+        follow_threshold_bps: cli.follow_threshold_bps,
     };
 
     // Issue #4: this plan's hash — computed identically whether starting a
@@ -1141,6 +1202,9 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
                 agent: original_plan.agent.clone(),
                 master: original_plan.master.clone(),
                 child_algo: original_plan.child_algo,
+                follow_poll_secs: original_plan.follow_poll_secs,
+                follow_repost_secs: original_plan.follow_repost_secs,
+                follow_threshold_bps: original_plan.follow_threshold_bps,
             }
         }
     };

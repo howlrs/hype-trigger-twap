@@ -388,9 +388,11 @@ journal に一切記録されなかったため、ハードキルされた passi
 `--resume` はこの注文を見つけられず、上記の保証はハードキルには
 成立していなかった。
 
-**スコープ外**: スライス内での即時 re-quote (touch が動いた瞬間の
-cancel→再quote) は実装していない。再quote はスライス境界でのみ発生する
-(効果測定後に別途検討する設計判断)。
+**スライス内 re-quote**: `--child-algo passive` はスライス境界でのみ
+再quote する (boundary-only)。スライス内で touch を追従して cancel→再quote
+する挙動が必要な場合は `--child-algo follow` を使う (`run_follow_loop`。
+place/settle/journal は passive と同一の機構を再利用し、「いつ呼ぶか」の
+判断だけが異なる)。
 
 ## エラー処理
 

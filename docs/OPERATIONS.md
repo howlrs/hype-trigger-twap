@@ -506,11 +506,13 @@ override はできません — タイプミスの可能性を疑ってくださ
   「取引所が拒否」という表現にフォールバックします
 - **1 プロセス 1 銘柄です。** ポートフォリオ的な制御、既存ポジションの考慮
   (`reduce_only` は常に未設定)、HIP-3 の `dex:SYMBOL` 形式には対応していません
-- **既定はテイカーですが、passive モードは実装済みです。** `--child-algo market`
+- **既定はテイカーですが、メイカー系モードも実装済みです。** `--child-algo market`
   (既定) はすべてのスライスがスプレッドを越え、テイカー手数料を支払います。
   `--child-algo passive` はベスト bid/ask に ALO (post-only) 指値を置きますが、
-  スライス中の再クオートやタイムアウト時のテイカー切り替えは行いません —
-  未約定のまま次のスライスへ持ち越されるのみです
+  スライス中の再クオートは行いません。`--child-algo follow` は passive に
+  スライス中の板追従再クオートを加えたものです (`--follow-*` フラグで調整)。
+  いずれもタイムアウト時のテイカー切り替えは行いません — 未約定分は次の
+  スライスへ持ち越されるのみです
   ([issue #1](https://github.com/howlrs/hype-trigger-twap/issues/1))
 - **testnet での実発注検証は未実施です。** Agent 署名注文に対する `orderStatus` の
   実挙動が唯一の未検証点です。初回は少額から始めてください
@@ -521,14 +523,17 @@ override はできません — タイプミスの可能性を疑ってくださ
 
 ## 今後の予定
 
-**対応済み: ベスト bid/ask 追従 (passive post-only)** — `--child-algo passive` で
+**対応済み: ベスト bid/ask 追従 (passive post-only / follow)** — `--child-algo passive` で
 ベスト bid (ロング) / ベスト ask (ショート) に ALO (post-only) 指値を置いて
-テイカー手数料とスリッページを削減できます。ただし境界のみの再クオートに留まり
-(スライス中の再クオートは行わない)、タイムアウト時のテイカー切り替えフォールバックも
-未実装です。詳細は README の「Child-order algorithms」節、実装方針は
+テイカー手数料とスリッページを削減できます (境界のみの再クオート)。
+`--child-algo follow` はさらにスライス中も板をポーリングし、touch が
+`--follow-threshold-bps` 以上離れたら cancel→新 touch へ再掲示して追従します
+(`--follow-poll-secs` / `--follow-repost-secs` で頻度制御)。
+タイムアウト時のテイカー切り替えフォールバックは未実装です。詳細は README の
+「Child-order algorithms」節、実装方針は
 [issue #1](https://github.com/howlrs/hype-trigger-twap/issues/1) を参照してください。
 
-今後の候補: スライス中の再クオート、タイムアウト時のテイカー切り替えフォールバック。
+今後の候補: タイムアウト時のテイカー切り替えフォールバック。
 
 当面スコープ外: WebSocket による約定取得、複数銘柄の同時執行、既存ポジションの考慮。
 (実行の再開・永続化は対応済みです — 「クラッシュ・再起動時の手順」を参照してください)
