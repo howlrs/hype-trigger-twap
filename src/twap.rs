@@ -23,7 +23,7 @@ use crate::api::HlApi;
 use crate::client::{OrderStatusFill, PlaceOutcome, ValidatedFill, ValidatedMarketSnapshot};
 use crate::errors::{HlError, RejectionKind};
 use crate::format::{human, round_price, round_size, taker_limit_price};
-use crate::journal::{ExecutionJournal, JournalRecord};
+use crate::journal::{summarize, ExecutionJournal, JournalRecord};
 use crate::risk::RiskEnvelope;
 use crate::types::{Address, CancelIntent, Cloid, OrderIntent, Side, Symbol, Tif};
 
@@ -2690,10 +2690,41 @@ pub async fn run_twap_journaled(
     }
 
     if let Some(j) = journal {
+        // Issue #20: `outcome_unknown_cloids` must list every cloid this run
+        // journaled `Prepared`/`Acknowledged` but never resolved to
+        // `Terminal` — e.g. a `settle_resting_child` failure above (cancel
+        // or orderStatus error) that aborted the run WITHOUT ever writing
+        // that cloid's closing `Terminal` record. Hardcoding `Vec::new()`
+        // here (the pre-#20 behaviour) silently dropped that cloid from the
+        // FinalReport, which made `find_incomplete_run` treat the run as
+        // complete and refuse `--resume`. Derived by replaying THIS run's
+        // own on-disk journal — the same `summarize`-based pattern
+        // `grace_timeout_report_fields` (src/main.rs) already uses for the
+        // grace-timeout FinalReport — rather than tracking a second
+        // in-memory set alongside `stats`, since the journal itself is
+        // already the single source of truth for per-cloid state and a
+        // fresh replay can never drift from it.
+        let outcome_unknown_cloids = j
+            .dir()
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|state_root| {
+                ExecutionJournal::read_all(state_root, j.run_id())
+                    .map(|records| summarize(&records).unresolved_cloids())
+                    .map_err(|e| {
+                        tracing::warn!(
+                            error = %e,
+                            "FinalReport: failed to replay this run's own journal to derive \
+                             outcome_unknown_cloids; falling back to empty"
+                        );
+                    })
+                    .ok()
+            })
+            .unwrap_or_default();
         let _ = j.record(&JournalRecord::FinalReport {
             completed: abort_reason.is_none(),
             filled_total: stats.filled.to_string(),
-            outcome_unknown_cloids: Vec::new(),
+            outcome_unknown_cloids,
             note: abort_reason.clone().unwrap_or_else(|| "completed".into()),
         });
     }
@@ -7428,6 +7459,458 @@ mod loop_tests {
                 summary.total_filled(),
                 Decimal::ZERO,
                 "the invalid overfill must never reach the journal's credited total"
+            );
+        }
+
+        // === Issue #20: outcome_unknown_cloids population + resume/abandon ===
+
+        /// (a) A settle-failure abort produces a `FinalReport` whose
+        /// `outcome_unknown_cloids` lists the dangling cloid that was
+        /// `Prepared`/`Acknowledged` but never reached `Terminal`.
+        ///
+        /// Drives a real single-slice passive run through
+        /// `run_twap_journaled`: the ALO rests, then final cleanup's
+        /// `settle_resting_child` -> `recover_resting_fill` ->
+        /// `poll_terminal_status` sees `"open"` on every one of the widened
+        /// [`ORDER_STATUS_RETRIES`] attempts and hard-stops — exactly the
+        /// real production shape Issue #20 reports (a settle failure that
+        /// aborts the run before the resting cloid's Terminal record is
+        /// ever written).
+        #[tokio::test(start_paused = true)]
+        async fn settle_failure_abort_populates_outcome_unknown_cloids_with_the_dangling_cloid() {
+            let tmp = TempDir::new();
+            let mut journal =
+                ExecutionJournal::start(tmp.path(), "run-unknown-cloid".into(), test_header())
+                    .unwrap();
+
+            let mut p = plan_passive(false);
+            p.slices = 1;
+            p.per_slice = dec!(3);
+            p.total_adjusted = dec!(3);
+            p.total_requested = dec!(3);
+
+            let mut api = ScriptedApi::new()
+                .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+                .push_place(Ok(PlaceOutcome::Resting { oid: OrderId(900) }))
+                .push_cancel(Ok(()));
+            // Final cleanup's poll_terminal_status: "open" on every attempt,
+            // exhausting the (now 8-attempt) retry budget without ever
+            // seeing a terminal status.
+            for _ in 0..ORDER_STATUS_RETRIES {
+                api = api.push_status(Ok(Some(status_full(
+                    dec!(0),
+                    None,
+                    "open",
+                    OrderId(900),
+                    None,
+                    "HYPE",
+                    "B",
+                ))));
+            }
+
+            let report = run_twap_journaled(&api, &p, Some(&mut journal), None).await;
+            assert!(
+                report.abort_reason.is_some(),
+                "the exhausted settle retry budget must hard-stop the run"
+            );
+
+            let records = ExecutionJournal::read_all(tmp.path(), "run-unknown-cloid").unwrap();
+            let dangling_cloid = records
+                .iter()
+                .find_map(|r| match r {
+                    JournalRecord::Prepared {
+                        slice_idx: 1,
+                        cloid,
+                        ..
+                    } => Some(*cloid),
+                    _ => None,
+                })
+                .expect("slice 1's Prepared record must exist");
+            // No Terminal record was ever written for this cloid — the
+            // exact gap Issue #20 reports.
+            assert!(
+                !records.iter().any(
+                    |r| matches!(r, JournalRecord::Terminal { cloid, .. } if *cloid == dangling_cloid)
+                ),
+                "this cloid must NOT have a Terminal record — that is the bug scenario: {records:?}"
+            );
+
+            let final_report = records
+                .iter()
+                .find_map(|r| match r {
+                    JournalRecord::FinalReport {
+                        outcome_unknown_cloids,
+                        ..
+                    } => Some(outcome_unknown_cloids.clone()),
+                    _ => None,
+                })
+                .expect("a FinalReport must be written on abort");
+            assert_eq!(
+                final_report,
+                vec![dangling_cloid],
+                "outcome_unknown_cloids must list the dangling Prepared/Acknowledged cloid \
+                 that never reached Terminal — pre-#20 this was hardcoded to []: {records:?}"
+            );
+
+            // find_incomplete_run must now flag this run as incomplete
+            // (Issue #20's find_incomplete_run requirement), even though a
+            // FinalReport exists.
+            let summary = summarize(&records);
+            assert!(
+                summary.is_incomplete(),
+                "a run whose last FinalReport carries a non-empty outcome_unknown_cloids must \
+                 be treated as incomplete"
+            );
+        }
+
+        /// (b) Resuming a journal from an (a)-style state reconciles the
+        /// unknown cloid via `reconcile_unresolved_cloid` (mock orderStatus:
+        /// canceled with a partial fill), crediting the fill EXACTLY ONCE
+        /// and writing a Terminal record — then the run continues executing
+        /// its remaining work (a second slice is placed).
+        #[tokio::test(start_paused = true)]
+        async fn resume_reconciles_the_unknown_cloid_exactly_once_and_continues_the_run() {
+            let tmp = TempDir::new();
+            let unresolved_cloid = Cloid::new();
+
+            // Seed a journal in the (a)-style post-abort shape by hand:
+            // Prepared+Acknowledged for slice 1 (no Terminal), then a
+            // FinalReport listing it as unknown — precisely what the fix in
+            // (a) now produces.
+            {
+                let mut journal =
+                    ExecutionJournal::start(tmp.path(), "run-resume-unknown".into(), test_header())
+                        .unwrap();
+                journal
+                    .record(&JournalRecord::Prepared {
+                        slice_idx: 1,
+                        cloid: unresolved_cloid,
+                        nonce: None,
+                        symbol: Symbol::new("HYPE"),
+                        side: Side::Long,
+                        px: "49.9".into(),
+                        sz: "3".into(),
+                    })
+                    .unwrap();
+                journal
+                    .record(&JournalRecord::Acknowledged {
+                        slice_idx: 1,
+                        cloid: unresolved_cloid,
+                        oid: Some(901),
+                        status: "open".into(),
+                    })
+                    .unwrap();
+                journal
+                    .record(&JournalRecord::FinalReport {
+                        completed: false,
+                        filled_total: "0".into(),
+                        outcome_unknown_cloids: vec![unresolved_cloid],
+                        note: "settle failure abort".into(),
+                    })
+                    .unwrap();
+            }
+
+            let records = ExecutionJournal::read_all(tmp.path(), "run-resume-unknown").unwrap();
+            let summary = summarize(&records);
+            assert!(
+                summary.is_incomplete(),
+                "seeded (a)-style journal must be detected as incomplete"
+            );
+            assert_eq!(summary.unresolved_cloids(), vec![unresolved_cloid]);
+
+            // "Resume": reconcile the one unresolved cloid via the EXISTING
+            // reconcile_unresolved_cloid machinery, exactly as
+            // main.rs::reconcile_incomplete_run does for every entry in
+            // unresolved_cloids().
+            let mut p = plan_passive(false);
+            p.slices = 2;
+            p.per_slice = dec!(3);
+            p.total_adjusted = dec!(6);
+            p.total_requested = dec!(6);
+
+            let reconcile_api = ScriptedApi::new()
+                .push_status(Ok(Some(status_full(
+                    dec!(0),
+                    None,
+                    "open",
+                    OrderId(901),
+                    Some(unresolved_cloid),
+                    "HYPE",
+                    "B",
+                ))))
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(2),
+                    Some(dec!(49.9)),
+                    "canceled",
+                    OrderId(901),
+                    Some(unresolved_cloid),
+                    "HYPE",
+                    "B",
+                ))));
+
+            let mut journal =
+                ExecutionJournal::open_existing(tmp.path(), "run-resume-unknown").unwrap();
+            let prepared = PreparedIntent {
+                symbol: Symbol::new("HYPE"),
+                side: Side::Long,
+                px: dec!(49.9),
+                sz: dec!(3),
+            };
+            reconcile_unresolved_cloid(
+                &reconcile_api,
+                &p,
+                unresolved_cloid,
+                1,
+                &prepared,
+                &mut journal,
+            )
+            .await
+            .expect("reconciling the unknown cloid must succeed");
+
+            let after_reconcile =
+                ExecutionJournal::read_all(tmp.path(), "run-resume-unknown").unwrap();
+            let terminal_records: Vec<_> = after_reconcile
+                .iter()
+                .filter(|r| matches!(r, JournalRecord::Terminal { cloid, .. } if *cloid == unresolved_cloid))
+                .collect();
+            assert_eq!(
+                terminal_records.len(),
+                1,
+                "exactly one Terminal record must be written for the reconciled cloid \
+                 (fill credited exactly once): {after_reconcile:?}"
+            );
+            let reconciled_summary = summarize(&after_reconcile);
+            assert_eq!(
+                reconciled_summary.total_filled(),
+                dec!(2),
+                "the partial fill (2 of 3) must be credited exactly once"
+            );
+            assert!(
+                reconciled_summary.unresolved_cloids().is_empty(),
+                "no unresolved cloids should remain after reconciliation"
+            );
+
+            // Continuation: the run now proceeds for the remainder (a fresh
+            // slice 2 places under the SAME journal/run_id, matching how
+            // `run_twap_journaled` continues a resumed run in main.rs).
+            let continue_api = ScriptedApi::new()
+                .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+                .push_place(filled(dec!(4), dec!(50)));
+            let mut continuation_plan = plan_passive(false);
+            continuation_plan.child_algo = ChildAlgo::Market;
+            continuation_plan.slices = 1;
+            continuation_plan.per_slice = dec!(4);
+            continuation_plan.total_adjusted = dec!(4);
+            continuation_plan.total_requested = dec!(4);
+            let mut journal =
+                ExecutionJournal::open_existing(tmp.path(), "run-resume-unknown").unwrap();
+            let cont_report =
+                run_twap_journaled(&continue_api, &continuation_plan, Some(&mut journal), None)
+                    .await;
+            assert_eq!(
+                cont_report.abort_reason, None,
+                "the continued remainder must complete normally"
+            );
+            assert_eq!(cont_report.filled, dec!(4));
+
+            // A fresh (second) FinalReport is written for the continuation.
+            let final_records =
+                ExecutionJournal::read_all(tmp.path(), "run-resume-unknown").unwrap();
+            let final_reports: Vec<_> = final_records
+                .iter()
+                .filter(|r| matches!(r, JournalRecord::FinalReport { .. }))
+                .collect();
+            assert_eq!(
+                final_reports.len(),
+                2,
+                "the continuation must append a FRESH (second) FinalReport, not rewrite the \
+                 first one: {final_records:?}"
+            );
+            let final_summary = summarize(&final_records);
+            assert!(
+                !final_summary.is_incomplete(),
+                "after the continuation's fresh FinalReport (empty outcome_unknown_cloids), \
+                 the run must be treated as complete"
+            );
+        }
+
+        /// (c) `--abandon-incomplete-run` on an (a)-style journal: reconciles
+        /// the unknown cloid via the same `reconcile_unresolved_cloid` path,
+        /// then closes the run as `Abandoned` — verify final state.
+        #[tokio::test(start_paused = true)]
+        async fn abandon_incomplete_run_reconciles_unknown_cloid_then_closes_as_abandoned() {
+            let tmp = TempDir::new();
+            let unresolved_cloid = Cloid::new();
+
+            {
+                let mut journal = ExecutionJournal::start(
+                    tmp.path(),
+                    "run-abandon-unknown".into(),
+                    test_header(),
+                )
+                .unwrap();
+                journal
+                    .record(&JournalRecord::Prepared {
+                        slice_idx: 1,
+                        cloid: unresolved_cloid,
+                        nonce: None,
+                        symbol: Symbol::new("HYPE"),
+                        side: Side::Long,
+                        px: "49.9".into(),
+                        sz: "3".into(),
+                    })
+                    .unwrap();
+                journal
+                    .record(&JournalRecord::Acknowledged {
+                        slice_idx: 1,
+                        cloid: unresolved_cloid,
+                        oid: Some(902),
+                        status: "open".into(),
+                    })
+                    .unwrap();
+                journal
+                    .record(&JournalRecord::FinalReport {
+                        completed: false,
+                        filled_total: "0".into(),
+                        outcome_unknown_cloids: vec![unresolved_cloid],
+                        note: "settle failure abort".into(),
+                    })
+                    .unwrap();
+            }
+
+            let records = ExecutionJournal::read_all(tmp.path(), "run-abandon-unknown").unwrap();
+            assert!(summarize(&records).is_incomplete());
+
+            let mut p = plan_passive(false);
+            p.slices = 1;
+            p.per_slice = dec!(3);
+            p.total_adjusted = dec!(3);
+            p.total_requested = dec!(3);
+
+            let reconcile_api = ScriptedApi::new()
+                .push_status(Ok(Some(status_full(
+                    dec!(0),
+                    None,
+                    "open",
+                    OrderId(902),
+                    Some(unresolved_cloid),
+                    "HYPE",
+                    "B",
+                ))))
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(3),
+                    Some(dec!(49.9)),
+                    "canceled",
+                    OrderId(902),
+                    Some(unresolved_cloid),
+                    "HYPE",
+                    "B",
+                ))));
+
+            let mut journal =
+                ExecutionJournal::open_existing(tmp.path(), "run-abandon-unknown").unwrap();
+            let prepared = PreparedIntent {
+                symbol: Symbol::new("HYPE"),
+                side: Side::Long,
+                px: dec!(49.9),
+                sz: dec!(3),
+            };
+            reconcile_unresolved_cloid(
+                &reconcile_api,
+                &p,
+                unresolved_cloid,
+                1,
+                &prepared,
+                &mut journal,
+            )
+            .await
+            .expect("reconciling the unknown cloid on abandon must succeed");
+
+            // Same as main.rs's --abandon-incomplete-run path: after forced
+            // reconciliation, mark the run Abandoned without continuing it.
+            journal
+                .record(&JournalRecord::Abandoned {
+                    note: "operator passed --abandon-incomplete-run".into(),
+                })
+                .unwrap();
+
+            let final_records =
+                ExecutionJournal::read_all(tmp.path(), "run-abandon-unknown").unwrap();
+            let final_summary = summarize(&final_records);
+            assert!(
+                final_summary.abandoned,
+                "the run must be marked Abandoned: {final_records:?}"
+            );
+            assert_eq!(
+                final_summary.total_filled(),
+                dec!(3),
+                "the reconciled fill must be credited before the run closes: {final_records:?}"
+            );
+            assert!(
+                !final_summary.is_incomplete(),
+                "an abandoned run must never be flagged incomplete, even though its \
+                 outcome_unknown_cloids-carrying FinalReport still precedes the Abandoned marker"
+            );
+        }
+
+        /// (d) A journal whose LAST `FinalReport` has EMPTY
+        /// `outcome_unknown_cloids` is correctly treated as complete —
+        /// `find_incomplete_run`/`is_incomplete` must NOT flag it: no
+        /// false-positive resume of an already-healthy completed run.
+        #[test]
+        fn healthy_final_report_with_empty_unknown_cloids_is_not_incomplete() {
+            let cloid = Cloid::new();
+            let records = vec![
+                JournalRecord::Header(test_header()),
+                JournalRecord::Prepared {
+                    slice_idx: 1,
+                    cloid,
+                    nonce: Some(1),
+                    symbol: Symbol::new("HYPE"),
+                    side: Side::Long,
+                    px: "50".into(),
+                    sz: "5".into(),
+                },
+                JournalRecord::Terminal {
+                    slice_idx: 1,
+                    cloid,
+                    status: "filled".into(),
+                    filled_sz: "5".into(),
+                    avg_px: Some("50".into()),
+                },
+                JournalRecord::FinalReport {
+                    completed: true,
+                    filled_total: "5".into(),
+                    outcome_unknown_cloids: vec![],
+                    note: "completed".into(),
+                },
+            ];
+            let summary = summarize(&records);
+            assert!(
+                !summary.is_incomplete(),
+                "a completed run whose FinalReport carries an empty outcome_unknown_cloids \
+                 must not be flagged incomplete"
+            );
+
+            // Also exercise the real find_incomplete_run scan, not just
+            // summarize(), to pin the end-to-end behaviour main.rs relies on.
+            let tmp = TempDir::new();
+            let mut journal =
+                ExecutionJournal::start(tmp.path(), "run-healthy".into(), test_header()).unwrap();
+            for rec in &records[1..] {
+                journal.record(rec).unwrap();
+            }
+            let found = crate::journal::find_incomplete_run(
+                tmp.path(),
+                "testnet",
+                Some(&Address::new(AGENT)),
+            )
+            .unwrap();
+            assert_eq!(
+                found, None,
+                "find_incomplete_run must not flag an already-healthy completed run"
             );
         }
     }
