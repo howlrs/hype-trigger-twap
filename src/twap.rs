@@ -54,8 +54,41 @@ const STALE_BOOK_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// order is known to exist (HL gave us its oid), so this loop is purely
 /// "keep asking until the status is terminal," with no safe-resend decision
 /// involved.
-const ORDER_STATUS_RETRIES: u32 = 3;
-const ORDER_STATUS_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+///
+/// Widened from the original 3 retries / fixed 500ms interval (~1s total)
+/// after a real mainnet abort: 2026-08-20 17:48Z, follow repost cycle, oid
+/// 520031185240. The cancel for that oid was ACCEPTED (no `cancel_error` in
+/// the log), but `poll_terminal_status` observed status `"open"` on all 3
+/// attempts (500ms apart, ~1s budget) and hard-stopped with "could not
+/// determine a terminal fill ... after 3 attempts (status 'open' is not
+/// terminal (filled 0 so far)); stopping rather than risk over-ordering".
+/// Post-mortem via `curl` against HL's live `orderStatus` endpoint confirmed
+/// the order HAD been canceled with 0 filled — the cancel had landed, but
+/// HL's `orderStatus` took >1.5s to transition open→canceled. Earlier
+/// settles in the same run transitioned in <0.8s, so this is propagation
+/// latency variance under load, not a stuck/hung order.
+///
+/// [`ORDER_STATUS_RETRIES`] attempts, backing off exponentially from
+/// [`ORDER_STATUS_RETRY_INTERVAL_BASE`] and capping at
+/// [`ORDER_STATUS_RETRY_INTERVAL_CAP`] between attempts (see
+/// [`order_status_retry_delay`]): 500ms, 1s, 2s, 2s, 2s, 2s, 2s between the
+/// 8 attempts — 7 sleeps totalling 11.5s worst case. This only widens the
+/// window before giving up; it does not change what counts as terminal, and
+/// exhausting the budget is still a hard stop (see `poll_terminal_status`).
+const ORDER_STATUS_RETRIES: u32 = 8;
+const ORDER_STATUS_RETRY_INTERVAL_BASE: Duration = Duration::from_millis(500);
+const ORDER_STATUS_RETRY_INTERVAL_CAP: Duration = Duration::from_secs(2);
+
+/// The delay before retry attempt `attempt + 1` (0-indexed `attempt` is the
+/// attempt that just failed): doubles from
+/// [`ORDER_STATUS_RETRY_INTERVAL_BASE`] each step, capped at
+/// [`ORDER_STATUS_RETRY_INTERVAL_CAP`]. Pure function so the backoff shape
+/// is unit-testable without any sleeping or network I/O.
+fn order_status_retry_delay(attempt: u32) -> Duration {
+    let base_ms = ORDER_STATUS_RETRY_INTERVAL_BASE.as_millis() as u64;
+    let doubled_ms = base_ms.checked_shl(attempt).unwrap_or(u64::MAX);
+    Duration::from_millis(doubled_ms).min(ORDER_STATUS_RETRY_INTERVAL_CAP)
+}
 
 /// W1 unknownOid safe-resend policy (Issue #7, PM-decided, binding).
 ///
@@ -761,12 +794,12 @@ async fn poll_terminal_status(
             Err(e) => last_err = Some(e.to_string()),
         }
         if attempt + 1 < ORDER_STATUS_RETRIES {
-            tokio::time::sleep(ORDER_STATUS_RETRY_INTERVAL).await;
+            tokio::time::sleep(order_status_retry_delay(attempt)).await;
         }
     }
     Err(HlError::InvalidResponse(format!(
         "could not determine a terminal fill for oid {oid} after {ORDER_STATUS_RETRIES} attempts \
-         ({}); stopping rather than risk over-ordering",
+         (~11.5s budget) ({}); stopping rather than risk over-ordering",
         last_err.unwrap_or_else(|| "no detail".into())
     )))
 }
@@ -2691,6 +2724,29 @@ async fn sleep_until(deadline: tokio::time::Instant) {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    // === orderStatus retry backoff (pure function, no I/O) ===
+
+    #[test]
+    fn order_status_retry_delay_doubles_then_caps_at_2s() {
+        assert_eq!(order_status_retry_delay(0), Duration::from_millis(500));
+        assert_eq!(order_status_retry_delay(1), Duration::from_secs(1));
+        assert_eq!(order_status_retry_delay(2), Duration::from_secs(2));
+        // Stays capped for every later attempt, including ones large enough
+        // to overflow a naive `500ms << attempt` shift.
+        assert_eq!(order_status_retry_delay(3), Duration::from_secs(2));
+        assert_eq!(order_status_retry_delay(6), Duration::from_secs(2));
+        assert_eq!(order_status_retry_delay(31), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn order_status_retry_budget_totals_eleven_point_five_seconds() {
+        // 8 attempts -> 7 inter-attempt sleeps: 500ms,1s,2s,2s,2s,2s,2s.
+        let total: Duration = (0..ORDER_STATUS_RETRIES - 1)
+            .map(order_status_retry_delay)
+            .sum();
+        assert_eq!(total, Duration::from_millis(11_500));
+    }
 
     // === pre-flight sizing ===
 
