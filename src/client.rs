@@ -583,35 +583,77 @@ fn normalise_status(s: &str) -> String {
 /// Constructing a `ValidatedFill` is the only way to turn an untrusted
 /// `(filled_sz, avg_px)` pair plus the `OrderIntent` that produced it into a
 /// value a caller may add to `FillStats`. Two entry points cover the two wire
-/// shapes that carry a fill (`PlaceOutcome::Filled` and `OrderStatusFill`)
-/// without forcing a false unification between them — see
-/// [`ValidatedFill::try_from_place`] and [`ValidatedFill::try_from_status`].
+/// shapes that carry a fill, and — this is the load-bearing difference — the
+/// two shapes have DIFFERENT avgPx contracts:
 ///
-/// Checks applied (all four must hold):
+/// - [`ValidatedFill::try_from_place`] validates a `/exchange` place
+///   response's `Filled` outcome. That shape ALWAYS carries `avgPx` on the
+///   wire; this path keeps the hard requirement `avg_px > 0` whenever
+///   `filled > 0`, unconditionally.
+/// - [`ValidatedFill::try_from_status`] validates an `/info orderStatus`
+///   snapshot. **A real HL `orderStatus` response never carries an `avgPx`
+///   field at all — not even for a fully filled order** — so `filled_sz > 0`
+///   with `avg_px: None` is a NORMAL, expected shape on this path, not an
+///   error. Filled size here is derived from `origSz - sz` (see
+///   `parse_order_status`), which does not depend on `avgPx` being present.
+///   Verified against a real mainnet payload (oid 520004740129, cloid
+///   0x01a01b02127876818a7dfe40cd8a6b79, 2026-08-20): a rested ALO long
+///   0.2 HYPE @ 62.008 that filled, whose `orderStatus` response was
+///   `{"status":"order","order":{"order":{...,"origSz":"0.2","sz":"0.0",
+///   ...no "avgPx" key anywhere...},"status":"filled",...}}`. Every caller
+///   of `try_from_status` credits a `None` `avg_px` at the RESTING/INTENT
+///   order's own signed limit price (`vf.avg_px.unwrap_or(intent.px)` /
+///   `.unwrap_or(resting.px)`), and that fallback is exact, not an estimate:
+///   HL always fills a resting maker (ALO/post-only) order at that order's
+///   own limit price — a maker fill cannot execute at any other price, so
+///   the limit price IS the fill price whenever HL declines to echo it back.
+///
+/// Checks applied by both paths (all must hold):
 /// - `0 <= filled <= intent.sz` — an overfill is a hard error, NEVER clamped.
 ///   Silently clamping would mean crediting a size that was never actually
 ///   asked for while hiding the fact that the exchange's number disagreed
 ///   with ours.
-/// - `avg_px > 0` whenever `filled > 0` — a filled quantity at a zero or
-///   negative price is not a price at all.
-/// - side-aware price bound: a LONG's average fill price may not exceed the
-///   signed limit (`avg_px <= intent.px`); a SHORT's may not fall below it
-///   (`avg_px >= intent.px`). HL is a taker-limit order, so a fill outside
-///   the limit means the response does not describe the order we sent.
+/// - when `avg_px` IS present (always for `try_from_place`; sometimes for
+///   `try_from_status`): `avg_px > 0` — a filled quantity at a zero or
+///   negative price is not a price at all. Side-aware price bound: a LONG's
+///   average fill price may not exceed the signed limit (`avg_px <=
+///   intent.px`); a SHORT's may not fall below it (`avg_px >= intent.px`).
+///   HL is a taker-limit order, so a fill outside the limit means the
+///   response does not describe the order we sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValidatedFill {
     pub filled_sz: Decimal,
-    /// `None` only when `filled_sz == 0` (a zero fill has no price).
+    /// `None` when `filled_sz == 0` (a zero fill has no price), OR — for
+    /// `try_from_status` only — when `filled_sz > 0` but the real
+    /// `orderStatus` response simply omitted `avgPx` (normal; see the
+    /// type-level doc comment). Every caller must fall back to the
+    /// resting/intent limit price in that case; `try_from_place` never
+    /// produces `avg_px: None` for a nonzero fill.
     pub avg_px: Option<Decimal>,
+}
+
+/// Whether a wire shape being validated is required to carry `avgPx`
+/// whenever it reports a nonzero fill. `/exchange` place responses are
+/// (`Required`); `/info orderStatus` snapshots are not (`Optional`) — see
+/// [`ValidatedFill`]'s doc comment for why the two shapes differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AvgPxRequirement {
+    Required,
+    Optional,
 }
 
 impl ValidatedFill {
     /// Core validator shared by both entry points. `avg_px` is `None` when
-    /// the wire response omitted it (HL does this for a never-filled order).
+    /// the wire response omitted it. `requirement` decides whether a
+    /// nonzero `filled_sz` with `avg_px: None` is an error
+    /// (`AvgPxRequirement::Required`, the place-response contract) or a
+    /// normal, valid outcome (`AvgPxRequirement::Optional`, the real
+    /// orderStatus contract).
     fn validate(
         filled_sz: Decimal,
         avg_px: Option<Decimal>,
         intent: &OrderIntent,
+        requirement: AvgPxRequirement,
     ) -> Result<Self, HlError> {
         if filled_sz < Decimal::ZERO {
             return Err(HlError::InvalidResponse(format!(
@@ -627,12 +669,34 @@ impl ValidatedFill {
         }
 
         if filled_sz > Decimal::ZERO {
-            let px = avg_px.ok_or_else(|| {
-                HlError::InvalidResponse(format!(
-                    "fill validation: filled_sz {filled_sz} > 0 but avgPx is missing (cloid {})",
-                    intent.cloid
-                ))
-            })?;
+            let px = match (avg_px, requirement) {
+                (Some(px), _) => px,
+                (None, AvgPxRequirement::Required) => {
+                    return Err(HlError::InvalidResponse(format!(
+                        "fill validation: filled_sz {filled_sz} > 0 but avgPx is missing \
+                         (cloid {})",
+                        intent.cloid
+                    )));
+                }
+                (None, AvgPxRequirement::Optional) => {
+                    // Normal for a real orderStatus response (HL never sends
+                    // avgPx on this shape) — the caller is responsible for
+                    // crediting at the resting/intent limit price. See
+                    // ValidatedFill's doc comment for why that fallback is
+                    // exact, not an estimate.
+                    tracing::info!(
+                        cloid = %intent.cloid,
+                        filled_sz = %filled_sz,
+                        limit_px = %intent.px,
+                        "orderStatus carried no avgPx (normal for HL); crediting at the \
+                         resting limit price"
+                    );
+                    return Ok(ValidatedFill {
+                        filled_sz,
+                        avg_px: None,
+                    });
+                }
+            };
             if px <= Decimal::ZERO {
                 return Err(HlError::InvalidResponse(format!(
                     "fill validation: avgPx {px} is not positive despite filled_sz {filled_sz} \
@@ -668,12 +732,14 @@ impl ValidatedFill {
     }
 
     /// Validate a `/exchange` place response's `Filled` outcome against the
-    /// intent that produced it.
+    /// intent that produced it. The place shape always carries `avgPx` on
+    /// the wire, so this path keeps FULL strictness: `avg_px: None` with a
+    /// nonzero fill is a hard error.
     pub fn try_from_place(outcome: &PlaceOutcome, intent: &OrderIntent) -> Result<Self, HlError> {
         match outcome {
             PlaceOutcome::Filled {
                 total_sz, avg_px, ..
-            } => Self::validate(*total_sz, Some(*avg_px), intent),
+            } => Self::validate(*total_sz, Some(*avg_px), intent, AvgPxRequirement::Required),
             PlaceOutcome::Resting { .. } => Err(HlError::InvalidResponse(
                 "fill validation: cannot validate a Resting outcome as a fill".into(),
             )),
@@ -681,9 +747,17 @@ impl ValidatedFill {
     }
 
     /// Validate an `/info orderStatus` snapshot against the intent that
-    /// produced the order it describes.
+    /// produced the order it describes. A real orderStatus response never
+    /// carries `avgPx` (see [`ValidatedFill`]'s doc comment), so
+    /// `filled_sz > 0` with no `avgPx` is accepted here as a normal
+    /// outcome — the caller must credit at the resting/intent limit price.
     pub fn try_from_status(fill: &OrderStatusFill, intent: &OrderIntent) -> Result<Self, HlError> {
-        Self::validate(fill.filled_sz, fill.avg_px, intent)
+        Self::validate(
+            fill.filled_sz,
+            fill.avg_px,
+            intent,
+            AvgPxRequirement::Optional,
+        )
     }
 }
 
@@ -1599,7 +1673,9 @@ mod tests {
     #[test]
     fn validated_fill_accepts_a_normal_long_fill_within_the_limit() {
         let i = intent(crate::types::Side::Long, dec!(50), dec!(10));
-        let vf = ValidatedFill::validate(dec!(10), Some(dec!(49.9)), &i).unwrap();
+        let vf =
+            ValidatedFill::validate(dec!(10), Some(dec!(49.9)), &i, AvgPxRequirement::Required)
+                .unwrap();
         assert_eq!(vf.filled_sz, dec!(10));
         assert_eq!(vf.avg_px, Some(dec!(49.9)));
     }
@@ -1607,14 +1683,16 @@ mod tests {
     #[test]
     fn validated_fill_accepts_a_normal_short_fill_within_the_limit() {
         let i = intent(crate::types::Side::Short, dec!(50), dec!(10));
-        let vf = ValidatedFill::validate(dec!(10), Some(dec!(50.1)), &i).unwrap();
+        let vf =
+            ValidatedFill::validate(dec!(10), Some(dec!(50.1)), &i, AvgPxRequirement::Required)
+                .unwrap();
         assert_eq!(vf.avg_px, Some(dec!(50.1)));
     }
 
     #[test]
     fn validated_fill_accepts_a_zero_fill_with_no_price() {
         let i = intent(crate::types::Side::Long, dec!(50), dec!(10));
-        let vf = ValidatedFill::validate(dec!(0), None, &i).unwrap();
+        let vf = ValidatedFill::validate(dec!(0), None, &i, AvgPxRequirement::Required).unwrap();
         assert_eq!(vf.filled_sz, Decimal::ZERO);
         assert_eq!(vf.avg_px, None);
     }
@@ -1623,7 +1701,9 @@ mod tests {
     fn validated_fill_rejects_overfill_never_clamps() {
         // 0 <= filled <= intent.sz — an overfill is a hard error.
         let i = intent(crate::types::Side::Long, dec!(50), dec!(10));
-        let err = ValidatedFill::validate(dec!(10.01), Some(dec!(50)), &i).unwrap_err();
+        let err =
+            ValidatedFill::validate(dec!(10.01), Some(dec!(50)), &i, AvgPxRequirement::Required)
+                .unwrap_err();
         match err {
             HlError::InvalidResponse(msg) => assert!(msg.contains("exceeds intent size"), "{msg}"),
             other => panic!("expected InvalidResponse, got {other:?}"),
@@ -1633,14 +1713,16 @@ mod tests {
     #[test]
     fn validated_fill_rejects_negative_filled_sz() {
         let i = intent(crate::types::Side::Long, dec!(50), dec!(10));
-        let err = ValidatedFill::validate(dec!(-1), Some(dec!(50)), &i).unwrap_err();
+        let err = ValidatedFill::validate(dec!(-1), Some(dec!(50)), &i, AvgPxRequirement::Required)
+            .unwrap_err();
         assert!(matches!(err, HlError::InvalidResponse(_)));
     }
 
     #[test]
     fn validated_fill_rejects_zero_avg_px_when_filled() {
         let i = intent(crate::types::Side::Long, dec!(50), dec!(10));
-        let err = ValidatedFill::validate(dec!(5), Some(dec!(0)), &i).unwrap_err();
+        let err = ValidatedFill::validate(dec!(5), Some(dec!(0)), &i, AvgPxRequirement::Required)
+            .unwrap_err();
         match err {
             HlError::InvalidResponse(msg) => assert!(msg.contains("not positive"), "{msg}"),
             other => panic!("expected InvalidResponse, got {other:?}"),
@@ -1650,14 +1732,34 @@ mod tests {
     #[test]
     fn validated_fill_rejects_negative_avg_px_when_filled() {
         let i = intent(crate::types::Side::Long, dec!(50), dec!(10));
-        let err = ValidatedFill::validate(dec!(5), Some(dec!(-1)), &i).unwrap_err();
+        let err = ValidatedFill::validate(dec!(5), Some(dec!(-1)), &i, AvgPxRequirement::Required)
+            .unwrap_err();
         assert!(matches!(err, HlError::InvalidResponse(_)));
     }
 
     #[test]
-    fn validated_fill_rejects_missing_avg_px_when_filled() {
+    fn validated_fill_status_shape_accepts_missing_avg_px_when_filled() {
+        // Real HL orderStatus responses never carry avgPx, even for a fully
+        // filled order (verified mainnet oid 520004740129, 2026-08-20 — see
+        // ValidatedFill's doc comment). AvgPxRequirement::Optional is the
+        // orderStatus contract: filled_sz > 0 with avg_px: None must VALIDATE
+        // successfully, leaving the caller to credit at the resting/intent
+        // limit price.
         let i = intent(crate::types::Side::Long, dec!(50), dec!(10));
-        let err = ValidatedFill::validate(dec!(5), None, &i).unwrap_err();
+        let vf = ValidatedFill::validate(dec!(5), None, &i, AvgPxRequirement::Optional).unwrap();
+        assert_eq!(vf.filled_sz, dec!(5));
+        assert_eq!(vf.avg_px, None);
+    }
+
+    #[test]
+    fn validated_fill_place_shape_rejects_missing_avg_px_when_filled() {
+        // The place-response contract is the opposite: /exchange's Filled
+        // shape always carries avgPx on the wire, so AvgPxRequirement::
+        // Required must still hard-error when it is absent despite a
+        // nonzero fill — this is the strictness try_from_place must keep.
+        let i = intent(crate::types::Side::Long, dec!(50), dec!(10));
+        let err =
+            ValidatedFill::validate(dec!(5), None, &i, AvgPxRequirement::Required).unwrap_err();
         match err {
             HlError::InvalidResponse(msg) => assert!(msg.contains("avgPx is missing"), "{msg}"),
             other => panic!("expected InvalidResponse, got {other:?}"),
@@ -1667,7 +1769,9 @@ mod tests {
     #[test]
     fn validated_fill_rejects_long_avg_px_above_the_limit() {
         let i = intent(crate::types::Side::Long, dec!(50), dec!(10));
-        let err = ValidatedFill::validate(dec!(5), Some(dec!(50.01)), &i).unwrap_err();
+        let err =
+            ValidatedFill::validate(dec!(5), Some(dec!(50.01)), &i, AvgPxRequirement::Required)
+                .unwrap_err();
         match err {
             HlError::InvalidResponse(msg) => assert!(msg.contains("long avgPx"), "{msg}"),
             other => panic!("expected InvalidResponse, got {other:?}"),
@@ -1677,7 +1781,9 @@ mod tests {
     #[test]
     fn validated_fill_rejects_short_avg_px_below_the_limit() {
         let i = intent(crate::types::Side::Short, dec!(50), dec!(10));
-        let err = ValidatedFill::validate(dec!(5), Some(dec!(49.99)), &i).unwrap_err();
+        let err =
+            ValidatedFill::validate(dec!(5), Some(dec!(49.99)), &i, AvgPxRequirement::Required)
+                .unwrap_err();
         match err {
             HlError::InvalidResponse(msg) => assert!(msg.contains("short avgPx"), "{msg}"),
             other => panic!("expected InvalidResponse, got {other:?}"),
@@ -1688,9 +1794,11 @@ mod tests {
     fn validated_fill_accepts_avg_px_exactly_at_the_limit() {
         // Boundary: exactly at the limit is fine on both sides.
         let long = intent(crate::types::Side::Long, dec!(50), dec!(10));
-        ValidatedFill::validate(dec!(5), Some(dec!(50)), &long).unwrap();
+        ValidatedFill::validate(dec!(5), Some(dec!(50)), &long, AvgPxRequirement::Required)
+            .unwrap();
         let short = intent(crate::types::Side::Short, dec!(50), dec!(10));
-        ValidatedFill::validate(dec!(5), Some(dec!(50)), &short).unwrap();
+        ValidatedFill::validate(dec!(5), Some(dec!(50)), &short, AvgPxRequirement::Required)
+            .unwrap();
     }
 
     #[test]
@@ -1710,6 +1818,27 @@ mod tests {
             avg_px: dec!(49.9),
         };
         assert!(ValidatedFill::try_from_place(&bad, &i).is_err());
+    }
+
+    #[test]
+    fn validated_fill_try_from_place_still_hard_errors_on_a_non_positive_avg_px() {
+        // Mirrors validated_fill_place_shape_rejects_missing_avg_px_when_filled
+        // through the actual try_from_place entry point: PlaceOutcome::Filled
+        // carries avg_px as a plain Decimal (not Option<Decimal>), so
+        // "missing avgPx" is unrepresentable at this shape — the wire
+        // guarantee IS the type. What remains testable, and what must still
+        // hard-error, is a non-positive avgPx smuggled into that field.
+        let i = intent(crate::types::Side::Long, dec!(50), dec!(10));
+        let zero_px = PlaceOutcome::Filled {
+            oid: OrderId(1),
+            total_sz: dec!(10),
+            avg_px: dec!(0),
+        };
+        let err = ValidatedFill::try_from_place(&zero_px, &i).unwrap_err();
+        match err {
+            HlError::InvalidResponse(msg) => assert!(msg.contains("not positive"), "{msg}"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
     }
 
     #[test]

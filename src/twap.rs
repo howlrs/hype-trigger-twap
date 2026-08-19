@@ -4094,6 +4094,67 @@ mod loop_tests {
         assert_eq!(report.abort_reason, None, "a zero fill is not an abort");
     }
 
+    /// Regression test for a real mainnet incident (2026-08-20, oid
+    /// 520004740129, cloid 0x01a01b02127876818a7dfe40cd8a6b79): a resting
+    /// ALO long 0.2 HYPE @ 62.008 filled, and the run's immediate-settle
+    /// path fetched this EXACT orderStatus payload — no `avgPx` key
+    /// anywhere in the JSON, because a real HL orderStatus response never
+    /// carries one. The fixture below is that payload verbatim; it is fed
+    /// through `client::parse_order_status`, the actual JSON deserialization
+    /// used in production (not the `status()` test helper that builds an
+    /// `OrderStatusFill` by hand), and then through the real
+    /// `settle_resting_child` settle path. Before the fix this hard-stopped
+    /// with "filled_sz 0.2 > 0 but avgPx is missing"; it must now succeed
+    /// and credit the fill at the resting order's own limit price (62.008)
+    /// — the exact fill price for a maker order, per ValidatedFill's doc
+    /// comment.
+    #[tokio::test(start_paused = true)]
+    async fn real_mainnet_filled_order_status_with_no_avg_px_key_settles_at_the_resting_limit() {
+        const REAL_ORDER_STATUS_PAYLOAD: &str = r#"{"status":"order","order":{"order":{"coin":"HYPE","side":"B","limitPx":"62.008","sz":"0.0","oid":520004740129,"timestamp":1787159515865,"triggerCondition":"N/A","isTrigger":false,"triggerPx":"0.0","children":[],"isPositionTpsl":false,"reduceOnly":false,"orderType":"Limit","origSz":"0.2","tif":"Alo","cloid":"0x01a01b02127876818a7dfe40cd8a6b79"},"status":"filled","statusTimestamp":1787159517142}}"#;
+
+        let parsed = crate::client::parse_order_status(REAL_ORDER_STATUS_PAYLOAD)
+            .expect("the real payload must parse without error")
+            .expect("status \"order\" must yield Some(OrderStatusFill)");
+        assert_eq!(
+            parsed.filled_sz,
+            dec!(0.2),
+            "origSz - sz must derive the filled size without needing avgPx"
+        );
+        assert_eq!(
+            parsed.avg_px, None,
+            "the real payload carries no avgPx key at all"
+        );
+
+        let cloid = Cloid::try_from("0x01a01b02127876818a7dfe40cd8a6b79".to_string())
+            .expect("must parse the real cloid");
+        let api = ScriptedApi::new().push_status(Ok(Some(parsed)));
+
+        let mut p = plan_passive(false);
+        p.master = Some(Address::new(MASTER));
+
+        let resting = RestingChild {
+            cloid,
+            oid: OrderId(520004740129),
+            requested_sz: dec!(0.2),
+            px: dec!(62.008),
+            slice_idx: 0,
+        };
+
+        let outcome = settle_resting_child(&api, &p, resting, None).await.expect(
+            "a filled orderStatus with no avgPx must now settle successfully, \
+                 not hard-stop with \"avgPx is missing\"",
+        );
+
+        assert_eq!(outcome.sz, dec!(0.2));
+        assert_eq!(
+            outcome.px,
+            dec!(62.008),
+            "a maker (ALO) fill with no reported avgPx must be credited at the \
+             resting order's own limit price — HL cannot fill a resting maker \
+             order at any other price"
+        );
+    }
+
     // === (c) T1: a mid-run price drop pushes a slice under the floor ===
 
     #[tokio::test(start_paused = true)]

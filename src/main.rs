@@ -3023,7 +3023,7 @@ mod tests {
             ))
             .with_status(200)
             .with_body(format!(
-                r#"{{"status":"order","order":{{"order":{{"oid":42,"coin":"HYPE","side":"B","cloid":"{prior_cloid}","origSz":"1","sz":"0","avgPx":"50"}},"status":"filled","statusTimestamp":0}}}}"#
+                r#"{{"status":"order","order":{{"order":{{"oid":42,"coin":"HYPE","side":"B","cloid":"{prior_cloid}","origSz":"1","sz":"0"}},"status":"filled","statusTimestamp":0}}}}"#
             ))
             .create_async()
             .await;
@@ -3183,7 +3183,7 @@ mod tests {
             ))
             .with_status(200)
             .with_body(format!(
-                r#"{{"status":"order","order":{{"order":{{"oid":42,"coin":"HYPE","side":"B","cloid":"{prior_cloid}","origSz":"1","sz":"0","avgPx":"50"}},"status":"filled","statusTimestamp":0}}}}"#
+                r#"{{"status":"order","order":{{"order":{{"oid":42,"coin":"HYPE","side":"B","cloid":"{prior_cloid}","origSz":"1","sz":"0"}},"status":"filled","statusTimestamp":0}}}}"#
             ))
             .create_async()
             .await;
@@ -3562,7 +3562,7 @@ mod tests {
             ))
             .with_status(200)
             .with_body(format!(
-                r#"{{"status":"order","order":{{"order":{{"oid":42,"coin":"HYPE","side":"B","cloid":"{prior_cloid}","origSz":"1","sz":"0","avgPx":"50"}},"status":"filled","statusTimestamp":0}}}}"#
+                r#"{{"status":"order","order":{{"order":{{"oid":42,"coin":"HYPE","side":"B","cloid":"{prior_cloid}","origSz":"1","sz":"0"}},"status":"filled","statusTimestamp":0}}}}"#
             ))
             .create_async()
             .await;
