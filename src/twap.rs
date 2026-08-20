@@ -48,46 +48,75 @@ pub fn min_notional_gate() -> Decimal {
 const STALE_BOOK_RETRIES: u32 = 3;
 const STALE_BOOK_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Retries when recovering a resting order's fill via `orderStatus` (§8, T3).
+/// Retries when recovering a resting order's fill via `orderStatus` in the
+/// SETTLE / RECOVERY path only (§8, T3) — i.e. as invoked from
+/// `poll_terminal_status` via `recover_resting_fill` /
+/// `settle_resting_child`. Distinct from, and does NOT affect,
+/// `reconcile_by_cloid`'s ambiguous-PLACE `UNKNOWN_OID_*` constants below —
+/// see that section's doc comment for why unknownOid means something
+/// different there (a safe-resend signal, not index lag).
 ///
 /// This is UNRELATED to the W1 unknownOid resend policy below — a resting
-/// order is known to exist (HL gave us its oid), so this loop is purely
-/// "keep asking until the status is terminal," with no safe-resend decision
-/// involved.
+/// order is known to exist (HL gave us its oid, i.e. a placement ack), so
+/// this loop is purely "keep asking until the status is terminal," with no
+/// safe-resend decision involved. An `unknownOid` (`Ok(None)`) response here
+/// is therefore never treated as "the order never existed" — the caller
+/// already holds proof it rested.
 ///
-/// Widened from the original 3 retries / fixed 500ms interval (~1s total)
-/// after a real mainnet abort: 2026-08-20 17:48Z, follow repost cycle, oid
-/// 520031185240. The cancel for that oid was ACCEPTED (no `cancel_error` in
-/// the log), but `poll_terminal_status` observed status `"open"` on all 3
-/// attempts (500ms apart, ~1s budget) and hard-stopped with "could not
-/// determine a terminal fill ... after 3 attempts (status 'open' is not
-/// terminal (filled 0 so far)); stopping rather than risk over-ordering".
-/// Post-mortem via `curl` against HL's live `orderStatus` endpoint confirmed
-/// the order HAD been canceled with 0 filled — the cancel had landed, but
-/// HL's `orderStatus` took >1.5s to transition open→canceled. Earlier
-/// settles in the same run transitioned in <0.8s, so this is propagation
-/// latency variance under load, not a stuck/hung order.
+/// Widened TWICE from the original 3 retries / fixed 500ms interval (~1s
+/// total):
 ///
-/// [`ORDER_STATUS_RETRIES`] attempts, backing off exponentially from
-/// [`ORDER_STATUS_RETRY_INTERVAL_BASE`] and capping at
-/// [`ORDER_STATUS_RETRY_INTERVAL_CAP`] between attempts (see
-/// [`order_status_retry_delay`]): 500ms, 1s, 2s, 2s, 2s, 2s, 2s between the
-/// 8 attempts — 7 sleeps totalling 11.5s worst case. This only widens the
-/// window before giving up; it does not change what counts as terminal, and
-/// exhausting the budget is still a hard stop (see `poll_terminal_status`).
-const ORDER_STATUS_RETRIES: u32 = 8;
-const ORDER_STATUS_RETRY_INTERVAL_BASE: Duration = Duration::from_millis(500);
-const ORDER_STATUS_RETRY_INTERVAL_CAP: Duration = Duration::from_secs(2);
+/// 1. First widening, after a real mainnet abort: 2026-08-20 17:48Z, follow
+///    repost cycle, oid 520031185240. The cancel for that oid was ACCEPTED
+///    (no `cancel_error` in the log), but `poll_terminal_status` observed
+///    status `"open"` on all 3 attempts (500ms apart, ~1s budget) and
+///    hard-stopped with "could not determine a terminal fill ... after 3
+///    attempts (status 'open' is not terminal (filled 0 so far)); stopping
+///    rather than risk over-ordering". Post-mortem via `curl` against HL's
+///    live `orderStatus` endpoint confirmed the order HAD been canceled with
+///    0 filled — the cancel had landed, but HL's `orderStatus` took >1.5s to
+///    transition open→canceled. This widened the budget to 8 attempts / 7
+///    sleeps (500ms,1s,2s,2s,2s,2s,2s = 11.5s worst case), capped at 2s per
+///    step.
+///
+/// 2. Second widening, after a real mainnet abort: 2026-08-20 01:48Z. An
+///    order we KNEW rested (we held its placement ack) filled at 01:48:33
+///    (statusTimestamp 1787190513213), but `orderStatus` polling in the
+///    settle/recovery path returned "HL reports unknown oid 520380295610"
+///    for ALL 8 attempts over ~11.5s (01:48:37 → 01:48:48), causing a hard
+///    abort. Querying the same oid minutes later returned status=filled
+///    normally — HL's `/info` orderStatus index can lag >15s behind the
+///    exchange for freshly-filled orders. The prior 11.5s budget was not
+///    long enough to outlast that lag even once, let alone give an operator
+///    margin. This widened the budget to give unknown-oid responses the SAME
+///    patience as non-terminal statuses (previously only "open"/etc. were
+///    retried indefinitely up to budget; `Ok(None)` was just another
+///    exhausted-budget cause with the same treatment, but the budget itself
+///    was too short for either cause).
+///
+/// [`ORDER_STATUS_RETRIES_SETTLE`] attempts, backing off exponentially from
+/// [`ORDER_STATUS_RETRY_INTERVAL_BASE_SETTLE`] and capping at
+/// [`ORDER_STATUS_RETRY_INTERVAL_CAP_SETTLE`] between attempts (see
+/// [`order_status_retry_delay_settle`]): 12 attempts -> 11 inter-attempt
+/// sleeps of 500ms, 1s, 2s, 4s, 5s, 5s, 5s, 5s, 5s, 5s, 5s (doubling from
+/// 500ms, capped at 5s) = 500 + 1000 + 2000 + 4000 + 5000*7 = 7500 + 35000 =
+/// 42500ms, i.e. ~42.5s (approximately the 45s target budget). This only
+/// widens the window before giving up; it does not change what counts as
+/// terminal, and exhausting the budget is still a hard stop (see
+/// `poll_terminal_status`).
+const ORDER_STATUS_RETRIES_SETTLE: u32 = 12;
+const ORDER_STATUS_RETRY_INTERVAL_BASE_SETTLE: Duration = Duration::from_millis(500);
+const ORDER_STATUS_RETRY_INTERVAL_CAP_SETTLE: Duration = Duration::from_secs(5);
 
-/// The delay before retry attempt `attempt + 1` (0-indexed `attempt` is the
-/// attempt that just failed): doubles from
-/// [`ORDER_STATUS_RETRY_INTERVAL_BASE`] each step, capped at
-/// [`ORDER_STATUS_RETRY_INTERVAL_CAP`]. Pure function so the backoff shape
-/// is unit-testable without any sleeping or network I/O.
-fn order_status_retry_delay(attempt: u32) -> Duration {
-    let base_ms = ORDER_STATUS_RETRY_INTERVAL_BASE.as_millis() as u64;
+/// The delay before settle-path retry attempt `attempt + 1` (0-indexed
+/// `attempt` is the attempt that just failed): doubles from
+/// [`ORDER_STATUS_RETRY_INTERVAL_BASE_SETTLE`] each step, capped at
+/// [`ORDER_STATUS_RETRY_INTERVAL_CAP_SETTLE`]. Pure function so the backoff
+/// shape is unit-testable without any sleeping or network I/O.
+fn order_status_retry_delay_settle(attempt: u32) -> Duration {
+    let base_ms = ORDER_STATUS_RETRY_INTERVAL_BASE_SETTLE.as_millis() as u64;
     let doubled_ms = base_ms.checked_shl(attempt).unwrap_or(u64::MAX);
-    Duration::from_millis(doubled_ms).min(ORDER_STATUS_RETRY_INTERVAL_CAP)
+    Duration::from_millis(doubled_ms).min(ORDER_STATUS_RETRY_INTERVAL_CAP_SETTLE)
 }
 
 /// W1 unknownOid safe-resend policy (Issue #7, PM-decided, binding).
@@ -764,7 +793,7 @@ async fn poll_terminal_status(
     oid: crate::types::OrderId,
 ) -> Result<OrderStatusFill, HlError> {
     let mut last_err: Option<String> = None;
-    for attempt in 0..ORDER_STATUS_RETRIES {
+    for attempt in 0..ORDER_STATUS_RETRIES_SETTLE {
         match client.fetch_order_status(user, oid).await {
             Ok(Some(st)) if st.is_terminal() => {
                 st.cross_check(plan.symbol.as_str(), &plan.side, None)?;
@@ -790,16 +819,37 @@ async fn poll_terminal_status(
                     "orderStatus not yet terminal; the order can still fill — retrying"
                 );
             }
-            Ok(None) => last_err = Some(format!("HL reports unknown oid {oid}")),
+            Ok(None) => {
+                last_err = Some(format!("HL reports unknown oid {oid}"));
+                // 2026-08-20 incident: an order we KNOW rested (we hold its
+                // placement ack) filled at 01:48:33 (statusTimestamp
+                // 1787190513213), but orderStatus returned unknown-oid for
+                // ALL 8 attempts over ~11.5s (01:48:37 -> 01:48:48) before
+                // this fix. Querying the same oid minutes later returned
+                // status=filled normally. This is HL's `/info` orderStatus
+                // read-index lagging the exchange by >15s for freshly-filled
+                // orders — NOT proof the order never existed, since the
+                // caller already has a placement ack. Logged distinctly so
+                // operators can tell this apart from a genuinely
+                // nonexistent/unknown order in logs.
+                tracing::warn!(
+                    oid = %oid,
+                    attempt = attempt + 1,
+                    "orderStatus reports unknown oid in the settle/recovery path; this order is \
+                     known to have rested (placement ack held) so this is most likely HL's \
+                     info-index lagging the exchange, not a nonexistent order — retrying"
+                );
+            }
             Err(e) => last_err = Some(e.to_string()),
         }
-        if attempt + 1 < ORDER_STATUS_RETRIES {
-            tokio::time::sleep(order_status_retry_delay(attempt)).await;
+        if attempt + 1 < ORDER_STATUS_RETRIES_SETTLE {
+            tokio::time::sleep(order_status_retry_delay_settle(attempt)).await;
         }
     }
     Err(HlError::InvalidResponse(format!(
-        "could not determine a terminal fill for oid {oid} after {ORDER_STATUS_RETRIES} attempts \
-         (~11.5s budget) ({}); stopping rather than risk over-ordering",
+        "could not determine a terminal fill for oid {oid} after {ORDER_STATUS_RETRIES_SETTLE} \
+         attempts (~42.5s budget) due to a persistently non-terminal status and/or persistent \
+         unknown-oid (HL info-index lag) responses ({}); stopping rather than risk over-ordering",
         last_err.unwrap_or_else(|| "no detail".into())
     )))
 }
@@ -2759,24 +2809,30 @@ mod tests {
     // === orderStatus retry backoff (pure function, no I/O) ===
 
     #[test]
-    fn order_status_retry_delay_doubles_then_caps_at_2s() {
-        assert_eq!(order_status_retry_delay(0), Duration::from_millis(500));
-        assert_eq!(order_status_retry_delay(1), Duration::from_secs(1));
-        assert_eq!(order_status_retry_delay(2), Duration::from_secs(2));
+    fn order_status_retry_delay_settle_doubles_then_caps_at_5s() {
+        assert_eq!(
+            order_status_retry_delay_settle(0),
+            Duration::from_millis(500)
+        );
+        assert_eq!(order_status_retry_delay_settle(1), Duration::from_secs(1));
+        assert_eq!(order_status_retry_delay_settle(2), Duration::from_secs(2));
+        assert_eq!(order_status_retry_delay_settle(3), Duration::from_secs(4));
+        assert_eq!(order_status_retry_delay_settle(4), Duration::from_secs(5));
         // Stays capped for every later attempt, including ones large enough
         // to overflow a naive `500ms << attempt` shift.
-        assert_eq!(order_status_retry_delay(3), Duration::from_secs(2));
-        assert_eq!(order_status_retry_delay(6), Duration::from_secs(2));
-        assert_eq!(order_status_retry_delay(31), Duration::from_secs(2));
+        assert_eq!(order_status_retry_delay_settle(5), Duration::from_secs(5));
+        assert_eq!(order_status_retry_delay_settle(10), Duration::from_secs(5));
+        assert_eq!(order_status_retry_delay_settle(31), Duration::from_secs(5));
     }
 
     #[test]
-    fn order_status_retry_budget_totals_eleven_point_five_seconds() {
-        // 8 attempts -> 7 inter-attempt sleeps: 500ms,1s,2s,2s,2s,2s,2s.
-        let total: Duration = (0..ORDER_STATUS_RETRIES - 1)
-            .map(order_status_retry_delay)
+    fn order_status_retry_budget_settle_totals_forty_two_point_five_seconds() {
+        // 12 attempts -> 11 inter-attempt sleeps:
+        // 500ms,1s,2s,4s,5s,5s,5s,5s,5s,5s,5s = 42.5s (~45s target budget).
+        let total: Duration = (0..ORDER_STATUS_RETRIES_SETTLE - 1)
+            .map(order_status_retry_delay_settle)
             .sum();
-        assert_eq!(total, Duration::from_millis(11_500));
+        assert_eq!(total, Duration::from_millis(42_500));
     }
 
     // === pre-flight sizing ===
@@ -4114,7 +4170,7 @@ mod loop_tests {
         let mut api = ScriptedApi::new()
             .with_default_book(book_at(dec!(49.9), dec!(50.1)))
             .push_place(Ok(PlaceOutcome::Resting { oid: OrderId(77) }));
-        for _ in 0..ORDER_STATUS_RETRIES {
+        for _ in 0..ORDER_STATUS_RETRIES_SETTLE {
             api = api.push_status(Ok(Some(status(dec!(2), None, "open"))));
         }
 
@@ -4124,6 +4180,69 @@ mod loop_tests {
         assert!(reason.contains("terminal"), "{reason}");
         assert_eq!(report.exit_code(), 1);
         // Nothing was credited from the non-terminal snapshot.
+        assert_eq!(report.filled, Decimal::ZERO);
+        assert_eq!(api.place_count(), 1, "must not place further slices");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn b_settle_unknown_oid_lag_then_terminal_settles_once_with_no_double_credit() {
+        // 2026-08-20 incident regression: HL's orderStatus index can return
+        // unknown-oid for a resting order we already hold a placement ack
+        // for, purely due to read-index lag — not because the order never
+        // existed. The settle path must tolerate a run of unknown-oid
+        // responses and still settle correctly (exactly once) once a
+        // terminal status finally appears, rather than hard-stopping on the
+        // first (or Nth) unknown-oid observation.
+        let mut api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(Ok(PlaceOutcome::Resting { oid: OrderId(77) }));
+        // Unknown-oid (index lag) for most of the budget...
+        for _ in 0..(ORDER_STATUS_RETRIES_SETTLE - 1) {
+            api = api.push_status(Ok(None));
+        }
+        // ...then a terminal fill arrives just before the budget is exhausted.
+        api = api.push_status(Ok(Some(status(dec!(5), Some(dec!(49.5)), "filled"))));
+
+        let mut p = plan(false);
+        p.slices = 1;
+        p.per_slice = dec!(5);
+        p.total_adjusted = dec!(5);
+        p.total_requested = dec!(5);
+
+        let report = run_twap(&api, &p).await;
+
+        assert_eq!(report.abort_reason, None, "must settle, not hard-stop");
+        assert_eq!(report.exit_code(), 0);
+        // Credited exactly once, at the terminal fill — no double-credit
+        // from the earlier unknown-oid observations (which credit nothing).
+        assert_eq!(report.filled, dec!(5));
+        assert_eq!(report.avg_px, Some(dec!(49.5)));
+        assert_eq!(api.place_count(), 1, "must not resend / double-place");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn b_settle_unknown_oid_for_entire_budget_still_hard_stops() {
+        // If the index lag NEVER resolves within the settle-path budget, the
+        // fix must still be a hard abort (never guess/credit zero) — the
+        // widened patience only widens the window, it does not change the
+        // fail-closed outcome when the window is genuinely exhausted. The
+        // abort message must mention unknown-oid so an operator can tell
+        // this apart from a persistently-open/non-terminal status.
+        let mut api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(Ok(PlaceOutcome::Resting { oid: OrderId(77) }));
+        for _ in 0..ORDER_STATUS_RETRIES_SETTLE {
+            api = api.push_status(Ok(None));
+        }
+
+        let report = run_twap(&api, &plan(false)).await;
+
+        let reason = report.abort_reason.clone().expect("must hard-stop");
+        assert!(
+            reason.contains("unknown"),
+            "abort reason should mention unknown-oid: {reason}"
+        );
+        assert_eq!(report.exit_code(), 1);
         assert_eq!(report.filled, Decimal::ZERO);
         assert_eq!(api.place_count(), 1, "must not place further slices");
     }
@@ -4790,7 +4909,7 @@ mod loop_tests {
         let mut api = ScriptedApi::new()
             .with_default_book(book_at(dec!(49.9), dec!(50.1)))
             .push_place(Ok(PlaceOutcome::Resting { oid: OrderId(77) }));
-        for _ in 0..ORDER_STATUS_RETRIES {
+        for _ in 0..ORDER_STATUS_RETRIES_SETTLE {
             api = api.push_status(malformed());
         }
 
@@ -4816,7 +4935,7 @@ mod loop_tests {
         let mut api = ScriptedApi::new()
             .with_default_book(book_at(dec!(49.9), dec!(50.1)))
             .push_place(Ok(PlaceOutcome::Resting { oid: OrderId(77) }));
-        for _ in 0..ORDER_STATUS_RETRIES {
+        for _ in 0..ORDER_STATUS_RETRIES_SETTLE {
             api = api.push_status(Ok(Some(status(
                 dec!(3),
                 Some(dec!(49.5)),
@@ -7472,9 +7591,9 @@ mod loop_tests {
         /// `run_twap_journaled`: the ALO rests, then final cleanup's
         /// `settle_resting_child` -> `recover_resting_fill` ->
         /// `poll_terminal_status` sees `"open"` on every one of the widened
-        /// [`ORDER_STATUS_RETRIES`] attempts and hard-stops — exactly the
-        /// real production shape Issue #20 reports (a settle failure that
-        /// aborts the run before the resting cloid's Terminal record is
+        /// [`ORDER_STATUS_RETRIES_SETTLE`] attempts and hard-stops — exactly
+        /// the real production shape Issue #20 reports (a settle failure
+        /// that aborts the run before the resting cloid's Terminal record is
         /// ever written).
         #[tokio::test(start_paused = true)]
         async fn settle_failure_abort_populates_outcome_unknown_cloids_with_the_dangling_cloid() {
@@ -7494,9 +7613,9 @@ mod loop_tests {
                 .push_place(Ok(PlaceOutcome::Resting { oid: OrderId(900) }))
                 .push_cancel(Ok(()));
             // Final cleanup's poll_terminal_status: "open" on every attempt,
-            // exhausting the (now 8-attempt) retry budget without ever
-            // seeing a terminal status.
-            for _ in 0..ORDER_STATUS_RETRIES {
+            // exhausting the (now 12-attempt / ~42.5s) settle-path retry
+            // budget without ever seeing a terminal status.
+            for _ in 0..ORDER_STATUS_RETRIES_SETTLE {
                 api = api.push_status(Ok(Some(status_full(
                     dec!(0),
                     None,
