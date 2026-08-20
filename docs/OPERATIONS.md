@@ -417,6 +417,119 @@ graceful shutdown を経由しないプロセス消滅 (電源断、OOM kill、`
 6. Hyperliquid 上の実際の約定・建玉と、ジャーナル上の `filled_sz` の合計が
    一致することを確認する (パターン A の手順5と同じ最終確認)。
 
+## デルタニュートラル2脚運用
+
+`hype-twap` は「1プロセス=1銘柄」の設計を維持しますが、**脚ごとに専用の
+agent (API) ウォレットを分けた複数プロセスの並行実行**はサポート対象の
+運用パターンです。例えば ETH ロング × BTC ショートのような
+デルタニュートラルペアを、2つの `hype-twap` プロセスで同時駆動できます。
+`scripts/dn-pair.sh` はこのパターンをコード化したランチャーで、
+`scripts/dn-watchdog.sh` と組み合わせて使います。
+
+### 前提: agent ウォレットは脚ごとに専用のものを用意する
+
+nonce の状態管理と単一 writer ロック (前節参照) は
+**`network + agent アドレス`** をキーに行われます。2脚を同じ agent
+ウォレットで動かすと、2つ目のプロセスが flock 競合により起動時点で
+拒否されます (最悪の場合、1脚だけが片肺で走り続ける状態を招きます)。
+
+- HL の agent ウォレット上限は **unnamed 1本 + named 3本** (マスター
+  アカウントあたり)。2脚のデルタニュートラルであれば named を2本
+  登録すれば足ります。
+- 各脚の秘密鍵は `HL_AGENT_PK_LEG1` / `HL_AGENT_PK_LEG2` として
+  `dn-pair.sh` に渡します (本ツール自体が読む環境変数は従来通り
+  `HL_AGENT_PK` 1本のみで、`dn-pair.sh` が脚ごとに子プロセスへ
+  `HL_AGENT_PK` として再エクスポートします)。2つの値が同一文字列の場合
+  `dn-pair.sh` は起動前に abort します。
+
+### live 実行前の極小 notional プローブを必須とする
+
+本番の notional で立ち上げる前に、`--leg1-usd` / `--leg2-usd` を
+最小 notional (例: $15〜$20 程度、per-slice が $10 の最小名目額を
+上回る額) に絞った**プローブ運用**を必ず行ってください。過去に
+このプローブ運用中に実バグ (nonce/flock 競合、パス解決の変数スコープ
+事故など) を捕捉した実績があり、フルサイズで初めて気づくのは
+手遅れです。
+
+### `dn-pair.sh` の使用例
+
+```bash
+export HL_AGENT_PK_LEG1=$(pass show hyperliquid/agent-pk-eth)
+export HL_AGENT_PK_LEG2=$(pass show hyperliquid/agent-pk-btc)
+
+scripts/dn-pair.sh \
+  --leg1-symbol ETH --leg1-side long  --leg1-usd 1000 \
+  --leg2-symbol BTC --leg2-side short --leg2-usd 1000 \
+  --duration 30m --slices 10 \
+  --child-algo follow \
+  --read-only false
+```
+
+主なオプション (すべて `--leg1-*`/`--leg2-*` は必須、他は任意):
+
+- `--child-algo` (既定値 `follow`)
+- `--max-notional-usd` (既定値: 各脚の `--usd` の1.2倍を自動計算。
+  下記「`--max-notional-usd` は総額判定」を参照)
+- `--log-dir` (既定値 `~/.local/state/hype-twap/logs`)
+- `--read-only` (既定値 `false`。`true` ならリハーサルモードで鍵不要)
+
+各脚は `setsid`+`nohup` で detach 起動され、ログは
+`<log-dir>/dn-<symbol>-<side>.log`、PID は
+`<log-dir>/dn-<symbol>-<side>.pid` に記録されます。起動後10秒で両PIDの
+生存確認を行い、片方が死んでいればもう片方に SIGTERM を送ってから
+異常終了します (裸ポジション防止)。両脚が健在なら
+`scripts/dn-watchdog.sh` を続けて起動します。
+
+### watchdog の意味論 (PID ベース監視)
+
+`dn-watchdog.sh` は **PID ベースで監視**します
+(`pgrep -cx` のようなプロセス名カウントは同一ホスト上の無関係な
+`hype-twap` プロセスと干渉するため使用していません)。
+
+- 5秒ごとに `kill -0` で両 PID の生存を確認します。可能であれば
+  `/proc/<pid>/comm` が `hype-twap` であることも確認し、PID 再利用
+  による誤爆を防ぎます。
+- **片方だけが生存している状態が `--grace` 秒 (既定90秒) 継続したら**、
+  生存している方に SIGTERM を送ります。`hype-twap` は SIGTERM で
+  resting 注文の cancel/settle まで行う graceful shutdown を実装済み
+  なので、裸ポジションのまま放置されることを防ぎます。
+- SIGTERM 送信後、最大180秒待って生存していれば exit 1 で終了します。
+
+### 停止後の状態: ポジションは残る
+
+プロセスを停止 (自然終了・SIGTERM いずれも) してもポジションそのものは
+残ります。フラット化する場合は以下の手順を踏んでください。
+
+1. `/info clearinghouseState` で各脚の建玉数量を確認する。
+2. 逆サイドの TWAP (本ツールを `--side` を逆にして再実行する、または
+   手動成行) で解消する。
+
+本ツールは `reduce_only` を使わない設計です。フラット化の数量は
+**手動で厳密に建玉数量へ合わせる必要があります**(意図せず追加の
+ポジションを積んでしまうリスクに注意)。
+
+### `--max-notional-usd` は総額判定であることへの注意
+
+`--usd` を指定した場合、`hype-twap` の `--max-notional-usd` は
+**per-slice ではなく総額 (執行全体の目標 notional) に対する判定**です。
+そのため `--max-notional-usd` には `--usd` そのものより大きい値を
+設定する必要があります。`dn-pair.sh` は明示指定がなければ各脚の
+`--usd` の1.2倍を自動計算しますが、意図と異なる場合は
+`--max-notional-usd` を明示的に指定してください。
+
+### 停止方法
+
+`dn-pair.sh` 実行後に表示される (またはログディレクトリの `.pid`
+ファイルに記録された) PID へ `kill -TERM` してください。
+
+```bash
+kill -TERM <leg1-pid> <leg2-pid>
+```
+
+`pkill -x hype-twap` のような**プロセス名ベースの一括停止は非推奨**
+です。同一ホスト上で動いている無関係な `hype-twap` プロセス
+(別の運用・別のペア) まで巻き込んで停止させてしまいます。
+
 ## トラブルシューティング
 
 ### `unknown symbol '...' — not in the HL perp universe`
