@@ -94,19 +94,42 @@ const STALE_BOOK_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 ///    exhausted-budget cause with the same treatment, but the budget itself
 ///    was too short for either cause).
 ///
+/// 3. Third widening, after a real mainnet abort: 2026-08-20 tonight
+///    (following the 12-attempt/~42.5s budget from widening #2 above). oid
+///    520763989117: the cancel was ACCEPTED at 11:40:20Z, but
+///    `poll_terminal_status` observed `unknownOid` for the FULL 12-attempt
+///    budget through 11:41:03Z (~43s observed) and hard-stopped at slice
+///    301. The same oid resolved cleanly (canceled, 0 filled) when queried
+///    again roughly 2 minutes after the cancel — i.e. HL's info-index lag
+///    tail can run into the *minutes*, not just tens of seconds, so the
+///    ~42.5s budget from widening #2 was itself still too short. This
+///    widens the budget again, to 25 attempts / 300.5s worst case (~5
+///    minutes) — see the schedule below.
+///
+///    This wait is safe by construction, unlike widening budgets on the
+///    PLACE-side ambiguous-order path: by the time `poll_terminal_status`
+///    runs here, the cancel for this order has already been sent, so the
+///    order is necessarily either off the book or resting at our own,
+///    already-intended quote — there is no scenario in which waiting longer
+///    causes an extra/duplicate order to exist. Only this one settle call
+///    blocks while waiting; `ExecutionDeadline` (§ below) still gates any
+///    *new* sends elsewhere in the run, and exhausting this budget remains
+///    exactly the same hard abort as before — "stopping rather than risk
+///    over-ordering" — just with a longer window before that abort fires.
+///
 /// [`ORDER_STATUS_RETRIES_SETTLE`] attempts, backing off exponentially from
 /// [`ORDER_STATUS_RETRY_INTERVAL_BASE_SETTLE`] and capping at
 /// [`ORDER_STATUS_RETRY_INTERVAL_CAP_SETTLE`] between attempts (see
-/// [`order_status_retry_delay_settle`]): 12 attempts -> 11 inter-attempt
-/// sleeps of 500ms, 1s, 2s, 4s, 5s, 5s, 5s, 5s, 5s, 5s, 5s (doubling from
-/// 500ms, capped at 5s) = 500 + 1000 + 2000 + 4000 + 5000*7 = 7500 + 35000 =
-/// 42500ms, i.e. ~42.5s (approximately the 45s target budget). This only
-/// widens the window before giving up; it does not change what counts as
-/// terminal, and exhausting the budget is still a hard stop (see
-/// `poll_terminal_status`).
-const ORDER_STATUS_RETRIES_SETTLE: u32 = 12;
+/// [`order_status_retry_delay_settle`]): 25 attempts -> 24 inter-attempt
+/// sleeps of 500ms, 1s, 2s, 4s, 8s (doubling from 500ms until the next
+/// doubling would exceed the 15s cap), then 15s for each of the remaining 19
+/// sleeps (capped at 15s) = (500 + 1000 + 2000 + 4000 + 8000) + 15000*19 =
+/// 15500 + 285000 = 300500ms, i.e. 300.5s (~5 minutes). This only widens the
+/// window before giving up; it does not change what counts as terminal, and
+/// exhausting the budget is still a hard stop (see `poll_terminal_status`).
+const ORDER_STATUS_RETRIES_SETTLE: u32 = 25;
 const ORDER_STATUS_RETRY_INTERVAL_BASE_SETTLE: Duration = Duration::from_millis(500);
-const ORDER_STATUS_RETRY_INTERVAL_CAP_SETTLE: Duration = Duration::from_secs(5);
+const ORDER_STATUS_RETRY_INTERVAL_CAP_SETTLE: Duration = Duration::from_secs(15);
 
 /// The delay before settle-path retry attempt `attempt + 1` (0-indexed
 /// `attempt` is the attempt that just failed): doubles from
@@ -848,7 +871,7 @@ async fn poll_terminal_status(
     }
     Err(HlError::InvalidResponse(format!(
         "could not determine a terminal fill for oid {oid} after {ORDER_STATUS_RETRIES_SETTLE} \
-         attempts (~42.5s budget) due to a persistently non-terminal status and/or persistent \
+         attempts (~300.5s budget) due to a persistently non-terminal status and/or persistent \
          unknown-oid (HL info-index lag) responses ({}); stopping rather than risk over-ordering",
         last_err.unwrap_or_else(|| "no detail".into())
     )))
@@ -2809,7 +2832,7 @@ mod tests {
     // === orderStatus retry backoff (pure function, no I/O) ===
 
     #[test]
-    fn order_status_retry_delay_settle_doubles_then_caps_at_5s() {
+    fn order_status_retry_delay_settle_doubles_then_caps_at_15s() {
         assert_eq!(
             order_status_retry_delay_settle(0),
             Duration::from_millis(500)
@@ -2817,22 +2840,24 @@ mod tests {
         assert_eq!(order_status_retry_delay_settle(1), Duration::from_secs(1));
         assert_eq!(order_status_retry_delay_settle(2), Duration::from_secs(2));
         assert_eq!(order_status_retry_delay_settle(3), Duration::from_secs(4));
-        assert_eq!(order_status_retry_delay_settle(4), Duration::from_secs(5));
+        assert_eq!(order_status_retry_delay_settle(4), Duration::from_secs(8));
+        // Attempt 5 would double to 16s, which exceeds the 15s cap.
+        assert_eq!(order_status_retry_delay_settle(5), Duration::from_secs(15));
         // Stays capped for every later attempt, including ones large enough
         // to overflow a naive `500ms << attempt` shift.
-        assert_eq!(order_status_retry_delay_settle(5), Duration::from_secs(5));
-        assert_eq!(order_status_retry_delay_settle(10), Duration::from_secs(5));
-        assert_eq!(order_status_retry_delay_settle(31), Duration::from_secs(5));
+        assert_eq!(order_status_retry_delay_settle(10), Duration::from_secs(15));
+        assert_eq!(order_status_retry_delay_settle(31), Duration::from_secs(15));
     }
 
     #[test]
-    fn order_status_retry_budget_settle_totals_forty_two_point_five_seconds() {
-        // 12 attempts -> 11 inter-attempt sleeps:
-        // 500ms,1s,2s,4s,5s,5s,5s,5s,5s,5s,5s = 42.5s (~45s target budget).
+    fn order_status_retry_budget_settle_totals_three_hundred_point_five_seconds() {
+        // 25 attempts -> 24 inter-attempt sleeps:
+        // 500ms,1s,2s,4s,8s (doubling from 500ms) then 15s*19 (capped) =
+        // 15.5s + 285s = 300.5s (~5 minute target budget).
         let total: Duration = (0..ORDER_STATUS_RETRIES_SETTLE - 1)
             .map(order_status_retry_delay_settle)
             .sum();
-        assert_eq!(total, Duration::from_millis(42_500));
+        assert_eq!(total, Duration::from_millis(300_500));
     }
 
     // === pre-flight sizing ===
@@ -7613,7 +7638,7 @@ mod loop_tests {
                 .push_place(Ok(PlaceOutcome::Resting { oid: OrderId(900) }))
                 .push_cancel(Ok(()));
             // Final cleanup's poll_terminal_status: "open" on every attempt,
-            // exhausting the (now 12-attempt / ~42.5s) settle-path retry
+            // exhausting the (now 25-attempt / ~300.5s) settle-path retry
             // budget without ever seeing a terminal status.
             for _ in 0..ORDER_STATUS_RETRIES_SETTLE {
                 api = api.push_status(Ok(Some(status_full(
