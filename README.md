@@ -442,6 +442,18 @@ the shortfall; a normal run reaches its last slice inside the window anyway.
   just falls back to the generic "exchange rejected" wording.
 - **One symbol per process.** No portfolio logic, no existing-position
   awareness (`reduce_only` is never set), no HIP-3 `dex:SYMBOL` prefixes.
+  This principle is unchanged, but running **multiple processes in
+  parallel, each with its own dedicated agent (API) wallet**, is a
+  supported operational pattern — e.g. a delta-neutral pair (long one
+  symbol, short another) driven by two `hype-twap` processes. Nonce state
+  and the single-writer advisory lock (see below) are keyed by
+  `network + agent address`, so each leg MUST use a separate agent wallet;
+  sharing one agent wallet across two concurrent processes causes the
+  second process to be refused at startup. `scripts/dn-pair.sh` launches
+  and supervises such a pair; see "Delta-Neutral Two-Leg Operation" in
+  docs/OPERATIONS.md for the runbook. Single-process multi-leg execution
+  (one process trading several symbols internally) remains out of scope —
+  see the Roadmap section below.
 - **Taker by default; passive/follow are opt-in.** `--child-algo market`
   (the default) crosses the spread and pays taker fees on every slice.
   `--child-algo passive` posts at the touch instead and holds for the full
@@ -469,7 +481,11 @@ by polling the book within a slice and re-quoting the resting order to keep
 following the touch (see "Child-order algorithms" above). A time-boxed
 taker-sweep fallback remains open follow-up work, not yet implemented.
 
-Also out of scope for now: WebSocket fills, multi-symbol execution, and
+Also out of scope for now: WebSocket fills, single-process multi-symbol
+execution (one process trading several symbols internally — a single
+process still trades exactly one symbol; running several *processes* in
+parallel, one per symbol/leg with dedicated agent wallets, is supported —
+see "One symbol per process" above and `scripts/dn-pair.sh`), and
 existing-position awareness. (Run resume/persistence — previously listed
 here — shipped: see "Known limitations" above and docs/OPERATIONS.md.)
 
