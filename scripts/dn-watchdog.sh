@@ -10,7 +10,7 @@
 #
 # bash / GNU Linux only.
 #
-# Usage: dn-watchdog.sh <pid1> <pid2> [--grace SECS] [--log FILE]
+# Usage: dn-watchdog.sh <pid1> <pid2> [--grace SECS] [--log FILE] [--comm NAME]
 #
 # Exit codes:
 #   0  both PIDs exited on their own (or after SIGTERM cleanup below)
@@ -29,14 +29,20 @@ shift 2
 
 grace=90
 log_file=""
+expected_comm="hype-twap"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --grace) grace="$2"; shift 2 ;;
     --log) log_file="$2"; shift 2 ;;
+    --comm) expected_comm="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+# /proc/<pid>/comm is truncated to 15 characters by the kernel; truncate the
+# expected name the same way so a long binary name still matches.
+expected_comm="${expected_comm:0:15}"
 
 log() {
   local msg="[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*"
@@ -48,7 +54,8 @@ log() {
 }
 
 # Returns 0 (alive) if kill -0 succeeds AND, when /proc/<pid>/comm is
-# readable, it names hype-twap (guards against PID reuse). If /proc/<pid>/comm
+# readable, it names the expected binary (guards against PID reuse; the
+# expected name comes from --comm, default hype-twap). If /proc/<pid>/comm
 # cannot be read but kill -0 succeeds, the process is still treated as alive
 # (best-effort check only, not required to be conclusive).
 is_alive() {
@@ -60,7 +67,7 @@ is_alive() {
   if [[ -r "${comm_file}" ]]; then
     local comm
     comm="$(cat -- "${comm_file}" 2>/dev/null || true)"
-    if [[ -n "${comm}" && "${comm}" != "hype-twap" ]]; then
+    if [[ -n "${comm}" && "${comm}" != "${expected_comm}" ]]; then
       return 1
     fi
   fi

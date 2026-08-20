@@ -490,7 +490,10 @@ scripts/dn-pair.sh \
   `/proc/<pid>/comm` が `hype-twap` であることも確認し、PID 再利用
   による誤爆を防ぎます。
 - **片方だけが生存している状態が `--grace` 秒 (既定90秒) 継続したら**、
-  生存している方に SIGTERM を送ります。`hype-twap` は SIGTERM で
+  生存している方に SIGTERM を送ります。grace は自然完走時の両脚の
+  終了タイミングのズレを吸収するためのもので、その間は生存側が発注を
+  続けます (乖離の拡大は高々数スライス分の notional)。異常死への反応を
+  速めたい場合は `--grace` を短くしてください。`hype-twap` は SIGTERM で
   resting 注文の cancel/settle まで行う graceful shutdown を実装済み
   なので、裸ポジションのまま放置されることを防ぎます。
 - SIGTERM 送信後、最大180秒待って生存していれば exit 1 で終了します。
@@ -529,6 +532,10 @@ kill -TERM <leg1-pid> <leg2-pid>
 `pkill -x hype-twap` のような**プロセス名ベースの一括停止は非推奨**
 です。同一ホスト上で動いている無関係な `hype-twap` プロセス
 (別の運用・別のペア) まで巻き込んで停止させてしまいます。
+
+watchdog 自体は両脚の消滅を検知して自動終了するため通常は放置で
+構いませんが、明示的に止めたい場合は `<log-dir>/dn-watchdog.pid` の
+PID へ `kill` してください。
 
 ## トラブルシューティング
 

@@ -109,6 +109,17 @@ if [[ "${read_only}" != "true" && "${read_only}" != "false" ]]; then
   exit 2
 fi
 
+for usd_var in leg1_usd leg2_usd; do
+  if ! [[ "${!usd_var}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "--${usd_var//_/-} must be a positive number (got: ${!usd_var})" >&2
+    exit 2
+  fi
+done
+
+if [[ "${leg1_side}" == "${leg2_side}" ]]; then
+  echo "WARNING: both legs have side '${leg1_side}' — this is NOT delta-neutral." >&2
+fi
+
 # ---------------------------------------------------------------------------
 # Resolve binary (absolute path resolved up front, see comment above)
 # ---------------------------------------------------------------------------
@@ -138,7 +149,11 @@ if [[ "${read_only}" == "false" ]]; then
     echo "live mode (--read-only false) requires HL_AGENT_PK_LEG1 and HL_AGENT_PK_LEG2 to be set" >&2
     exit 1
   fi
-  if [[ "${HL_AGENT_PK_LEG1}" == "${HL_AGENT_PK_LEG2}" ]]; then
+  # Normalized comparison (strip 0x, lowercase) so the same key stored with
+  # differing prefix/case is still caught.
+  _norm1="${HL_AGENT_PK_LEG1#0x}"; _norm1="${_norm1,,}"
+  _norm2="${HL_AGENT_PK_LEG2#0x}"; _norm2="${_norm2,,}"
+  if [[ "${_norm1}" == "${_norm2}" ]]; then
     echo "ABORT: HL_AGENT_PK_LEG1 and HL_AGENT_PK_LEG2 are identical." >&2
     echo "Each leg MUST use a separate agent (API) wallet: nonce state and" >&2
     echo "hype-twap's single-writer advisory lock are keyed by (network, agent" >&2
@@ -192,7 +207,7 @@ launch_leg() {
       --child-algo "${child_algo}" \
       --max-notional-usd "${max_notional}" \
       --read-only "${read_only}" \
-      >"${logfile}" 2>&1 &
+      >>"${logfile}" 2>&1 &
     echo $! >"${pidfile}"
   )
   # The subshell backgrounds the setsid/nohup'd process and writes its PID
@@ -246,6 +261,7 @@ watchdog_pidfile="${log_dir}/dn-watchdog.pid"
 (
   setsid nohup "${WATCHDOG_SCRIPT}" "${leg1_pid}" "${leg2_pid}" \
     --log "${watchdog_log}" \
+    --comm "$(basename -- "${bin_path}")" \
     >"${watchdog_log}.launch" 2>&1 &
   echo $! >"${watchdog_pidfile}"
 )
