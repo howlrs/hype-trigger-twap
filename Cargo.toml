@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.91"
 license = "Apache-2.0"
-authors = ["howlrs <terashima@howlrs.net>"]
-description = "Trigger-gated TWAP execution for Hyperliquid perps (single binary)"
+authors = ["howlrs"]
+description = "Trigger-gated TWAP execution and run inspection for Hyperliquid perps"
 
 [lib]
 name = "hype_trigger_twap"
@@ -15,6 +15,10 @@ path = "src/lib.rs"
 name = "hype-twap"
 path = "src/main.rs"
 
+[[bin]]
+name = "hype-twap-runs"
+path = "src/bin/hype-twap-runs.rs"
+
 [dependencies]
 tokio = { version = "1.52", features = ["full"] }
 reqwest = { version = "0.13", features = [
@@ -23,7 +27,10 @@ reqwest = { version = "0.13", features = [
     "webpki-roots",
 ], default-features = false }
 clap = { version = "4", features = ["derive", "env"] }
-alloy = { version = "2.0.4", default-features = false, features = [
+# Keep the declared Rust 1.91 MSRV real. Alloy 2.3 raised its MSRV to
+# Rust 1.94; an exact pin prevents a routine lockfile refresh from silently
+# making the documented/CI MSRV impossible to build.
+alloy = { version = "=2.0.4", default-features = false, features = [
     "signer-local",
     "sol-types",
     "signers",

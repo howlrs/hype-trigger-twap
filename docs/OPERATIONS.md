@@ -90,28 +90,33 @@ hype-twap --symbol HYPE --side long --usd 1500 --duration 30m --slices 10
 - `rounding dropped` の警告が出ている場合、その残余が許容できる大きさか
 - 各スライスの想定価格が現在の板と整合しているか
 
-### ステップ 2: 少額で本番実行
+### ステップ 2: funded testnet で Issue #16 を完了する
 
-**初回は必ず少額から始めてください。** testnet での実発注検証は未実施であり、
-Agent 署名注文に対する `orderStatus` の実挙動が唯一の未検証点です。
+**mainnet live はまだ許可されていません。** 2026-09-04 に testnet の read-only
+`meta` / unknown-oid `orderStatus` conformance は通過しましたが、funded account を
+使う market/passive の実発注、ALO 拒否文言、cancel の `expiresAfter: null` は未検証です。
+まず funded testnet account で、ごく少額の market smoke を実施します。
 
 ```bash
 export HL_AGENT_PK=$(pass show hyperliquid/agent-pk)
 hype-twap --symbol HYPE --side long --usd 50 --duration 5m --slices 2 \
-  --max-notional-usd 60 --read-only false
+  --network testnet --max-notional-usd 60 --read-only false
 ```
 
-失敗する場合も「安全側に停止する」設計ですが、実際の資金で挙動を確認してから
-本来の金額に移行してください。
+続いて Issue #16 の checklist に従い、passive の境界 cancel → settle → requote、
+終了時 resting cancel、ALO 拒否文言、cancel の `expiresAfter: null` を同じ testnet
+account で確認し、結果をこの文書へ記録してください。失敗する場合は mainnet へ
+進まず、API との乖離を修正します。
 
-### ステップ 3: 本来の金額で実行
+### ステップ 3: mainnet 移行判定
 
-少額実行で問題がなければ、目的の条件で実行します。
+Issue #16 の **全 checklist が実 API で完了し、その結果が文書化されるまで、
+mainnet で `--read-only false` を実行しないでください。** 現在はこの gate が未完了のため、
+mainnet live 用の実行コマンドは掲載しません。read-only で計画確認を続けるか、
+明示的な `--network testnet` でのみ検証してください。
 
 ```bash
-hype-twap --symbol HYPE --side long --usd 1500 --duration 30m \
-  --trigger-price 40 --trigger-when above --start-after 2h \
-  --max-notional-usd 2000 --read-only false
+hype-twap --symbol HYPE --side long --usd 1500 --duration 30m --network testnet
 ```
 
 ## 実行中の監視
@@ -124,7 +129,7 @@ hype-twap --symbol HYPE --side long --usd 1500 --duration 30m \
 長時間の実行ではログをファイルに残しておくと、中断時の突き合わせが楽になります。
 
 ```bash
-hype-twap ... --read-only false 2>&1 | tee twap-$(date +%Y%m%d-%H%M%S).log
+hype-twap ... --network testnet --read-only false 2>&1 | tee twap-$(date +%Y%m%d-%H%M%S).log
 ```
 
 ### 中断したい場合
@@ -145,6 +150,8 @@ hype-twap ... --read-only false 2>&1 | tee twap-$(date +%Y%m%d-%H%M%S).log
 3. 最終レポートをジャーナルに永続化してから終了する。
 
 この一連の処理は `--shutdown-grace` (既定 60 秒) 以内に完了させます。
+position-aware / zero-crossing 実行では、close 後の exact-zero 確認、open phase、
+最終建玉確認、`FinalReport` 永続化まで同じ単一の猶予時間に含まれます。
 超過した場合は、未解決の注文を `outcome_unknown` としてジャーナルに記録した上で、
 **非ゼロ終了コード**でプロセスを終了します — この場合は次項の crash/restart
 手順に従ってください。
@@ -220,11 +227,13 @@ continue it, or --abandon-incomplete-run to force-reconcile and abandon it
 ### 手順 1: `--resume` で再開する (推奨)
 
 エラーメッセージに表示された `<run-id>` を使い、**元と同じコマンドライン**に
-`--resume <run-id>` を追加して再実行します。
+`--resume <run-id>` と `--master-address <master>`（または同じ値の
+`HL_MASTER_ADDRESS`）を追加して再実行します。再開時は master も journal と
+外部 API 呼び出し前に照合するため、明示が必須です。
 
 ```bash
 hype-twap --symbol HYPE --side long --usd 1500 --duration 30m \
-  --max-notional-usd 5000 --read-only false \
+  --network testnet --max-notional-usd 5000 --read-only false --master-address 0x... \
   --resume <run-id>
 ```
 
@@ -241,7 +250,7 @@ cloid をすべて `orderStatus` で照合してから、通常の実行フロ�
 
 ```bash
 hype-twap --symbol HYPE --side long --usd 1500 --duration 30m \
-  --max-notional-usd 5000 --read-only false \
+  --network testnet --max-notional-usd 5000 --read-only false --master-address 0x... \
   --abandon-incomplete-run
 ```
 
@@ -259,18 +268,20 @@ run を `Abandoned` としてクローズします。「照合すらせず握り
   状態ディレクトリ上の未完了 run と一致しないと、`orderStatus` による
   照合を始める前に即座にエラーで停止します。エラーメッセージに表示された
   正しい `<run-id>` を使ってください。
-- **`<run-id>` は正しいが、他のパラメータ (`--usd`/`--size`/`--duration`/
-  `--slices`/`--slippage-bps`/`--max-notional-usd` など) が元の実行と
-  異なる場合**: `--resume` 限定のチェックです。run の未解決 cloid の
-  `orderStatus` 照合を終えたあと (照合は安全のため常に先に行われ、
-  パラメータの食い違いでスキップされることはありません)、サイズ算出後に
-  元の run のジャーナルへ記録された `plan_hash` と比較し、一致しなければ
-  エラーで停止します。この場合も `orderStatus` 照合の結果はジャーナルに
-  残ったままなので、**元と同じパラメータで `--resume` をやり直す**か、
+- **`<run-id>` は正しいが、実行条件が元の run と異なる場合**:
+  `--resume` 限定のチェックです。run の未解決 cloid の `orderStatus` 照合を
+  終えたあと (照合は安全のため常に先に行われ、条件の食い違いで
+  スキップされることはありません)、journal の version 付き typed
+  execution fingerprint と照合します。対象は request mode/value、sizing、
+  duration、絶対deadline、symbol/side、slippage、cap、book freshness、
+  settle retries、child algorithm/follow設定、network、agent/master、position
+  phase/reduce-only です。相違field名を示して新規注文前に停止します。この場合も
+  `orderStatus` 照合結果はjournalに残るので、**元と同じ条件で `--resume` を
+  やり直す**か、
   続行するつもりがないなら `--abandon-incomplete-run` を使ってください。
   パラメータを意図的に変えて残りを続行する手段は用意していません —
   途中からスケジュールを変えて再解釈させることは事故のもとだからです。
-  なお `--abandon-incomplete-run` はこの `plan_hash` チェックを行いません
+  なお `--abandon-incomplete-run` は continuation 用 fingerprint チェックを行いません
   — run を閉じるだけなので、渡した `--usd`/`--duration` 等がどんな値でも
   (照合完了後に) 正常に `Abandoned` としてクローズできます。
 
@@ -430,6 +441,66 @@ graceful shutdown を経由しないプロセス消滅 (電源断、OOM kill、`
 6. Hyperliquid 上の実際の約定・建玉と、ジャーナル上の `filled_sz` の合計が
    一致することを確認する (パターン A の手順5と同じ最終確認)。
 
+## 観測イベント、metrics、alert hook
+
+ジャーナル (`journal.jsonl`) が執行・resume・会計の唯一の正本です。観測用の
+JSONL、Prometheus metrics、外部 alert はすべて best-effort であり、書込み・
+DNS/TLS/connect/read timeout・5xx・hook 停止によって place/cancel/reconciliation
+または終了コードが変わることはありません。
+
+`src/observability.rs` のイベント契約は `schema_version: 1` の JSON Lines です。
+同一 event stream 内で `sequence` は 1 から単調増加します。破壊的な変更は既存
+version を変更せず、新しい schema version を導入してください。`run_started`、
+`preflight_completed`、`slice_prepared/submitted/acknowledged/terminal`、`fill`、
+`cap_near`、`reconciliation`、`execution_failed`、`run_stopped`、`final_report`、
+`pair_leg_abnormal` が
+閉じた語彙です。payload に秘密鍵、署名、認証 header、token、生の request/response、
+完全な query URL、任意の error string を足してはいけません。read-only は event の
+`mode: "read_only"` で live と区別します。read-only simulation で実際のJSONLを
+確認する場合は `--event-jsonl /明示/path/events.jsonl` を指定します。この明示ファイル
+以外のstate directoryやjournalは作られません。liveでは同フラグを使わず、run directory
+内のsidecarを使用します。
+`cap_near` はdurable terminal accounting後の残capがrun上限の10%以下になった時に
+runごとに一度だけ発火します。各terminal後の `cap_remaining` と最終reportの値は
+journal replayの保守的なaccounted notionalを使い、価格不明を実約定VWAPとは扱いません。
+event をファイルへ保存する場合も `journal.jsonl` と別の sidecar にし、event
+file の create/write/flush 失敗は記録・監視対象に留めて、正本 journal の fsync
+や取引の成否へ伝播させません。
+
+Prometheus は固定カーディナリティだけを公開します。run 状態、累積 filled size /
+notional、cap 残額、API/reconciliation error、未解決注文、終了 reason と alert
+drop/delivery failure を含みます。symbol、address、cloid、run_id、URL、error text は
+label に禁止です。HTTP exposition は loopback (`127.0.0.1`/`::1`) bind を既定にし、
+外部 interface への bind は明示的な opt-in を必要とします。外部公開する場合は
+firewall/認証付き reverse proxy で保護し、metrics をインターネットへ直接出さないで
+ください。
+
+alert hook は既定 off です。有効化する実装では bounded queue と短い delivery timeout
+を使います。queue 満杯は `hype_twap_alerts_dropped_total`、timeout/5xx は
+`hype_twap_alert_delivery_failures_total` で検知し、トレード処理を待たせません。推奨
+alert 条件は abort、`unresolved_orders > 0`、reconciliation error、`cap_reached`、
+deadline、`pair_leg_abnormal` と watchdog の `ALERT:` ログです。
+
+`dn-pair.sh` は `HL_ALERT_HOOK_URL` が設定されている場合、その値だけを
+sanitizer の後に watchdog と各 leg の隔離環境へ private export します。hook は
+argv、sanitizer の中間環境、manifest、event、launcher/leg log には書き込みません。
+watchdog は片脚異常時に固定の `pair_leg_abnormal` JSON payload を curl で best-effort
+送信します。remote URL は **HTTPS 必須**です。テスト受信機だけは literal loopback の
+`http://127.0.0.1` / `http://[::1]` を許可します。userinfo、query、fragment は使えません。
+送信は同時1件、connect 1 秒・全体 2 秒、redirect 無効です。curl 不在、URL 不正、timeout、
+5xx、queue busy は警告だけで、watchdog の SIGTERM・exit 判定を変更しません。片脚異常の
+containment として SIGTERM を送った後に両脚が消滅した場合は、異常を失わないよう watchdog
+は非ゼロ終了します。両脚が自然に終了した場合は 0 です。
+
+実行バイナリでは `--metrics-bind 127.0.0.1:9464`（または
+`HL_METRICS_BIND`）で `/metrics` を有効化できます。non-loopback bind は
+`--allow-external-metrics`（または `HL_ALLOW_EXTERNAL_METRICS=true`）を明示しない
+限り拒否されます。alert hook は `HL_ALERT_HOOK_URL` のみで設定します。remote URL は HTTPS
+のみで、literal loopback の `http://127.0.0.1` / `http://[::1]` だけがテスト用例外です。
+userinfo、query、fragment は使えず、redirect は追跡しません。hook や metrics listener の
+開始に失敗した場合は警告して disabled に落とすだけで、注文・cancel・resume の結果や
+exit code は変えません。live run の sidecar は run directory 内の `events.jsonl` です。
+
 ## デルタニュートラル2脚運用
 
 `hype-twap` は「1プロセス=1銘柄」の設計を維持しますが、**脚ごとに専用の
@@ -452,19 +523,38 @@ nonce の状態管理と単一 writer ロック (前節参照) は
 - 各脚の秘密鍵は `HL_AGENT_PK_LEG1` / `HL_AGENT_PK_LEG2` として
   `dn-pair.sh` に渡します (本ツール自体が読む環境変数は従来通り
   `HL_AGENT_PK` 1本のみで、`dn-pair.sh` が脚ごとに子プロセスへ
-  `HL_AGENT_PK` として再エクスポートします)。2つの値が同一文字列の場合
-  `dn-pair.sh` は起動前に abort します。
+  `HL_AGENT_PK` として環境変数で渡します)。この受け渡しでは秘密鍵を argv
+  や `/proc/<pid>/cmdline` に載せません。2つの値が同一文字列の場合
+`dn-pair.sh` は起動前に abort します。
+
+各 leg の子プロセス環境は最小化されます。常に渡るのは `PATH`、`HOME`、`TMPDIR`
+だけで、live の場合に限り該当 leg の `HL_AGENT_PK` と、設定されていれば
+`HL_AGENT_ADDRESS` が追加されます。operator が明示設定した非空の値だけ、固定
+allowlist の `SSL_CERT_FILE`、`SSL_CERT_DIR`、`HTTPS_PROXY` / `HTTP_PROXY` /
+`ALL_PROXY` / `NO_PROXY`（および lowercase 版）、`RUST_LOG`、`RUST_BACKTRACE` も
+leg に渡されます。任意の環境変数名を指定する仕組みはありません。generic
+`HL_AGENT_PK` / `HL_AGENT_ADDRESS`、source の `*_LEG1` / `*_LEG2`、allowlist 外の値は
+leg に継承されません。例外として `HL_ALERT_HOOK_URL` は allowlist とは別の private
+値で、設定時にのみ sanitizer 後の各leg と watchdog に復元されます。
 
 ### live 実行前の極小 notional プローブを必須とする
 
-本番の notional で立ち上げる前に、`--leg1-usd` / `--leg2-usd` を
+本番の notional で立ち上げる前に、funded testnet で `--leg1-usd` / `--leg2-usd` を
 最小 notional (例: $15〜$20 程度、per-slice が $10 の最小名目額を
 上回る額) に絞った**プローブ運用**を必ず行ってください。極小 mainnet
 プローブは過去に実バグ (orderStatus の avgPx 欠落による計上不備、
 resume の二重執行など) をフルサイズ投入前に複数回捕捉した実績が
-あります。フルサイズで初めて気づくのは手遅れです。
+ありますが、現在は Issue #16 が未完了なので mainnet probe 自体を行ってはいけません。
+全 checklist の完了を記録して gate を解除した後も、最初は極小額から始めます。
 
 ### `dn-pair.sh` の使用例
+
+`dn-pair.sh` は **read-only が既定**です。本番実行は必ず `--live`、各脚の
+明示 cap、別々の agent key を指定します。run ごとに mode 0700 の専用
+directory と versioned `manifest.json` を作成し、PID だけでなく Linux の
+starttime と executable identity を記録します。manifest やログに秘密鍵は入りません。
+`--log-dir` は絶対パスで、symlink ではなく、起動ユーザー所有かつ mode 0700 の
+root directory だけを受け付けます。
 
 ```bash
 export HL_AGENT_PK_LEG1=$(pass show hyperliquid/agent-pk-eth)
@@ -474,24 +564,59 @@ scripts/dn-pair.sh \
   --leg1-symbol ETH --leg1-side long  --leg1-usd 1000 \
   --leg2-symbol BTC --leg2-side short --leg2-usd 1000 \
   --duration 30m --slices 10 \
-  --child-algo follow \
-  --read-only false
+  --leg1-network testnet --leg2-network testnet \
+  --leg1-child-algo follow --leg2-child-algo follow \
+  --leg1-max-notional-usd 1200 --leg2-max-notional-usd 1200 \
+  --live
 ```
 
-主なオプション (すべて `--leg1-*`/`--leg2-*` は必須、他は任意):
+同方向の脚、または既定の USD hedge ratio (1.0、許容差 100 bps) を外れる
+構成は開始前に拒否されます。例外は監査対象の `--allow-same-side` /
+`--allow-hedge-imbalance` に限られます。watchdog grace は既定 0 秒です。
+`/proc/<pid>/stat` starttime と `/proc/<pid>/exe` を確認できない場合は
+fail-closed で signal を送らず停止します。共通 start 公開後に片脚異常を検出した
+launcher は、watchdog を先に止めず、verified な脚へ SIGTERM を送って最大10秒
+待機・identity再確認します。残存脚があれば manifest は `start_failed_partial` のまま
+非ゼロ終了し、watchdog を残して alert/containment を継続します。operator は建玉を
+確認してください。
 
-- `--child-algo` (既定値 `follow`)
-- `--max-notional-usd` (既定値: 各脚の `--usd` の1.2倍を自動計算。
-  下記「`--max-notional-usd` は総額判定」を参照)
-- `--log-dir` (既定値 `~/.local/state/hype-twap/logs`)
-- `--read-only` (既定値 `false`。`true` ならリハーサルモードで鍵不要)
+主なオプションは `--leg1-child-algo` / `--leg2-child-algo` (既定 `follow`)、
+各脚の `--legN-max-notional-usd` (live では必須)、`--log-dir`、
+`--watchdog-grace`、`--pair-barrier-timeout` (秒、既定30) です。
+各脚はさらに `--legN-network` / `--legN-state-dir` / `--legN-trigger-price` /
+`--legN-trigger-when` / `--legN-start-after` / `--legN-expire-after` /
+`--legN-slippage-bps` / `--legN-max-book-age-ms` / `--legN-follow-poll-secs` /
+`--legN-follow-repost-secs` / `--legN-follow-threshold-bps` /
+`--legN-wait-network-grace` を独立指定できます。
+脚別 `--legN-slippage-bps` は 0〜1000 bps を受け付けます。単体 CLI の
+`--allow-high-slippage` に相当する危険域 override は pair launcher では公開しません。
+`--read-only true` が既定で、鍵を使わないリハーサルです。標準出力の
+`READ-ONLY / DRY-RUN` banner を確認し、実発注は明示した `--live` だけで行います。
+旧 `--read-only false` は 0.1.x の移行期間だけ warning 付きで `--live` と同じ
+扱いを維持し、次の breaking release (0.2.0) で削除します。新しい runbook や
+automation では使用しないでください。unsafe override と非zero watchdog grace は
+manifest に加えて `launcher.log` にも明示されます。
 
-各脚は `setsid`+`nohup` で detach 起動され、ログは
-`<log-dir>/dn-<symbol>-<side>.log`、PID は
-`<log-dir>/dn-<symbol>-<side>.pid` に記録されます。起動後10秒で両PIDの
-生存確認を行い、片方が死んでいればもう片方に SIGTERM を送ってから
-異常終了します (裸ポジション防止)。両脚が健在なら
-`scripts/dn-watchdog.sh` を続けて起動します。
+各実行は `<log-dir>/<run-id>/` (0700) を作り、そこに `manifest.json`、各脚の
+ログ、`leg1.ready.json`/`leg2.ready.json`、`start.json` を保存します。manifest は
+version 1 の正本で、PIDだけでなく `/proc/<pid>/stat` starttime と executable を
+記録します。各Rust子は signer/agent/lock/meta/master/trigger/sizing/journal の
+preflight後に ready を atomic に公開します。launcher は **両方の run_id とPIDが
+一致する ready** を待ってから、共通の未来 Unix-ms を持つ `start.json` を atomic
+公開します。timeout・ready不正・片脚死ではstartを公開せず、最初に起動した脚から
+identity確認付きでrollbackします。これによりbarrier前の発注はありません。
+watchdog は共通 start を公開する**前**に起動ログと PID identity の両方で health
+check されます。watchdog 起動/health check 失敗時も start は公開されず、ready 済みの
+両脚へ identity 確認付き rollback を行います。
+
+pair run directory の `lifecycle.lock` は launcher の manifest 更新と `status` /
+`stop` / `recover` を run 単位で直列化します。競合した操作は待機せず fail-fast
+します。lock は launcher 終了時に解放され、watchdog・脚プロセスへは継承されません。
+live leg は durable journal 作成後・barrier直前に ready file へ自分の正確な
+`journal_run_id` を公開します。launcher は state directory 内のその一意IDと Header の
+symbol/side を検証して manifest に保存し、shared state root の全走査や「最初の一致」を
+行いません。read-only leg は journal を作らず空です。これにより同じ state root・同じ
+symbol/side の同時 pair run でも mapping を混同しません。
 
 ### watchdog の意味論 (PID ベース監視)
 
@@ -499,56 +624,108 @@ scripts/dn-pair.sh \
 (`pgrep -cx` のようなプロセス名カウントは同一ホスト上の無関係な
 `hype-twap` プロセスと干渉するため使用していません)。
 
-- 5秒ごとに `kill -0` で両 PID の生存を確認します。可能であれば
-  `/proc/<pid>/comm` が `hype-twap` であることも確認し、PID 再利用
-  による誤爆を防ぎます。
-- **片方だけが生存している状態が `--grace` 秒 (既定90秒) 継続したら**、
+- 1秒ごとに `kill -0`、`/proc/<pid>/stat` の starttime、`/proc/<pid>/exe` を
+  3点一致で確認します。いずれかを読めない/一致しない場合は fail-closed で
+  signal を送りません。
+- **片方だけが生存している状態が `--grace` 秒 (既定0秒) 継続したら**、
   生存している方に SIGTERM を送ります。grace は自然完走時の両脚の
   終了タイミングのズレを吸収するためのもので、その間は生存側が発注を
   続けます (乖離の拡大は高々数スライス分の notional)。異常死への反応を
   速めたい場合は `--grace` を短くしてください。`hype-twap` は SIGTERM で
   resting 注文の cancel/settle まで行う graceful shutdown を実装済み
   なので、裸ポジションのまま放置されることを防ぎます。
-- SIGTERM 送信後、最大180秒待って生存していれば exit 1 で終了します。
+- SIGTERM後も生存する場合は30秒ごとにalertを記録します。watchdog自身は
+  identity未検証のPIDへKILLを送りません。
 
 ### 停止後の状態: ポジションは残る
 
 プロセスを停止 (自然終了・SIGTERM いずれも) してもポジションそのものは
-残ります。フラット化する場合は以下の手順を踏んでください。
+残ります。単なる `--usd` は常に**新規に注文する notional**であり、現在
+建玉を考慮しません。解消・目標 exposure には position mode を使います。
 
-1. `/info clearinghouseState` で各脚の建玉数量を確認する。
-2. 逆サイドの TWAP (本ツールを `--side` を逆にして再実行する、または
-   手動成行) で解消する。
+```bash
+# 読み取り専用: master の現在建玉、delta、phase を表示する
+hype-twap --symbol HYPE --flatten --master-address 0x... --duration 5m --slices 5
+hype-twap --symbol HYPE --target-sz -10 --master-address 0x... --duration 10m --slices 10 --json
+# target-usd は preflight mid で一度だけ size 化し、以後再計算しない
+hype-twap --symbol HYPE --target-usd 1000 --master-address 0x... --duration 10m --slices 10
+```
 
-本ツールは `reduce_only` を使わない設計です。フラット化の数量は
-**手動で厳密に建玉数量へ合わせる必要があります**(意図せず追加の
-ポジションを積んでしまうリスクに注意)。
+`--flatten` は `clearinghouseState` の対象 perpetual symbol 一つだけを読み、
+long なら short、short なら long の**最大 current size**を全 child order の
+`reduce_only=true` で送ります。zero、取得失敗、symbol/精度不正は注文しません。
+live flatten は、preflight が表示する `FLATTEN CONFIRMATION` token を同じ内容で
+`--confirm-flatten` に渡すまで注文しません。token は network/master/symbol/
+initial size/close side/max size/cap/algo/deadline に束縛されます。agent key は
+live でのみ使い、read-only は `--master-address` または `HL_MASTER_ADDRESS` の
+公開アドレスだけを使います。
+
+token は再実行間で変わらない `--flatten-deadline-unix-ms` を指定して生成します。
+read-only の同じ plan/deadline で token を確認し、live invocation に同じ deadline
+と token を渡してください。この deadline は journal Header と全 order wire の
+`expiresAfter`、ローカル期限に同一値で適用されます。
+
+`--flatten --resume` でも元の `--confirm-flatten` token が必須です。未解決注文の
+reconciliation/cancel は安全確定のため先に実行され得ますが、新規child注文は、
+journal fingerprintの初期建玉・最大close量とHeaderの元deadlineから同じtokenを
+再構築して一致確認するまで送信されません。部分約定後の小さい残量から別tokenを
+作り直すことはありません。元のdeadlineとtokenを同じresumeコマンドへ渡してください。
+
+token の直前には `FLATTEN PREFLIGHT` として、token に束縛される `network`、
+`master`、`symbol`、`initial_szi`、`close_side`、`max_close_size`、
+`max_notional_usd`、`child_algo`、`execution_deadline_unix_ms` を固定順で表示します。
+秘密鍵・agent key・endpoint は表示しません。これは read-only の token 準備でも
+同じです。`--json` は position plan の機械可読 stdout を維持するため、この人間向け
+表示を出しません。
+
+`--target-sz` / `--target-usd` は `target - current` だけを実行します。既存建玉を
+減らす phase は reduce-only です。符号を跨ぐ target は close-to-flat が terminal、
+未確定 cloid なし、最新 position が厳密に zero と確認できるまで open phase を
+開始してはいけません。外部約定や reduce-only rejection を成功と推測せず、状態を
+再取得して判断してください。失敗・中断時は journal を `--resume` で先に
+reconcile し、手作業で反対注文を送らないでください。
 
 ### `--max-notional-usd` は総額判定であることへの注意
 
 `--usd` を指定した場合、`hype-twap` の `--max-notional-usd` は
 **per-slice ではなく総額 (執行全体の目標 notional) に対する判定**です。
-そのため `--max-notional-usd` には `--usd` そのものより大きい値を
-設定する必要があります。`dn-pair.sh` は明示指定がなければ各脚の
-`--usd` の1.2倍を自動計算しますが、意図と異なる場合は
-`--max-notional-usd` を明示的に指定してください。
+そのため各脚の `--legN-max-notional-usd` は `--legN-usd` を安全に上回る
+値として**明示指定**してください。launcherはlive modeのcap省略を拒否し、
+自動補完は行いません。
 
 ### 停止方法
 
-`dn-pair.sh` 実行後に表示される (またはログディレクトリの `.pid`
-ファイルに記録された) PID へ `kill -TERM` してください。
+manifestを正本にする運用CLIを使ってください。`status` はhuman表示または
+`--json` の機械可読表示、`stop` はPID+starttime+exe一致のプロセスだけへ
+TERMを送り、指定timeout後も identity一致で生存するものは強制killせず
+`stop_partial` として残します。
+`recover` は死んだ/stale runを診断するだけで、spawn・発注・signal・manifest書換を
+一切行いません。
 
 ```bash
-kill -TERM <leg1-pid> <leg2-pid>
+scripts/dn-pair.sh status --run-id <run-id> --log-dir /absolute/path/to/pairs
+scripts/dn-pair.sh status --run-id <run-id> --log-dir /absolute/path/to/pairs --json
+scripts/dn-pair.sh stop --run-id <run-id> --log-dir /absolute/path/to/pairs --timeout 30
+scripts/dn-pair.sh recover --run-id <run-id> --log-dir /absolute/path/to/pairs
 ```
+
+`--run-id` は必須で、英数字から始まる `[A-Za-z0-9._-]` のみを受け付けます。
+CLIは`<log-dir>/<run-id>/manifest.json`を自力で解決し、manifest_version=1かつ
+内部のrun_id完全一致でなければfail-closedします。任意のmanifest pathは受け付けません。
+manifestには各脚で明示した`state_dir`も保存されます。`recover`はこれを読むだけで
+`hype-twap-runs verify/inspect` と同じvalidated replayにより、journal run id を
+`VALIDATED-SUCCESS` / `VALIDATED-INCOMPLETE` / `VALIDATED-ABANDONED` / corruptとして
+表示します。CLI不在・検証不能・壊れた/未終端journalは残存riskとして警告するので、exchangeの建玉と
+注文を確認してから手動hedgeまたは通常の`--resume`手順を選んでください。
 
 `pkill -x hype-twap` のような**プロセス名ベースの一括停止は非推奨**
 です。同一ホスト上で動いている無関係な `hype-twap` プロセス
 (別の運用・別のペア) まで巻き込んで停止させてしまいます。
 
-watchdog 自体は両脚の消滅を検知して自動終了するため通常は放置で
-構いませんが、明示的に止めたい場合は `<log-dir>/dn-watchdog.pid` の
-PID へ `kill` してください。
+`stop` はwatchdogも同じidentity検証で SIGTERM を送りますが、自動 SIGKILL はしません。
+全記録 process が absent と再確認できた場合にだけ manifest を `stopped` にします。生存または identity mismatch が
+残れば `stop_partial` と residual-risk を表示して非ゼロ終了します。`pkill -x` や裸のPIDへの
+直接signalは、無関係な運用またはPID再利用を巻き込むため使用しません。
 
 ## トラブルシューティング
 
@@ -572,6 +749,16 @@ PID へ `kill` してください。
 
 1 スライスあたりの名目金額が Hyperliquid の最低額を下回っています。
 `--usd` / `--size` を増やすか、`--slices` を減らしてください。
+
+### cancel後の `orderStatus` が `open` / `unknownOid` のままになる
+
+既知のresting注文をcancelした後のInfo index遅延です。待機予算は
+`--settle-retries N` または `HL_SETTLE_RETRIES=N`（既定25、正の整数）で調整できます。
+この値はcancel/settleだけに効き、ambiguous placeの再送回数は増やしません。
+予算を使い切り、cancel acknowledgementが確認済みの場合だけ、cancel開始10秒前からの
+`userFillsByTime`を照会し、oid/cloid/symbol/side/数量が一致するfillを採用します。
+ledgerも確定根拠を返せなければ推測でzero扱いせずhard-stopするため、journalを検査して
+`--resume`してください。
 
 ### `live mode requires --max-notional-usd` で起動しない
 
@@ -617,7 +804,10 @@ override はできません — タイプミスの可能性を疑ってくださ
 `above` は「mid が閾値以上になったら」、`below` は「mid が閾値以下になったら」発火します。
 起動時のログの `Trigger:` 行に条件が明示されます。
 
-タイムアウトを設けたい場合は `--start-after` を併記してください (OR 条件で先勝ちです)。
+条件が成立しないまま待機を打ち切り、何も発注せず終了するタイムアウトを
+設けたい場合は `--expire-after` を指定してください。`--start-after` は逆に、
+指定時間が経過した時点で価格条件が未成立でも実行を**開始する**フォールバックです。
+両方を併用する場合は `expire_after > start_after` となる値が必要です。
 
 ## 既知の制約
 
@@ -628,17 +818,22 @@ override はできません — タイプミスの可能性を疑ってくださ
 - **システム時刻に依存します。** nonce と板の鮮度チェックは、ある程度正確なシステム時刻を
   前提としています。NTP を動かしてください (板のタイムスタンプがローカル時刻より未来の場合は
   新鮮として扱うため、軽度のずれは許容されます)
-- **タイミング系フラグは wall-clock ではなく単調クロックです。** `--start-after` /
-  `--duration` / `--expire-after` はいずれも `tokio::time::Instant` (Linux では
-  `CLOCK_MONOTONIC`) を基準に計測しており、システムサスペンド中は時刻が進みません。
-  サスペンドするラップトップ等で運用すると、たとえば `--start-after 2h` は「起動後、
-  実際に稼働していた時間で 2 時間後」に開始します — 途中で 1 時間サスペンドすれば、
-  実際の開始時刻もその分だけ後ろ倒しになります
+- **trigger待機は単調クロック、executionは永続化したwall-clock deadlineです。**
+  `--start-after` / `--expire-after` の待機は `tokio::time::Instant` を使います。
+  execution開始時には `--duration` から絶対Unix-ms期限をjournalへ固定し、全注文の
+  `expiresAfter` と `--resume` が同じ期限を引き継ぎます。サスペンドや再開によって
+  元の論理execution windowが延長されることはありません。resume時の残りが元の
+  1 slice interval 未満でも、1ms以上あれば残量をその短いwindowへ圧縮した最終
+  continuationを許可しますが、各book retry・place・resend直前に同じ絶対deadlineを
+  再確認します。境界ちょうど／境界後は reconciliation/cancel のみで、新規book取得・
+  発注は行いません
 - **HL のエラー文字列を部分一致で判定しています。** Hyperliquid が拒否メッセージの文言を
   変更する可能性があります。文言が変わっても実行は停止しますが、分類が汎用的な
   「取引所が拒否」という表現にフォールバックします
-- **1 プロセス 1 銘柄です。** ポートフォリオ的な制御、既存ポジションの考慮
-  (`reduce_only` は常に未設定)、HIP-3 の `dex:SYMBOL` 形式には対応していません
+- **1 プロセス 1 銘柄です。** `--flatten` / `--target-sz` / `--target-usd` は
+  その1つのstandard perpetualについて現在建玉を考慮し、解消区間を
+  `reduce_only` にします。portfolio最適化とHIP-3 `dex:SYMBOL` position modeは
+  対象外です
 - **既定はテイカーですが、メイカー系モードも実装済みです。** `--child-algo market`
   (既定) はすべてのスライスがスプレッドを越え、テイカー手数料を支払います。
   `--child-algo passive` はベスト bid/ask に ALO (post-only) 指値を置きますが、
@@ -647,8 +842,10 @@ override はできません — タイプミスの可能性を疑ってくださ
   いずれもタイムアウト時のテイカー切り替えは行いません — 未約定分は次の
   スライスへ持ち越されるのみです
   ([issue #1](https://github.com/howlrs/hype-trigger-twap/issues/1))
-- **testnet での実発注検証は未実施です。** Agent 署名注文に対する `orderStatus` の
-  実挙動が唯一の未検証点です。初回は少額から始めてください
+- **testnet conformance は一部のみ確認済みです。** 2026-09-04 に公開 `meta` と
+  unknown-oid `orderStatus` の応答shapeを実APIで確認済みです。funded account が必要な
+  market/passive smoke、ALO拒否文言、cancel `expiresAfter: null` は未実施なので、
+  mainnet live の前に Issue #16 の手順を完了し、初回は少額から始めてください
 - **単一ホスト内の単一 writer のみ保証します。** 同一ホスト・同一
   `network + agent` の二重起動は起動時ロックで検知しますが、複数ホストに
   またがる二重起動は検知できません。「単一 writer ロックと nonce の運用境界」
@@ -668,5 +865,6 @@ override はできません — タイプミスの可能性を疑ってくださ
 
 今後の候補: タイムアウト時のテイカー切り替えフォールバック。
 
-当面スコープ外: WebSocket による約定取得、複数銘柄の同時執行、既存ポジションの考慮。
+当面スコープ外: WebSocket による約定取得、複数銘柄のportfolio最適化、
+funding/PnL最適化、leverageの自動変更。
 (実行の再開・永続化は対応済みです — 「クラッシュ・再起動時の手順」を参照してください)

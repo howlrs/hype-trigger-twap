@@ -1,12 +1,17 @@
 # hype-trigger-twap 日本語ドキュメント
 
-Hyperliquid 無期限先物向けの「トリガー付き TWAP」を実行する単一 Rust バイナリ (`hype-twap`) の
-日本語資料です。サーバー・WebSocket・Python・DB は一切使いません。
+Hyperliquid 無期限先物向けの「トリガー付き TWAP」を実行する Rust executor
+(`hype-twap`) と read-only journal inspector (`hype-twap-runs`) の日本語資料です。
+サーバー・WebSocket・Python・DB は一切使いません。
 
 指定した価格または経過時間で発火し、目標数量を等間隔の IOC (テイカー) スライスに分割して
 執行します。スライスが約定不足のときは次スライスで自動的に取り返します (キャッチアップ方式)。
 
 **Read-only (ドライラン) が既定値です。** `--read-only false` を明示しない限り注文は一切送信されません。
+
+**Issue #16 の funded testnet 検証が未完了のため、mainnet live は現在禁止です。**
+以下の live 例は必ず `--network testnet` で実行し、checklist 完了と結果の文書化前に
+mainnet へ切り替えないでください。
 
 ## 目次
 
@@ -28,10 +33,10 @@ cargo build --release
 # ドライラン (既定) — 実際には発注せず、板から計算した想定注文を表示
 ./target/release/hype-twap --symbol HYPE --side long --usd 1500 --duration 30m
 
-# 本番実行
+# funded testnet での live smoke
 export HL_AGENT_PK=0x<64桁の16進数>
 ./target/release/hype-twap --symbol HYPE --side long --usd 1500 --duration 30m \
-  --max-notional-usd 2000 --read-only false
+  --network testnet --max-notional-usd 2000 --read-only false
 ```
 
 ## 安全設計の要点

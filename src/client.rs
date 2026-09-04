@@ -29,7 +29,9 @@ use serde::{Deserialize, Serialize};
 use crate::errors::HlError;
 use crate::lock::NonceHwm;
 use crate::signer::Signer;
-use crate::types::{BookLevel, CancelIntent, OrderBook, OrderId, OrderIntent, Symbol};
+use crate::types::{
+    Address, BookLevel, CancelIntent, OrderBook, OrderId, OrderIntent, SignedPerpPosition, Symbol,
+};
 
 /// Backoff schedule for transport errors (§5): 3 retries max.
 const RETRY_BACKOFF: [Duration; 3] = [
@@ -144,6 +146,68 @@ impl WireL2Book {
             asks: self.levels.get(1).map(map).unwrap_or_default(),
             time_ms: self.time,
         }
+    }
+}
+
+/// HL `/info clearinghouseState` response.
+///
+/// Only the position fields needed for position-aware execution are modeled,
+/// but they deliberately use nested structs rather than probing a loose JSON
+/// value: a missing `assetPositions`, missing `position`, missing `coin`, or
+/// non-string/non-decimal `szi` is an invalid response and must stop before
+/// it can influence a reduce-only or target-exposure order.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireClearinghouseState {
+    pub asset_positions: Vec<WireAssetPosition>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WireAssetPosition {
+    pub position: WirePerpPosition,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WirePerpPosition {
+    pub coin: String,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub szi: Decimal,
+}
+
+impl WireClearinghouseState {
+    /// Return the signed perp position for `requested`.
+    ///
+    /// A missing requested symbol is a genuine flat position. Duplicate coins
+    /// are never resolved by choosing one arbitrarily: that would let an
+    /// ambiguous account snapshot determine an order size. We reject any
+    /// duplicate within the state, including an unrelated market, so callers
+    /// can treat this parsed state as a coherent account snapshot.
+    pub fn position_for(&self, requested: &Symbol) -> Result<SignedPerpPosition, HlError> {
+        let mut found = None;
+        let mut coins = std::collections::HashSet::with_capacity(self.asset_positions.len());
+
+        for asset_position in &self.asset_positions {
+            let position = &asset_position.position;
+            if position.coin.is_empty() {
+                return Err(HlError::InvalidResponse(
+                    "clearinghouseState: position.coin is empty".into(),
+                ));
+            }
+            if !coins.insert(&position.coin) {
+                return Err(HlError::InvalidResponse(format!(
+                    "clearinghouseState: duplicate position for coin {}",
+                    position.coin
+                )));
+            }
+            if position.coin == requested.as_str() {
+                found = Some(SignedPerpPosition {
+                    symbol: requested.clone(),
+                    szi: position.szi,
+                });
+            }
+        }
+
+        Ok(found.unwrap_or_else(|| SignedPerpPosition::zero(requested.clone())))
     }
 }
 
@@ -437,6 +501,22 @@ pub struct OrderStatusFill {
     pub side: String,
 }
 
+/// One official `/info userFillsByTime` row used to corroborate a cancelled
+/// resting child.  It intentionally retains the order identity fields rather
+/// than aggregating at the HTTP boundary: callers must reject a wrong oid,
+/// coin, or side before it can affect accounting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserFill {
+    pub coin: String,
+    pub px: Decimal,
+    pub sz: Decimal,
+    pub side: String,
+    pub time_ms: u64,
+    pub oid: OrderId,
+    pub tid: u64,
+    pub cloid: Option<crate::types::Cloid>,
+}
+
 impl OrderStatusFill {
     /// Verify the response actually describes the order the caller queried
     /// for (Issue #7).
@@ -534,6 +614,23 @@ const ORDER_STATUS_VOCABULARY: &[(&str, bool)] = &[
     ("scheduledCancel", true),
 ];
 
+/// Shared terminal-status boundary for both live API validation and durable
+/// journal replay. Unknown and known-live statuses intentionally return
+/// false: treating a potentially live order as closed is the unsafe error.
+pub(crate) fn is_terminal_order_status(status: &str) -> bool {
+    let got = normalise_status(status);
+    ORDER_STATUS_VOCABULARY
+        .iter()
+        .any(|(name, terminal)| *terminal && normalise_status(name) == got)
+}
+
+pub(crate) fn is_known_order_status(status: &str) -> bool {
+    let got = normalise_status(status);
+    ORDER_STATUS_VOCABULARY
+        .iter()
+        .any(|(name, _)| normalise_status(name) == got)
+}
+
 impl OrderStatusFill {
     /// True when the status guarantees the fill count can no longer change.
     ///
@@ -545,20 +642,14 @@ impl OrderStatusFill {
     /// vocabulary explicit: a status absent from the table (HL adds one we
     /// don't know about yet) is always non-terminal, never guessed terminal.
     pub fn is_terminal(&self) -> bool {
-        let got = normalise_status(&self.status);
-        ORDER_STATUS_VOCABULARY
-            .iter()
-            .any(|(name, terminal)| *terminal && normalise_status(name) == got)
+        is_terminal_order_status(&self.status)
     }
 
     /// True when the status is a recognised member of the vocabulary at all
     /// (terminal or not). A status that is neither is one HL has added since
     /// this table was written — conformance drift, not a code bug.
     pub fn is_known_status(&self) -> bool {
-        let got = normalise_status(&self.status);
-        ORDER_STATUS_VOCABULARY
-            .iter()
-            .any(|(name, _)| normalise_status(name) == got)
+        is_known_order_status(&self.status)
     }
 }
 
@@ -793,6 +884,11 @@ impl HlClient {
         let http = reqwest::Client::builder()
             .pool_idle_timeout(Some(Duration::from_secs(60)))
             .timeout(HTTP_TIMEOUT)
+            // Never forward an info request or a signed exchange POST to a
+            // redirect target.  Endpoint validation applies to the URL the
+            // operator configured; following a 30x would otherwise let that
+            // endpoint select a different host after validation.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| HlError::InvalidConfig(format!("build http client: {e}")))?;
         Ok(Self {
@@ -960,6 +1056,23 @@ impl HlClient {
         Ok(wire.to_orderbook())
     }
 
+    /// `{"type":"clearinghouseState","user":master}` → one signed perp
+    /// position. `user` must be the MASTER account, since agent orders and
+    /// positions are accounted there by Hyperliquid.
+    ///
+    /// A requested symbol absent from a valid state is returned as `szi = 0`;
+    /// malformed states and duplicate position entries are rejected rather
+    /// than guessed.
+    pub async fn fetch_perp_position(
+        &self,
+        user: &Address,
+        symbol: &Symbol,
+    ) -> Result<SignedPerpPosition, HlError> {
+        let body = serde_json::json!({"type": "clearinghouseState", "user": user.as_str()});
+        let text = self.post_with_retry(&self.config.info_url, &body).await?;
+        parse_clearinghouse_position(&text, symbol)
+    }
+
     /// `{"type":"userRole","user":addr}` → the address's HL role (F1).
     ///
     /// Used at live-mode startup to discover the MASTER account behind the
@@ -1003,6 +1116,28 @@ impl HlClient {
     ) -> Result<Option<OrderStatusFill>, HlError> {
         self.order_status_body(user, serde_json::json!(cloid.to_hex_string()))
             .await
+    }
+
+    /// Official `userFillsByTime`: the bounded, non-aggregated fill ledger.
+    /// `end_time_ms: None` deliberately omits `endTime`, matching the API
+    /// contract rather than serialising JSON null.
+    pub async fn fetch_user_fills_by_time(
+        &self,
+        user: &crate::types::Address,
+        start_time_ms: u64,
+        end_time_ms: Option<u64>,
+    ) -> Result<Vec<UserFill>, HlError> {
+        let mut body = serde_json::json!({
+            "type": "userFillsByTime",
+            "user": user.as_str(),
+            "startTime": start_time_ms,
+            "aggregateByTime": false,
+        });
+        if let Some(end) = end_time_ms {
+            body["endTime"] = serde_json::json!(end);
+        }
+        let text = self.post_with_retry(&self.config.info_url, &body).await?;
+        parse_user_fills_by_time(&text)
     }
 
     async fn order_status_body(
@@ -1350,11 +1485,72 @@ pub fn parse_order_status(text: &str) -> Result<Option<OrderStatusFill>, HlError
     }))
 }
 
+/// Parse the official non-aggregated `userFillsByTime` response.
+pub fn parse_user_fills_by_time(text: &str) -> Result<Vec<UserFill>, HlError> {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(text)
+        .map_err(|e| HlError::InvalidResponse(format!("parse userFillsByTime json: {e}")))?;
+    rows.into_iter()
+        .enumerate()
+        .map(|(idx, row)| {
+            let field = |key: &str| -> Result<&str, HlError> {
+                row.get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        HlError::InvalidResponse(format!(
+                            "userFillsByTime[{idx}].{key} missing or not a string"
+                        ))
+                    })
+            };
+            let number = |key: &str| -> Result<u64, HlError> {
+                row.get(key)
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| {
+                        HlError::InvalidResponse(format!(
+                            "userFillsByTime[{idx}].{key} missing or not u64"
+                        ))
+                    })
+            };
+            let cloid = match row.get("cloid") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(value) => Some(serde_json::from_value(value.clone()).map_err(|e| {
+                    HlError::InvalidResponse(format!("userFillsByTime[{idx}].cloid invalid: {e}"))
+                })?),
+            };
+            Ok(UserFill {
+                coin: field("coin")?.to_string(),
+                px: field("px")?.parse().map_err(|e| {
+                    HlError::InvalidResponse(format!("userFillsByTime[{idx}].px invalid: {e}"))
+                })?,
+                sz: field("sz")?.parse().map_err(|e| {
+                    HlError::InvalidResponse(format!("userFillsByTime[{idx}].sz invalid: {e}"))
+                })?,
+                side: field("side")?.to_string(),
+                time_ms: number("time")?,
+                oid: OrderId(number("oid")?),
+                tid: number("tid")?,
+                cloid,
+            })
+        })
+        .collect()
+}
+
 /// Parse an `/info userRole` response into the domain `Role` (F1).
 pub fn parse_user_role(text: &str) -> Result<Role, HlError> {
     let wire: WireUserRole = serde_json::from_str(text)
         .map_err(|e| HlError::InvalidResponse(format!("userRole: {e}")))?;
     Ok(wire.into())
+}
+
+/// Parse a `clearinghouseState` response and extract one symbol's signed
+/// perpetual position. Kept separate from the HTTP method so malformed and
+/// duplicate-state handling is directly unit-testable.
+pub fn parse_clearinghouse_position(
+    text: &str,
+    symbol: &Symbol,
+) -> Result<SignedPerpPosition, HlError> {
+    let wire: WireClearinghouseState = serde_json::from_str(text)
+        .map_err(|e| HlError::InvalidResponse(format!("clearinghouseState: {e}")))?;
+    wire.position_for(symbol)
 }
 
 #[cfg(test)]
@@ -1381,10 +1577,83 @@ mod tests {
     }
 
     #[test]
+    fn user_fills_by_time_parser_keeps_identity_fields_and_optional_cloid() {
+        let cloid = crate::types::Cloid::new();
+        let json = format!(
+            r#"[{{"coin":"HYPE","px":"50.1","sz":"2","side":"B","time":123,"oid":42,"tid":7,"cloid":"{}"}},{{"coin":"HYPE","px":"50.2","sz":"1","side":"B","time":124,"oid":42,"tid":8}}]"#,
+            cloid
+        );
+        let fills = parse_user_fills_by_time(&json).unwrap();
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0].oid, OrderId(42));
+        assert_eq!(fills[0].cloid, Some(cloid));
+        assert_eq!(fills[1].cloid, None);
+    }
+
+    #[test]
     fn meta_unknown_symbol_is_hard_error() {
         let meta: WireMeta = serde_json::from_str(META_BODY).unwrap();
         let err = meta.resolve(&Symbol::new("NOPE")).unwrap_err();
         assert!(matches!(err, HlError::UnknownSymbol(_)));
+    }
+
+    #[test]
+    fn clearinghouse_position_parses_long_short_and_zero() {
+        let long = parse_clearinghouse_position(
+            r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"1.25"}}]}"#,
+            &Symbol::new("HYPE"),
+        )
+        .unwrap();
+        assert_eq!(long.szi, dec!(1.25));
+
+        let short = parse_clearinghouse_position(
+            r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"-2.5"}}]}"#,
+            &Symbol::new("HYPE"),
+        )
+        .unwrap();
+        assert_eq!(short.szi, dec!(-2.5));
+
+        let zero = parse_clearinghouse_position(
+            r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"0"}}]}"#,
+            &Symbol::new("HYPE"),
+        )
+        .unwrap();
+        assert!(zero.is_flat());
+    }
+
+    #[test]
+    fn clearinghouse_missing_symbol_is_zero() {
+        let position = parse_clearinghouse_position(
+            r#"{"assetPositions":[{"position":{"coin":"BTC","szi":"3"}}]}"#,
+            &Symbol::new("HYPE"),
+        )
+        .unwrap();
+        assert_eq!(position.symbol, Symbol::new("HYPE"));
+        assert_eq!(position.szi, Decimal::ZERO);
+    }
+
+    #[test]
+    fn clearinghouse_malformed_szi_or_shape_fails_closed() {
+        for body in [
+            r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"not-a-number"}}]}"#,
+            r#"{"assetPositions":[{}]}"#,
+            r#"{"assetPositions":{}}"#,
+        ] {
+            assert!(parse_clearinghouse_position(body, &Symbol::new("HYPE")).is_err());
+        }
+    }
+
+    #[test]
+    fn clearinghouse_duplicate_coin_fails_closed() {
+        let err = parse_clearinghouse_position(
+            r#"{"assetPositions":[
+                {"position":{"coin":"HYPE","szi":"1"}},
+                {"position":{"coin":"HYPE","szi":"2"}}
+            ]}"#,
+            &Symbol::new("HYPE"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, HlError::InvalidResponse(message) if message.contains("duplicate")));
     }
 
     #[test]
