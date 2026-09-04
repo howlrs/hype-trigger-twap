@@ -1,0 +1,4 @@
+[resolver]
+# Keep lockfile refreshes compatible with package.rust-version instead of
+# selecting a newer semver-compatible crate that has already raised its MSRV.
+incompatible-rust-versions = "fallback"

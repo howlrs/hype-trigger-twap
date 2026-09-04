@@ -12,7 +12,9 @@ use std::time::Duration;
 use hype_trigger_twap::client::{HlClient, HlConfig, Network, PlaceOutcome};
 use hype_trigger_twap::errors::{HlError, RejectionKind};
 use hype_trigger_twap::signer::Eip712AgentSigner;
-use hype_trigger_twap::types::{CancelIntent, Cloid, OrderId, OrderIntent, Side, Symbol, Tif};
+use hype_trigger_twap::types::{
+    Address, CancelIntent, Cloid, OrderId, OrderIntent, Side, Symbol, Tif,
+};
 use rust_decimal_macros::dec;
 use secrecy::SecretString;
 
@@ -115,6 +117,55 @@ async fn l2_book_parses_touch_and_timestamp() {
     assert_eq!(book.best_ask(), Some(dec!(38.14)));
     assert_eq!(book.mid(), Some(dec!(38.12)));
     assert_eq!(book.time_ms, 1700000000000);
+}
+
+// === /info clearinghouseState ===
+
+#[tokio::test]
+async fn clearinghouse_position_fetches_signed_size_and_uses_master_address() {
+    let mut server = mockito::Server::new_async().await;
+    let master = Address::new("0x00000000000000000000000000000000000000aa");
+    let m = server
+        .mock("POST", "/info")
+        .match_body(mockito::Matcher::PartialJsonString(format!(
+            r#"{{"type":"clearinghouseState","user":"{}"}}"#,
+            master.as_str()
+        )))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"-1.25"}}]}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let client = make_read_only_client(&server);
+    let position = client
+        .fetch_perp_position(&master, &Symbol::new("HYPE"))
+        .await
+        .unwrap();
+    assert_eq!(position.szi, dec!(-1.25));
+    m.assert_async().await;
+}
+
+#[tokio::test]
+async fn clearinghouse_missing_symbol_fetches_as_zero() {
+    let mut server = mockito::Server::new_async().await;
+    let _m = server
+        .mock("POST", "/info")
+        .with_status(200)
+        .with_body(r#"{"assetPositions":[{"position":{"coin":"BTC","szi":"1"}}]}"#)
+        .create_async()
+        .await;
+
+    let client = make_read_only_client(&server);
+    let position = client
+        .fetch_perp_position(
+            &Address::new("0x00000000000000000000000000000000000000aa"),
+            &Symbol::new("HYPE"),
+        )
+        .await
+        .unwrap();
+    assert!(position.is_flat());
 }
 
 // === /exchange place ===
@@ -502,4 +553,31 @@ async fn client_error_4xx_is_not_retried() {
     let err = client.fetch_meta().await.unwrap_err();
     assert!(matches!(err, HlError::Exchange { .. }), "got {err:?}");
     m.assert_async().await;
+}
+
+#[tokio::test]
+async fn redirects_are_rejected_without_contacting_the_target() {
+    let mut redirector = mockito::Server::new_async().await;
+    let mut target = mockito::Server::new_async().await;
+
+    let target_mock = target
+        .mock("POST", "/stolen")
+        .with_status(200)
+        .with_body(META_BODY)
+        .expect(0)
+        .create_async()
+        .await;
+    let redirect = redirector
+        .mock("POST", "/info")
+        .with_status(302)
+        .with_header("location", &format!("{}/stolen", target.url()))
+        .expect(1)
+        .create_async()
+        .await;
+
+    let client = make_read_only_client(&redirector);
+    let err = client.fetch_meta().await.unwrap_err();
+    assert!(matches!(err, HlError::Exchange { .. }), "got {err:?}");
+    redirect.assert_async().await;
+    target_mock.assert_async().await;
 }

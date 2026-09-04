@@ -9,17 +9,32 @@
 //! 5. log the trigger condition
 //! 6. wait for the trigger → pre-flight sizing → TWAP loop
 
+use std::fs::{self, OpenOptions};
+use std::future::Future;
+use std::io::Write;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use secrecy::SecretString;
+use serde::{Deserialize, Serialize};
 
 use hype_trigger_twap::client::{HlClient, HlConfig, Network, Role, ValidatedMarketSnapshot};
 use hype_trigger_twap::errors::HlError;
 use hype_trigger_twap::format::human;
+use hype_trigger_twap::observability::{
+    ExecutionMode, JournalEventObserver, ObservabilityConfig, ObservabilityRuntime,
+};
+use hype_trigger_twap::position::{
+    apply_signed_fill, is_between_frozen_endpoints, FlattenConfirmation, PositionExecutionPlan,
+    PositionPhase, PositionPhaseKind,
+};
 use hype_trigger_twap::risk::{pre_send_summary, RiskEnvelope};
 use hype_trigger_twap::signer::{Eip712AgentSigner, Signer};
 use hype_trigger_twap::trigger::{
@@ -27,9 +42,702 @@ use hype_trigger_twap::trigger::{
 };
 use hype_trigger_twap::twap::{
     check_clock_skew, compute_sizing, fetch_fresh_book, usd_to_coin, wall_clock_now_ms, ChildAlgo,
-    TwapPlan, MIN_NOTIONAL_USD, READ_ONLY_BANNER,
+    ShutdownSignal, TwapPlan, DEFAULT_SETTLE_RETRIES, MIN_NOTIONAL_USD, READ_ONLY_BANNER,
 };
+use hype_trigger_twap::types::SignedPerpPosition;
 use hype_trigger_twap::types::{Address, Side, Symbol};
+
+/// `--report-json -` reserves stdout for the final machine-readable report.
+/// Tracing uses stderr by default; normal operator text in this module goes
+/// through the two macros below and is suppressed in that mode.
+static REPORT_JSON_STDOUT: AtomicBool = AtomicBool::new(false);
+
+macro_rules! println {
+    ($($arg:tt)*) => {
+        if !REPORT_JSON_STDOUT.load(Ordering::Relaxed) {
+            ::std::println!($($arg)*);
+        }
+    };
+}
+
+macro_rules! print {
+    ($($arg:tt)*) => {
+        if !REPORT_JSON_STDOUT.load(Ordering::Relaxed) {
+            ::std::print!($($arg)*);
+        }
+    };
+}
+
+/// Read and validate a resume journal before any external reconciliation.
+/// This is deliberately separate from the full fingerprint check, which is
+/// possible only after pre-flight sizing has resolved the plan.
+fn validated_resume_replay(
+    state_dir: &std::path::Path,
+    run_id: &str,
+    network: &Network,
+    agent: Option<&Address>,
+    configured_or_resolved_master: Option<&Address>,
+    symbol: &Symbol,
+    ordinary_side: Option<Side>,
+) -> Result<hype_trigger_twap::journal::ValidatedJournalReplay, String> {
+    let records = hype_trigger_twap::journal::ExecutionJournal::read_all(state_dir, run_id)
+        .map_err(|e| format!("--resume {run_id}: failed to read journal: {e}"))?;
+    let replay =
+        hype_trigger_twap::journal::ValidatedJournalReplay::replay(&records).map_err(|e| {
+            format!("--resume {run_id}: invalid journal; refusing external API calls: {e}")
+        })?;
+    let h = replay
+        .summary
+        .header
+        .as_ref()
+        .ok_or_else(|| format!("--resume {run_id}: journal has no Header"))?;
+    let mut mismatch = Vec::new();
+    if h.run_id != run_id {
+        mismatch.push(format!("run_id (requested {run_id}, journal {})", h.run_id));
+    }
+    if h.network != network.to_string() {
+        mismatch.push(format!(
+            "network (expected {}, journal {})",
+            network, h.network
+        ));
+    }
+    if h.agent.as_ref() != agent {
+        mismatch.push(format!(
+            "agent (expected {:?}, journal {:?})",
+            agent.map(Address::as_str),
+            h.agent.as_ref().map(Address::as_str)
+        ));
+    }
+    if configured_or_resolved_master.is_some() && h.master.as_ref() != configured_or_resolved_master
+    {
+        mismatch.push(format!(
+            "master (expected {:?}, journal {:?})",
+            configured_or_resolved_master.map(Address::as_str),
+            h.master.as_ref().map(Address::as_str)
+        ));
+    }
+    if &h.symbol != symbol {
+        mismatch.push(format!(
+            "symbol (expected {}, journal {})",
+            symbol, h.symbol
+        ));
+    }
+    if ordinary_side.is_some_and(|side| h.side != side) {
+        mismatch.push(format!(
+            "side (expected {}, journal {})",
+            ordinary_side.unwrap_or(h.side),
+            h.side
+        ));
+    }
+    for (cloid, intent) in &replay.prepared {
+        if intent.symbol != h.symbol {
+            mismatch.push(format!(
+                "Prepared symbol for cloid {cloid} (header {}, record {})",
+                h.symbol, intent.symbol
+            ));
+        }
+        if ordinary_side.is_some_and(|side| intent.side != side) {
+            mismatch.push(format!(
+                "Prepared side for cloid {cloid} (expected {}, record {})",
+                ordinary_side.unwrap_or(h.side),
+                intent.side
+            ));
+        }
+    }
+    if mismatch.is_empty() {
+        Ok(replay)
+    } else {
+        Err(format!(
+            "--resume {run_id}: journal identity mismatch before external API calls: {}",
+            mismatch.join(", ")
+        ))
+    }
+}
+
+fn parse_public_address(label: &str, value: &str) -> Result<Address, String> {
+    let value = value.trim();
+    let valid = value.len() == 42
+        && value.starts_with("0x")
+        && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit());
+    if !valid {
+        return Err(format!(
+            "{label} must be a public 0x-prefixed 20-byte hex address"
+        ));
+    }
+    Ok(Address::new(value.to_ascii_lowercase()))
+}
+
+/// Stable decimal spelling for journal identity. `rust_decimal::Display`
+/// preserves input scale, so normalising first keeps equivalent CLI values
+/// such as `1`, `1.0`, and `1.000` from producing false resume mismatches.
+fn canonical_decimal(value: Decimal) -> String {
+    value.normalize().to_string()
+}
+
+/// Remaining wall-clock window for a resumed logical run. A strictly
+/// positive remainder is executable even when it is shorter than the
+/// original slice interval; the TWAP loop compresses its continuation into
+/// this window and still checks the same absolute deadline before every send.
+/// At or after the boundary, callers may reconcile/cancel only.
+fn remaining_execution_window(deadline_unix_ms: u64, now_unix_ms: u64) -> Option<Duration> {
+    deadline_unix_ms
+        .checked_sub(now_unix_ms)
+        .filter(|remaining_ms| *remaining_ms > 0)
+        .map(Duration::from_millis)
+}
+
+fn requested_mode_and_value(cli: &Cli) -> (&'static str, String) {
+    if let Some(value) = cli.size {
+        ("size", canonical_decimal(value))
+    } else if let Some(value) = cli.usd {
+        ("usd", canonical_decimal(value))
+    } else if cli.flatten {
+        ("flatten", "0".to_owned())
+    } else if let Some(value) = cli.target_sz {
+        ("target_sz", canonical_decimal(value))
+    } else if let Some(value) = cli.target_usd {
+        ("target_usd", canonical_decimal(value))
+    } else {
+        ("unknown", String::new())
+    }
+}
+
+fn execution_sizing(
+    total_coin: Decimal,
+    slices: u32,
+    sz_decimals: u32,
+    mid: Decimal,
+    require_exact_position_target: bool,
+) -> Result<hype_trigger_twap::twap::Sizing, hype_trigger_twap::twap::PreflightError> {
+    let mut sizing = compute_sizing(total_coin, slices, sz_decimals, mid)?;
+    if require_exact_position_target {
+        // Position phases start and end on the exchange size grid. Keep the
+        // exact phase delta as the final cumulative target so the last slice
+        // absorbs any per-slice truncation; otherwise flatten/target mode can
+        // stop one or more ticks short and can never pass authoritative final
+        // position verification.
+        sizing.total_adjusted = total_coin;
+    }
+    Ok(sizing)
+}
+
+fn child_algo_name(value: ChildAlgoArg) -> &'static str {
+    match value {
+        ChildAlgoArg::Market => "market",
+        ChildAlgoArg::Passive => "passive",
+        ChildAlgoArg::Follow => "follow",
+    }
+}
+
+fn phase_fingerprint(
+    phase: &PositionPhase,
+) -> hype_trigger_twap::journal::PositionPhaseFingerprint {
+    hype_trigger_twap::journal::PositionPhaseFingerprint {
+        kind: match phase.kind {
+            PositionPhaseKind::Adjust => "adjust",
+            PositionPhaseKind::CloseToFlat => "close_to_flat",
+            PositionPhaseKind::OpenFromFlat => "open_from_flat",
+        }
+        .to_owned(),
+        side: phase.side.to_string(),
+        size: canonical_decimal(phase.size),
+        reduce_only: phase.reduce_only,
+    }
+}
+
+fn parse_canonical_fingerprint_decimal(
+    run_id: &str,
+    field: &'static str,
+    value: &str,
+) -> Result<Decimal, String> {
+    let parsed: Decimal = value
+        .parse()
+        .map_err(|_| format!("--resume {run_id}: invalid stored {field}"))?;
+    if canonical_decimal(parsed) != value {
+        return Err(format!(
+            "--resume {run_id}: stored {field} is not canonical; refusing new orders"
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Prove the durable sizing tuple is the deterministic result of one frozen
+/// requested coin quantity. This prevents any one persisted sizing field from
+/// silently becoming authoritative after journal corruption or manual edits.
+fn validate_fingerprint_sizing(
+    run_id: &str,
+    fingerprint: &hype_trigger_twap::journal::ExecutionPlanFingerprint,
+    expected_total_requested: Decimal,
+    expected_reduce_only: bool,
+    sz_decimals: u32,
+    require_exact_position_target: bool,
+) -> Result<(), String> {
+    if fingerprint.slices == 0 {
+        return Err(format!(
+            "--resume {run_id}: stored slices must be positive; refusing new orders"
+        ));
+    }
+    let per_slice =
+        parse_canonical_fingerprint_decimal(run_id, "per_slice", &fingerprint.per_slice)?;
+    let total_adjusted =
+        parse_canonical_fingerprint_decimal(run_id, "total_adjusted", &fingerprint.total_adjusted)?;
+    let total_requested = parse_canonical_fingerprint_decimal(
+        run_id,
+        "total_requested",
+        &fingerprint.total_requested,
+    )?;
+    if expected_total_requested <= Decimal::ZERO
+        || per_slice <= Decimal::ZERO
+        || total_adjusted <= Decimal::ZERO
+        || total_requested <= Decimal::ZERO
+    {
+        return Err(format!(
+            "--resume {run_id}: stored sizing must be positive; refusing new orders"
+        ));
+    }
+
+    let expected_per_slice = hype_trigger_twap::format::round_size(
+        expected_total_requested / Decimal::from(fingerprint.slices),
+        sz_decimals,
+    );
+    let expected_total_adjusted = if require_exact_position_target {
+        expected_total_requested
+    } else {
+        expected_per_slice
+            .checked_mul(Decimal::from(fingerprint.slices))
+            .ok_or_else(|| format!("--resume {run_id}: stored sizing overflows"))?
+    };
+    let mut mismatches = Vec::new();
+    if total_requested != expected_total_requested {
+        mismatches.push("total_requested");
+    }
+    if per_slice != expected_per_slice {
+        mismatches.push("per_slice");
+    }
+    if total_adjusted != expected_total_adjusted {
+        mismatches.push("total_adjusted");
+    }
+    if fingerprint.reduce_only != expected_reduce_only {
+        mismatches.push("reduce_only");
+    }
+    if !mismatches.is_empty() {
+        return Err(format!(
+            "--resume {run_id}: execution plan fingerprint mismatch in {}; refusing new orders",
+            mismatches.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// Validate every execution-affecting CLI field after unresolved cloids were
+/// reconciled but before a trigger/book/position request can lead to a new
+/// order. Legacy fingerprints remain readable for reconciliation, but are
+/// intentionally not sufficient authority for continuation.
+fn validate_resume_execution_fingerprint(
+    run_id: &str,
+    replay: &hype_trigger_twap::journal::ValidatedJournalReplay,
+    cli: &Cli,
+    network: &Network,
+    agent: Option<&Address>,
+    master: Option<&Address>,
+    sz_decimals: u32,
+) -> Result<Option<PositionExecutionPlan>, String> {
+    let header = replay
+        .summary
+        .header
+        .as_ref()
+        .ok_or_else(|| format!("--resume {run_id}: journal has no Header"))?;
+    let Some(stored) = header.execution_fingerprint.as_ref() else {
+        return Err(format!(
+            "--resume {run_id}: legacy journal has no typed execution fingerprint; unresolved \
+             orders were reconciled, but safely reconstructing new orders is impossible. \
+             Inspect the run, then use --abandon-incomplete-run."
+        ));
+    };
+    if stored.version != hype_trigger_twap::journal::ExecutionPlanFingerprint::VERSION {
+        return Err(format!(
+            "--resume {run_id}: fingerprint version {} is unsupported (current {}); unresolved \
+             orders were reconciled, but no new order will be sent. Inspect the run, then use \
+             --abandon-incomplete-run.",
+            stored.version,
+            hype_trigger_twap::journal::ExecutionPlanFingerprint::VERSION
+        ));
+    }
+    let mut mismatches = Vec::new();
+    macro_rules! expect_eq {
+        ($name:literal, $actual:expr, $expected:expr) => {
+            if $actual != $expected {
+                mismatches.push($name);
+            }
+        };
+    }
+    let (request_mode, request_value) = requested_mode_and_value(cli);
+    expect_eq!("request_mode", stored.request_mode.as_str(), request_mode);
+    expect_eq!("request_value", stored.request_value, request_value);
+    expect_eq!("network", stored.network, network.to_string());
+    expect_eq!("agent", stored.agent.as_deref(), agent.map(Address::as_str));
+    expect_eq!(
+        "master",
+        stored.master.as_deref(),
+        master.map(Address::as_str)
+    );
+    expect_eq!("symbol", stored.symbol, header.symbol.as_str());
+    expect_eq!("side", stored.side, header.side.to_string());
+    expect_eq!("header.slices", stored.slices, header.slices);
+    expect_eq!("slices", stored.slices, cli.slices);
+    expect_eq!(
+        "duration_ms",
+        stored.duration_ms,
+        cli.duration.as_millis().try_into().unwrap_or(u64::MAX)
+    );
+    expect_eq!(
+        "slippage_bps",
+        stored.slippage_bps,
+        canonical_decimal(cli.slippage_bps)
+    );
+    expect_eq!(
+        "max_notional_usd",
+        stored.max_notional_usd,
+        canonical_decimal(cli.max_notional_usd.unwrap_or(Decimal::MAX))
+    );
+    expect_eq!(
+        "max_book_age_ms",
+        stored.max_book_age_ms,
+        cli.max_book_age_ms
+    );
+    expect_eq!("settle_retries", stored.settle_retries, cli.settle_retries);
+    expect_eq!(
+        "child_algo",
+        stored.child_algo.as_str(),
+        child_algo_name(cli.child_algo)
+    );
+    expect_eq!(
+        "follow_poll_secs",
+        stored.follow_poll_secs,
+        cli.follow_poll_secs
+    );
+    expect_eq!(
+        "follow_repost_secs",
+        stored.follow_repost_secs,
+        cli.follow_repost_secs
+    );
+    expect_eq!(
+        "follow_threshold_bps",
+        stored.follow_threshold_bps,
+        canonical_decimal(cli.follow_threshold_bps)
+    );
+    expect_eq!(
+        "absolute_deadline_unix_ms",
+        stored.absolute_deadline_unix_ms,
+        header.execution_deadline_unix_ms
+    );
+    if let Some(requested_deadline) = cli.flatten_deadline_unix_ms {
+        if Some(requested_deadline) != header.execution_deadline_unix_ms {
+            mismatches.push("flatten_deadline_unix_ms");
+        }
+    }
+    if !mismatches.is_empty() {
+        return Err(format!(
+            "--resume {run_id}: execution plan fingerprint mismatch in {}; refusing new orders",
+            mismatches.join(", ")
+        ));
+    }
+    let position_mode = stored.position_mode.as_deref();
+    if position_mode.is_none() {
+        if cli.flatten || cli.target_sz.is_some() || cli.target_usd.is_some() {
+            return Err(format!(
+                "--resume {run_id}: ordinary journal cannot be resumed as a position target"
+            ));
+        }
+        if stored.initial_position_szi.is_some()
+            || stored.target_position_szi.is_some()
+            || stored.position_requested_value.is_some()
+            || stored.position_reference_price.is_some()
+            || !stored.position_phases.is_empty()
+        {
+            return Err(format!(
+                "--resume {run_id}: ordinary fingerprint contains position-only fields; refusing new orders"
+            ));
+        }
+        let stored_total = parse_canonical_fingerprint_decimal(
+            run_id,
+            "total_requested",
+            &stored.total_requested,
+        )?;
+        let expected_total = match request_mode {
+            "size" => {
+                parse_canonical_fingerprint_decimal(run_id, "request_value", &stored.request_value)?
+            }
+            // USD sizing was frozen against the original book. The raw USD
+            // request is checked above; its durable coin quantity is then
+            // checked for canonical, internally consistent rounding below.
+            "usd" => stored_total,
+            _ => {
+                return Err(format!(
+                    "--resume {run_id}: invalid ordinary request mode {request_mode}"
+                ))
+            }
+        };
+        validate_fingerprint_sizing(run_id, stored, expected_total, false, sz_decimals, false)?;
+        return Ok(None);
+    }
+    if position_mode != Some(request_mode) {
+        return Err(format!(
+            "--resume {run_id}: stored position mode {:?} does not match --{request_mode}",
+            position_mode.unwrap_or_default()
+        ));
+    }
+    let initial_szi = parse_canonical_fingerprint_decimal(
+        run_id,
+        "initial_position_szi",
+        stored
+            .initial_position_szi
+            .as_deref()
+            .ok_or_else(|| format!("--resume {run_id}: fingerprint lacks initial_position_szi"))?,
+    )?;
+    let target_szi = parse_canonical_fingerprint_decimal(
+        run_id,
+        "target_position_szi",
+        stored
+            .target_position_szi
+            .as_deref()
+            .ok_or_else(|| format!("--resume {run_id}: fingerprint lacks target_position_szi"))?,
+    )?;
+    let initial = SignedPerpPosition {
+        symbol: header.symbol.clone(),
+        szi: initial_szi,
+    };
+    let frozen = match position_mode.unwrap_or_default() {
+        "flatten" => PositionExecutionPlan::flatten(&initial, &header.symbol, sz_decimals),
+        "target_sz" => PositionExecutionPlan::target_size(
+            &initial,
+            &header.symbol,
+            cli.target_sz.ok_or_else(|| {
+                format!("--resume {run_id}: stored target_sz requires --target-sz")
+            })?,
+            sz_decimals,
+        ),
+        "target_usd" => {
+            let reference = parse_canonical_fingerprint_decimal(
+                run_id,
+                "position_reference_price",
+                stored.position_reference_price.as_deref().ok_or_else(|| {
+                    format!("--resume {run_id}: target_usd fingerprint lacks reference price")
+                })?,
+            )?;
+            PositionExecutionPlan::target_usd(
+                &initial,
+                &header.symbol,
+                cli.target_usd.ok_or_else(|| {
+                    format!("--resume {run_id}: stored target_usd requires --target-usd")
+                })?,
+                reference,
+                sz_decimals,
+            )
+        }
+        other => {
+            return Err(format!(
+                "--resume {run_id}: unknown stored position mode {other}"
+            ))
+        }
+    }
+    .map_err(|e| format!("--resume {run_id}: invalid frozen position plan: {e}"))?;
+    if frozen.target_szi != target_szi {
+        return Err(format!(
+            "--resume {run_id}: frozen target mismatch (fingerprint {target_szi}, reconstructed {})",
+            frozen.target_szi
+        ));
+    }
+    let phases: Vec<_> = frozen.phases.iter().map(phase_fingerprint).collect();
+    if phases != stored.position_phases
+        || frozen
+            .phases
+            .first()
+            .is_some_and(|phase| phase.side != header.side)
+    {
+        return Err(format!(
+            "--resume {run_id}: frozen position phase sequence is inconsistent; refusing new orders"
+        ));
+    }
+    let expected_position_requested = match position_mode.unwrap_or_default() {
+        "flatten" => None,
+        _ => Some(request_value.as_str()),
+    };
+    if stored.position_requested_value.as_deref() != expected_position_requested {
+        return Err(format!(
+            "--resume {run_id}: execution plan fingerprint mismatch in position_requested_value; refusing new orders"
+        ));
+    }
+    if position_mode != Some("target_usd") && stored.position_reference_price.is_some() {
+        return Err(format!(
+            "--resume {run_id}: execution plan fingerprint mismatch in position_reference_price; refusing new orders"
+        ));
+    }
+    let first_phase = frozen.phases.first().ok_or_else(|| {
+        format!("--resume {run_id}: stored position plan has no executable phase")
+    })?;
+    validate_fingerprint_sizing(
+        run_id,
+        stored,
+        first_phase.size,
+        first_phase.reduce_only,
+        sz_decimals,
+        true,
+    )?;
+    Ok(Some(frozen))
+}
+
+fn expected_position_from_replay(
+    run_id: &str,
+    replay: &hype_trigger_twap::journal::ValidatedJournalReplay,
+    frozen: &PositionExecutionPlan,
+) -> Result<Decimal, String> {
+    let expected_side = if frozen.target_szi > frozen.current_szi {
+        Some(Side::Long)
+    } else if frozen.target_szi < frozen.current_szi {
+        Some(Side::Short)
+    } else {
+        None
+    };
+    let mut expected = frozen.current_szi;
+    for (cloid, state) in &replay.summary.cloids {
+        let hype_trigger_twap::journal::CloidState::Terminal { filled_sz, .. } = state else {
+            continue;
+        };
+        let intent = replay.prepared.get(cloid).ok_or_else(|| {
+            format!("--resume {run_id}: terminal cloid {cloid} lacks validated Prepared intent")
+        })?;
+        if expected_side.is_some_and(|side| intent.side != side) {
+            return Err(format!(
+                "--resume {run_id}: durable cloid {cloid} moves away from the frozen target"
+            ));
+        }
+        let filled: Decimal = filled_sz
+            .parse()
+            .map_err(|_| format!("--resume {run_id}: invalid terminal fill for {cloid}"))?;
+        expected = apply_signed_fill(expected, intent.side, filled)
+            .map_err(|e| format!("--resume {run_id}: cannot reconstruct position: {e}"))?;
+        if !is_between_frozen_endpoints(expected, frozen.current_szi, frozen.target_szi) {
+            return Err(format!(
+                "--resume {run_id}: durable fills imply position {expected} beyond frozen target {}; refusing automatic reversal",
+                frozen.target_szi
+            ));
+        }
+    }
+    Ok(expected)
+}
+
+/// Stable, secret-free operator preview of every value bound into a live
+/// flatten confirmation token.  Keep field labels equal to the serialized
+/// [`FlattenConfirmation`] fields so an operator can compare a read-only
+/// preparation with the later live invocation without reverse-engineering a
+/// hash.  This deliberately does not include the agent key or any endpoint.
+fn format_flatten_confirmation_preflight(confirmation: &FlattenConfirmation) -> String {
+    format!(
+        "FLATTEN PREFLIGHT:\nnetwork: {}\nmaster: {}\nsymbol: {}\ninitial_szi: {}\nclose_side: {}\nmax_close_size: {}\nmax_notional_usd: {}\nchild_algo: {}\nexecution_deadline_unix_ms: {}",
+        confirmation.network,
+        confirmation.master,
+        confirmation.symbol,
+        canonical_decimal(confirmation.initial_szi),
+        confirmation.close_side,
+        canonical_decimal(confirmation.max_close_size),
+        canonical_decimal(confirmation.max_notional_usd),
+        confirmation.child_algo,
+        confirmation.execution_deadline_unix_ms,
+    )
+}
+
+fn execution_fingerprint(
+    network: &Network,
+    plan: &TwapPlan,
+    position_plan: Option<&PositionExecutionPlan>,
+    cli: &Cli,
+    position_reference_price: Option<Decimal>,
+) -> hype_trigger_twap::journal::ExecutionPlanFingerprint {
+    let child_algo = match plan.child_algo {
+        ChildAlgo::Market => "market",
+        ChildAlgo::Passive => "passive",
+        ChildAlgo::Follow => "follow",
+    };
+    let position_mode = if cli.flatten {
+        Some("flatten".to_owned())
+    } else if cli.target_sz.is_some() {
+        Some("target_sz".to_owned())
+    } else if cli.target_usd.is_some() {
+        Some("target_usd".to_owned())
+    } else {
+        None
+    };
+    let position_requested_value = cli.target_sz.or(cli.target_usd).map(canonical_decimal);
+    let position_phases = position_plan
+        .map(|value| {
+            value
+                .phases
+                .iter()
+                .map(
+                    |phase| hype_trigger_twap::journal::PositionPhaseFingerprint {
+                        kind: match phase.kind {
+                            PositionPhaseKind::Adjust => "adjust",
+                            PositionPhaseKind::CloseToFlat => "close_to_flat",
+                            PositionPhaseKind::OpenFromFlat => "open_from_flat",
+                        }
+                        .to_owned(),
+                        side: phase.side.to_string(),
+                        size: canonical_decimal(phase.size),
+                        reduce_only: phase.reduce_only,
+                    },
+                )
+                .collect()
+        })
+        .unwrap_or_default();
+    let (request_mode, request_value) = if let Some(value) = cli.size {
+        ("size", canonical_decimal(value))
+    } else if let Some(value) = cli.usd {
+        ("usd", canonical_decimal(value))
+    } else if cli.flatten {
+        ("flatten", "0".to_owned())
+    } else if let Some(value) = cli.target_sz {
+        ("target_sz", canonical_decimal(value))
+    } else if let Some(value) = cli.target_usd {
+        ("target_usd", canonical_decimal(value))
+    } else {
+        ("unknown", String::new())
+    };
+    hype_trigger_twap::journal::ExecutionPlanFingerprint {
+        version: hype_trigger_twap::journal::ExecutionPlanFingerprint::VERSION,
+        symbol: plan.symbol.as_str().to_owned(),
+        side: plan.side.to_string(),
+        request_mode: request_mode.to_owned(),
+        request_value,
+        per_slice: canonical_decimal(plan.per_slice),
+        total_adjusted: canonical_decimal(plan.total_adjusted),
+        total_requested: canonical_decimal(plan.total_requested),
+        slices: plan.slices,
+        duration_ms: plan.duration.as_millis().try_into().unwrap_or(u64::MAX),
+        slippage_bps: canonical_decimal(plan.slippage_bps),
+        max_notional_usd: canonical_decimal(plan.max_notional_usd),
+        max_book_age_ms: plan.max_book_age_ms,
+        settle_retries: plan.settle_retries,
+        child_algo: child_algo.to_owned(),
+        follow_poll_secs: plan.follow_poll_secs,
+        follow_repost_secs: plan.follow_repost_secs,
+        follow_threshold_bps: canonical_decimal(plan.follow_threshold_bps),
+        network: network.to_string(),
+        agent: plan.agent.as_ref().map(|a| a.as_str().to_owned()),
+        master: plan.master.as_ref().map(|a| a.as_str().to_owned()),
+        position_mode,
+        initial_position_szi: position_plan.map(|value| canonical_decimal(value.current_szi)),
+        target_position_szi: position_plan.map(|value| canonical_decimal(value.target_szi)),
+        position_requested_value,
+        position_reference_price: cli
+            .target_usd
+            .and(position_reference_price)
+            .map(canonical_decimal),
+        position_phases,
+        reduce_only: plan.reduce_only,
+        absolute_deadline_unix_ms: plan.absolute_deadline_unix_ms,
+    }
+}
 
 /// F3: `long_about = None` makes clap drop the struct's doc comment, so the
 /// environment contract would otherwise be invisible to `--help`. These are the
@@ -46,10 +754,11 @@ ENVIRONMENT VARIABLES:
                       account. If set, it is checked against the address derived
                       from HL_AGENT_PK and startup fails on a mismatch.
 
-  HL_MASTER_ADDRESS   Optional. The MASTER account the agent belongs to. Live
-                      mode discovers this automatically via the HL `userRole`
-                      probe; if you also set it here, the two must agree or
-                      startup fails.
+  HL_MASTER_ADDRESS   The MASTER account the agent belongs to. Optional for a
+                      new live run, which discovers it via `userRole`; required
+                      for --resume/--abandon-incomplete-run so journal identity
+                      is checked before any external API call. When supplied,
+                      it must agree with the `userRole` response.
 
   HL_INFO_URL         Optional. Override the /info endpoint (testing). In LIVE
                       mode this is rejected by default (Issue #3) unless
@@ -148,20 +857,58 @@ struct Cli {
     #[arg(long)]
     symbol: String,
 
-    /// Trade direction.
+    /// Trade direction for ordinary `--size` / `--usd` execution. Position
+    /// modes derive it from the signed current/target exposure instead.
     #[arg(long, value_enum)]
-    side: SideArg,
+    side: Option<SideArg>,
 
     /// Quantity in coin units. Mutually exclusive with --usd.
-    #[arg(long, conflicts_with = "usd")]
+    #[arg(long, conflicts_with_all = ["usd", "flatten", "target_sz", "target_usd"])]
     size: Option<Decimal>,
 
     /// Notional in USD. Converted to a coin quantity at the mid observed when
     /// the trigger fires, and FIXED from then on — if price moves during the
     /// window the executed notional will drift from this number. Mutually
     /// exclusive with --size.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["size", "flatten", "target_sz", "target_usd"])]
     usd: Option<Decimal>,
+
+    /// Safely close this symbol's current perpetual position. The side and
+    /// maximum close size are read from clearinghouseState; every child order
+    /// is reduce-only. Live mode additionally requires --confirm-flatten.
+    #[arg(long, conflicts_with_all = ["target_sz", "target_usd"])]
+    flatten: bool,
+
+    /// Operator token printed by the corresponding flatten preflight.
+    #[arg(long, requires = "flatten")]
+    confirm_flatten: Option<String>,
+
+    /// Absolute Unix-ms deadline used to bind a live flatten confirmation.
+    /// Supplying it makes a token reproducible across the read-only prepare
+    /// and live confirm invocations.
+    #[arg(long)]
+    flatten_deadline_unix_ms: Option<u64>,
+
+    /// Signed final perpetual size (positive long, negative short).
+    #[arg(long, conflicts_with = "target_usd", allow_hyphen_values = true)]
+    target_sz: Option<Decimal>,
+
+    /// Signed final USD exposure. Converted once at the validated preflight
+    /// mid and frozen as a conservatively rounded target size.
+    #[arg(long, conflicts_with = "target_sz", allow_hyphen_values = true)]
+    target_usd: Option<Decimal>,
+
+    /// Render the preflight position plan as JSON (the default is a compact
+    /// operator-readable plan). This never changes execution semantics.
+    #[arg(long, default_value_t = false)]
+    json: bool,
+
+    /// Master account used for read-only position planning and required for
+    /// live resume/abandon identity validation before any external API call.
+    /// On a new live run, userRole remains authoritative and must agree with
+    /// this value when supplied.
+    #[arg(long)]
+    master_address: Option<String>,
 
     /// Execution window, e.g. 30m, 2h.
     #[arg(long, value_parser = parse_duration)]
@@ -190,6 +937,21 @@ struct Cli {
     /// slice prints the order it would have placed from the live book.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     read_only: bool,
+
+    /// Optional Prometheus listen address. If set, loopback addresses are
+    /// accepted by default; a non-loopback bind additionally requires
+    /// --allow-external-metrics.
+    #[arg(long, env = "HL_METRICS_BIND")]
+    metrics_bind: Option<SocketAddr>,
+
+    /// Explicitly allow a metrics listener on a non-loopback interface.
+    #[arg(long, env = "HL_ALLOW_EXTERNAL_METRICS", default_value_t = false)]
+    allow_external_metrics: bool,
+
+    /// Optional state-free JSONL event stream for a read-only simulation.
+    /// Live runs always use their journal-adjacent events.jsonl sidecar.
+    #[arg(long)]
+    event_jsonl: Option<PathBuf>,
 
     /// Selects both the API endpoints and the EIP-712 Agent.source domain
     /// ("a" mainnet / "b" testnet) — the two can never disagree.
@@ -229,6 +991,11 @@ struct Cli {
     /// check. A negative age (HL clock ahead of ours) counts as fresh.
     #[arg(long, default_value_t = 3000)]
     max_book_age_ms: u64,
+
+    /// Maximum orderStatus polls while settling a known resting child after
+    /// cancellation.  Does not alter ambiguous-place reconciliation/resend.
+    #[arg(long, env = "HL_SETTLE_RETRIES", default_value_t = DEFAULT_SETTLE_RETRIES)]
+    settle_retries: u32,
 
     /// Seconds between l2Book polls while waiting for the trigger.
     #[arg(long, default_value_t = 2)]
@@ -284,6 +1051,11 @@ struct Cli {
     #[arg(long, value_parser = parse_duration, default_value = "60s")]
     shutdown_grace: Duration,
 
+    /// Write the final live journal report as schema-versioned JSON. Use `-`
+    /// to reserve stdout for that JSON; any file target is atomically replaced.
+    #[arg(long)]
+    report_json: Option<PathBuf>,
+
     /// Child-order algorithm for each slice (Issue #1). `market` (default)
     /// reproduces pre-Issue-#1 behaviour exactly: an IOC taker limit at
     /// mid +/- slippage-bps. `passive` places a post-only (ALO) limit at the
@@ -313,17 +1085,265 @@ struct Cli {
     /// warning) by other child algos.
     #[arg(long, default_value = "1.0")]
     follow_threshold_bps: Decimal,
+
+    /// Pair-launcher coordination only.  These four arguments are an
+    /// all-or-nothing interface: after this process has completed every
+    /// pre-flight step it atomically publishes readiness, then it waits for
+    /// the launcher's authenticated common start timestamp before any order
+    /// can be submitted.
+    #[arg(long)]
+    pair_ready_file: Option<PathBuf>,
+
+    /// File written by the pair launcher with the common future start time.
+    #[arg(long)]
+    pair_start_file: Option<PathBuf>,
+
+    /// Opaque pair-run identity, supplied by the pair launcher.
+    #[arg(long)]
+    pair_run_id: Option<String>,
+
+    /// Maximum time to wait for the common start release.
+    #[arg(long, value_parser = parse_duration)]
+    pair_barrier_timeout: Option<Duration>,
+}
+
+#[derive(Debug, Clone)]
+struct PairBarrier {
+    ready_file: PathBuf,
+    start_file: PathBuf,
+    run_id: String,
+    timeout: Duration,
+}
+
+#[derive(Debug, Serialize)]
+struct PairReadyFile<'a> {
+    run_id: &'a str,
+    ready_at_unix_ms: u64,
+    pid: u32,
+    /// Live legs create their durable journal before entering the pair
+    /// barrier.  Publish that exact run id so the launcher never has to
+    /// guess by scanning a shared state root.  Read-only has no journal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    journal_run_id: Option<&'a str>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PairStartFile {
+    run_id: String,
+    start_at_unix_ms: u64,
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
     humantime::parse_duration(s).map_err(|e| format!("invalid duration '{s}': {e}"))
 }
 
+fn valid_pair_run_id(run_id: &str) -> bool {
+    !run_id.is_empty()
+        && run_id.len() <= 128
+        && run_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn validate_barrier_path(path: &Path, flag: &str) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!("{flag} must be an absolute path"));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{flag} must have a parent directory"))?;
+    let metadata = fs::symlink_metadata(parent)
+        .map_err(|e| format!("{flag} parent {} is unavailable: {e}", parent.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "{flag} parent {} must be a real directory (not a symlink)",
+            parent.display()
+        ));
+    }
+    Ok(())
+}
+
+impl Cli {
+    fn pair_barrier(&self) -> Result<Option<PairBarrier>, String> {
+        let supplied = [
+            self.pair_ready_file.is_some(),
+            self.pair_start_file.is_some(),
+            self.pair_run_id.is_some(),
+            self.pair_barrier_timeout.is_some(),
+        ];
+        if supplied.iter().any(|v| *v) && !supplied.iter().all(|v| *v) {
+            return Err("--pair-ready-file, --pair-start-file, --pair-run-id, and --pair-barrier-timeout must be supplied together".into());
+        }
+        if !supplied.iter().all(|v| *v) {
+            return Ok(None);
+        }
+        let (ready_file, start_file, run_id, timeout) = match (
+            self.pair_ready_file.clone(),
+            self.pair_start_file.clone(),
+            self.pair_run_id.clone(),
+            self.pair_barrier_timeout,
+        ) {
+            (Some(ready_file), Some(start_file), Some(run_id), Some(timeout)) => {
+                (ready_file, start_file, run_id, timeout)
+            }
+            _ => return Err("internal pair barrier option validation error".into()),
+        };
+        if timeout.is_zero() {
+            return Err("--pair-barrier-timeout must be > 0".into());
+        }
+        if !valid_pair_run_id(&run_id) {
+            return Err("--pair-run-id must contain only ASCII letters, digits, '.', '_' or '-' (1..128 bytes)".into());
+        }
+        validate_barrier_path(&ready_file, "--pair-ready-file")?;
+        validate_barrier_path(&start_file, "--pair-start-file")?;
+        if ready_file == start_file {
+            return Err("--pair-ready-file and --pair-start-file must differ".into());
+        }
+        if fs::symlink_metadata(&ready_file).is_ok() {
+            return Err(format!(
+                "--pair-ready-file already exists (refusing stale/reused barrier): {}",
+                ready_file.display()
+            ));
+        }
+        Ok(Some(PairBarrier {
+            ready_file,
+            start_file,
+            run_id,
+            timeout,
+        }))
+    }
+}
+
+fn write_pair_ready_file(
+    barrier: &PairBarrier,
+    journal_run_id: Option<&str>,
+) -> Result<(), String> {
+    let parent = barrier
+        .ready_file
+        .parent()
+        .ok_or_else(|| "pair ready file has no parent directory".to_string())?;
+    let temporary = parent.join(format!(
+        ".pair-ready-{}-{}-{}.tmp",
+        barrier.run_id,
+        std::process::id(),
+        uuid::Uuid::now_v7()
+    ));
+    let result = (|| -> Result<(), String> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|e| format!("creating pair ready file failed: {e}"))?;
+        serde_json::to_writer(
+            &mut file,
+            &PairReadyFile {
+                run_id: &barrier.run_id,
+                ready_at_unix_ms: wall_clock_now_ms(),
+                pid: std::process::id(),
+                journal_run_id,
+            },
+        )
+        .map_err(|e| format!("encoding pair ready file failed: {e}"))?;
+        file.write_all(b"\n")
+            .map_err(|e| format!("writing pair ready file failed: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("syncing pair ready file failed: {e}"))?;
+        // hard_link is create-only at the final name, unlike rename which
+        // could silently replace a file supplied by another process.
+        fs::hard_link(&temporary, &barrier.ready_file).map_err(|e| {
+            format!("publishing pair ready file failed (it may already exist): {e}")
+        })?;
+        fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| format!("syncing pair ready directory failed: {e}"))?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(&temporary);
+    result
+}
+
+async fn wait_for_pair_start(
+    barrier: &PairBarrier,
+    journal_run_id: Option<&str>,
+) -> Result<(), String> {
+    write_pair_ready_file(barrier, journal_run_id)?;
+    let deadline = tokio::time::Instant::now() + barrier.timeout;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "pair barrier timed out after {:?}; no order was placed",
+                barrier.timeout
+            ));
+        }
+        match fs::symlink_metadata(&barrier.start_file) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(
+                        "pair start file must be a regular non-symlink file; no order was placed"
+                            .into(),
+                    );
+                }
+                let contents = fs::read_to_string(&barrier.start_file).map_err(|e| {
+                    format!("reading pair start file failed; no order was placed: {e}")
+                })?;
+                let start: PairStartFile = serde_json::from_str(&contents)
+                    .map_err(|e| format!("invalid pair start file; no order was placed: {e}"))?;
+                if start.run_id != barrier.run_id {
+                    return Err("pair start file run_id mismatch; no order was placed".into());
+                }
+                let now = wall_clock_now_ms();
+                if start.start_at_unix_ms <= now {
+                    return Err("pair start time is not in the future; no order was placed".into());
+                }
+                let wait = Duration::from_millis(start.start_at_unix_ms.saturating_sub(now));
+                if tokio::time::Instant::now() + wait > deadline {
+                    return Err(
+                        "pair start time exceeds barrier timeout; no order was placed".into(),
+                    );
+                }
+                tokio::time::sleep(wait).await;
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => {
+                return Err(format!(
+                    "checking pair start file failed; no order was placed: {e}"
+                ))
+            }
+        }
+    }
+}
+
 impl Cli {
     /// §4 step 1: argument validation that clap cannot express.
     fn validate(&self) -> Result<(), String> {
-        if self.size.is_none() && self.usd.is_none() {
-            return Err("exactly one of --size or --usd is required".into());
+        if !self.read_only && self.event_jsonl.is_some() {
+            return Err(
+                "--event-jsonl is for read-only simulations; live runs use the run-directory events.jsonl sidecar"
+                    .into(),
+            );
+        }
+        let position_mode = self.flatten || self.target_sz.is_some() || self.target_usd.is_some();
+        if position_mode {
+            if self.size.is_some() || self.usd.is_some() {
+                return Err("position modes cannot be combined with --size or --usd".into());
+            }
+            if self.side.is_some() {
+                return Err(
+                    "position modes derive side from current and target exposure; omit --side"
+                        .into(),
+                );
+            }
+        } else {
+            if self.size.is_none() && self.usd.is_none() {
+                return Err("exactly one of --size or --usd is required".into());
+            }
+            if self.side.is_none() {
+                return Err("--side is required with --size or --usd".into());
+            }
         }
         if let Some(sz) = self.size {
             if sz <= Decimal::ZERO {
@@ -340,6 +1360,12 @@ impl Cli {
         }
         if self.slices == 0 {
             return Err("--slices must be > 0".into());
+        }
+        if self.settle_retries == 0 {
+            return Err("--settle-retries must be > 0".into());
+        }
+        if self.flatten_deadline_unix_ms.is_some() && !self.flatten {
+            return Err("--flatten-deadline-unix-ms requires --flatten".into());
         }
         // Issue #3: slippage bounds are enforced by the single risk-policy
         // module (src/risk.rs) — CLI validation and the twap.rs slice loop
@@ -451,6 +1477,25 @@ async fn run() -> Result<ExitCode, String> {
     run_with_cli(Cli::parse()).await
 }
 
+/// Race the complete live execution lifecycle against one grace window that
+/// starts only after cooperative shutdown is requested.  Keeping this outside
+/// the TWAP loop is intentional: position-aware execution has additional
+/// close-to-flat and final-position reads after a phase returns, and those
+/// reads must not outlive `--shutdown-grace` either.
+async fn complete_before_shutdown_grace<T>(
+    execution: impl Future<Output = T>,
+    mut shutdown: ShutdownSignal,
+    grace: Duration,
+) -> Result<T, ()> {
+    tokio::select! {
+        output = execution => Ok(output),
+        _ = async move {
+            shutdown.wait().await;
+            tokio::time::sleep(grace).await;
+        } => Err(()),
+    }
+}
+
 /// The body of `run()`, taking an already-parsed [`Cli`] rather than reading
 /// `std::env::args()` itself. This split exists purely as a test seam: it
 /// lets `#[cfg(test)]` drive a full pre-wait/post-trigger `run()` execution
@@ -459,11 +1504,70 @@ async fn run() -> Result<ExitCode, String> {
 /// without needing `Cli::parse()` to read real process argv. `run()` itself
 /// is unchanged in every other respect — same validation, same behavior.
 async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
+    let report_to_stdout = cli
+        .report_json
+        .as_deref()
+        .is_some_and(|path| path == Path::new("-"));
+    REPORT_JSON_STDOUT.store(report_to_stdout, Ordering::Relaxed);
     cli.validate()?;
+    // Observability is never part of the trading critical path. The hook URL
+    // is env-only so a bearer token cannot reach argv/history/ps. Any invalid
+    // URL, listener bind, or hook setup simply disables observability while
+    // preserving the same trading flow and exit status.
+    let observability_config = ObservabilityConfig {
+        metrics_bind: cli.metrics_bind,
+        allow_external_metrics_bind: cli.allow_external_metrics,
+        alert_hook_url: std::env::var("HL_ALERT_HOOK_URL").ok(),
+        ..ObservabilityConfig::default()
+    };
+    let observability = match ObservabilityRuntime::start(&observability_config).await {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            tracing::warn!("observability setup failed; continuing with journal-only execution");
+            ObservabilityRuntime::disabled()
+        }
+    };
+    let result = async {
+    if cli.read_only && cli.report_json.is_some() {
+        return Err("--report-json is available only with --read-only false".into());
+    }
+    // Resolve this before any network operation.  The actual ready publication
+    // is deliberately deferred until all normal pre-flight/journal work is
+    // complete below.
+    let pair_barrier = cli.pair_barrier()?;
 
     let symbol = Symbol::new(&cli.symbol);
-    let side: Side = cli.side.into();
+    // Position modes derive a side later from the signed position plan.  The
+    // placeholder is never used to construct an order before it is replaced.
+    let mut side: Side = cli.side.map(Into::into).unwrap_or(Side::Long);
     let network: Network = cli.network.into();
+    let position_mode_requested =
+        cli.flatten || cli.target_sz.is_some() || cli.target_usd.is_some();
+    let configured_master_raw = cli
+        .master_address
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            std::env::var("HL_MASTER_ADDRESS")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        });
+    let configured_master = configured_master_raw
+        .as_deref()
+        .map(|value| parse_public_address("master address", value))
+        .transpose()?;
+    if !cli.read_only
+        && (cli.resume.is_some() || cli.abandon_incomplete_run)
+        && configured_master.is_none()
+    {
+        return Err(
+            "--resume and --abandon-incomplete-run require --master-address or HL_MASTER_ADDRESS so journal master identity can be verified before any external API call"
+                .into(),
+        );
+    }
 
     if cli.read_only {
         println!("{READ_ONLY_BANNER}");
@@ -517,10 +1621,10 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         // HL_AGENT_ADDRESS is the AGENT's address (the API wallet), NOT the
         // master account. A mismatch means the wrong key is loaded.
         if let Ok(expected) = std::env::var("HL_AGENT_ADDRESS") {
-            let expected_norm = expected.trim().to_lowercase();
-            if expected_norm != derived.as_str() {
+            let expected = parse_public_address("HL_AGENT_ADDRESS", &expected)?;
+            if expected != derived {
                 return Err(format!(
-                    "HL_AGENT_ADDRESS mismatch: env says {expected_norm}, key derives {derived}. \
+                    "HL_AGENT_ADDRESS mismatch: env says {expected}, key derives {derived}. \
                      HL_AGENT_ADDRESS must be the AGENT (API wallet) address, not the master account."
                 ));
             }
@@ -584,6 +1688,24 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         None
     };
 
+    // #27: a requested journal is parsed and its static identity is checked
+    // before the first HTTP request (`meta` below). A position run has no
+    // CLI side; its immutable Header/Prepared sides are validated internally
+    // and the phase fingerprint is checked before any new order later.
+    if !cli.read_only {
+        if let Some(resume_id) = &cli.resume {
+            validated_resume_replay(
+                &resolved_state_dir,
+                resume_id,
+                &network,
+                agent_address.as_ref(),
+                configured_master.as_ref(),
+                &symbol,
+                (!position_mode_requested).then_some(side),
+            )?;
+        }
+    }
+
     if !cli.read_only {
         let incomplete = hype_trigger_twap::journal::find_incomplete_run(
             &resolved_state_dir,
@@ -612,6 +1734,17 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
                          --abandon-incomplete-run to abandon {incomplete_run_id} instead."
                     ));
                 }
+            }
+            if cli.abandon_incomplete_run && cli.resume.is_none() {
+                validated_resume_replay(
+                    &resolved_state_dir,
+                    &incomplete_run_id,
+                    &network,
+                    agent_address.as_ref(),
+                    configured_master.as_ref(),
+                    &symbol,
+                    (!position_mode_requested).then_some(side),
+                )?;
             }
         } else if cli.resume.is_some() {
             return Err(format!(
@@ -676,7 +1809,11 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     // Read-only never probes: it places nothing, so it needs no master, and the
     // mode's contract is that it makes no calls a dry run does not require.
     let master: Option<Address> = match agent_address.as_ref() {
-        None => None,
+        // Read-only position planning has no agent key to probe.  It must
+        // therefore name a public master explicitly (flag or environment),
+        // rather than accidentally querying an agent address or an implicit
+        // account.
+        None => configured_master.clone(),
         Some(agent) => {
             let role = client
                 .fetch_user_role(agent)
@@ -697,11 +1834,10 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
             // If the operator also declared the master, the two must agree —
             // a mismatch means the key belongs to a different account than
             // they think.
-            if let Ok(declared) = std::env::var("HL_MASTER_ADDRESS") {
-                let declared = declared.trim().to_ascii_lowercase();
-                if !declared.is_empty() && declared != master.as_str().to_ascii_lowercase() {
+            if let Some(declared) = configured_master.as_ref() {
+                if declared.as_str() != master.as_str().to_ascii_lowercase() {
                     return Err(format!(
-                        "HL_MASTER_ADDRESS mismatch: env says {declared}, but HL reports agent \
+                        "master address mismatch: configured {declared}, but HL reports agent \
                          {agent} belongs to master {master}. Nothing was sent."
                     ));
                 }
@@ -740,20 +1876,41 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     // reconciliation unconditionally first means the run's on-disk state
     // only ever gets MORE resolved, never less, regardless of which flags
     // the operator got wrong.
+    let mut resume_observability_started = false;
     if !cli.read_only && (cli.resume.is_some() || cli.abandon_incomplete_run) {
+        // #27: identity and journal-state validation precede the first
+        // `orderStatus` request.  A wrong run id must never be able to add a
+        // reconciliation result to another account/network's journal.
+        if let Some(resume_id) = &cli.resume {
+            validated_resume_replay(
+                &resolved_state_dir,
+                resume_id,
+                &network,
+                agent_address.as_ref(),
+                master.as_ref(),
+                &symbol,
+                (!position_mode_requested).then_some(side),
+            )?;
+        }
         let reconcile_plan = TwapPlan {
             symbol: symbol.clone(),
             side,
-            asset_index: 0,
-            sz_decimals: 0,
+            // Metadata was resolved before this branch.  Resume may need to
+            // cancel a still-live passive order, so the signed cancel must
+            // carry the real asset index rather than a placeholder zero.
+            asset_index: asset.asset_index,
+            sz_decimals: asset.sz_decimals,
             per_slice: Decimal::ZERO,
             total_adjusted: Decimal::ZERO,
             total_requested: Decimal::ZERO,
             slices: 1,
             duration: Duration::ZERO,
+            absolute_deadline_unix_ms: None,
             slippage_bps: cli.slippage_bps,
             max_book_age_ms: cli.max_book_age_ms,
+            settle_retries: cli.settle_retries,
             read_only: false,
+            reduce_only: false,
             max_notional_usd: Decimal::MAX,
             agent: agent_address.clone(),
             master: master.clone(),
@@ -769,9 +1926,49 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
                 resume_id,
             )
             .map_err(|e| format!("--resume {resume_id}: failed to open journal: {e}"))?;
-            reconcile_incomplete_run(&client, &reconcile_plan, &mut j)
-                .await
-                .map_err(|e| format!("--resume {resume_id}: reconciliation failed: {e}"))?;
+            let existing = hype_trigger_twap::journal::ExecutionJournal::read_all(
+                &resolved_state_dir,
+                resume_id,
+            )
+            .map_err(|e| format!("--resume {resume_id}: failed to seed observability: {e}"))?;
+            let mut observer = live_journal_observer(&j, &observability);
+            observer.seed_from_records(&existing, true);
+            observer.emit_resume();
+            j.set_observer(Box::new(observer));
+            resume_observability_started = true;
+            if let Err(error) = reconcile_incomplete_run(&client, &reconcile_plan, &mut j).await {
+                let records = hype_trigger_twap::journal::ExecutionJournal::read_all(
+                    &resolved_state_dir,
+                    resume_id,
+                )
+                .map_err(|read_error| {
+                    format!(
+                        "--resume {resume_id}: reconciliation failed ({error}); reading its durable result also failed: {read_error}"
+                    )
+                })?;
+                let replay = hype_trigger_twap::journal::ValidatedJournalReplay::replay(&records)
+                    .map_err(|replay_error| {
+                        format!(
+                            "--resume {resume_id}: reconciliation failed ({error}); journal validation also failed: {replay_error}"
+                        )
+                    })?;
+                j.record(&hype_trigger_twap::journal::JournalRecord::FinalReport {
+                    completed: false,
+                    filled_total: replay.fill_totals.filled_sz.to_string(),
+                    outcome_unknown_cloids: replay.summary.unresolved_cloids(),
+                    note: format!("resume reconciliation failed: {error}"),
+                    whole_run: Some(whole_run_from_replay(&replay)),
+                })
+                .map_err(|record_error| {
+                    format!(
+                        "--resume {resume_id}: reconciliation failed ({error}); recording failure also failed: {record_error}"
+                    )
+                })?;
+                emit_live_report_json(&cli, &resolved_state_dir, resume_id)?;
+                return Err(format!(
+                    "--resume {resume_id}: reconciliation failed: {error}"
+                ));
+            }
         } else if cli.abandon_incomplete_run {
             let incomplete_id = hype_trigger_twap::journal::find_incomplete_run(
                 &resolved_state_dir,
@@ -782,14 +1979,61 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
             .ok_or_else(|| {
                 "--abandon-incomplete-run given but no incomplete run was found".to_string()
             })?;
+            validated_resume_replay(
+                &resolved_state_dir,
+                &incomplete_id,
+                &network,
+                agent_address.as_ref(),
+                master.as_ref(),
+                &symbol,
+                (!position_mode_requested).then_some(side),
+            )?;
             let mut j = hype_trigger_twap::journal::ExecutionJournal::open_existing(
                 &resolved_state_dir,
                 &incomplete_id,
             )
             .map_err(|e| format!("--abandon-incomplete-run: failed to open journal: {e}"))?;
-            reconcile_incomplete_run(&client, &reconcile_plan, &mut j)
-                .await
-                .map_err(|e| format!("--abandon-incomplete-run: reconciliation failed: {e}"))?;
+            let existing = hype_trigger_twap::journal::ExecutionJournal::read_all(
+                &resolved_state_dir,
+                &incomplete_id,
+            )
+            .map_err(|e| format!("--abandon-incomplete-run: observability seed failed: {e}"))?;
+            let mut observer = live_journal_observer(&j, &observability);
+            observer.seed_from_records(&existing, true);
+            j.set_observer(Box::new(observer));
+            if let Err(error) = reconcile_incomplete_run(&client, &reconcile_plan, &mut j).await {
+                let records = hype_trigger_twap::journal::ExecutionJournal::read_all(
+                    &resolved_state_dir,
+                    &incomplete_id,
+                )
+                .map_err(|read_error| {
+                    format!(
+                        "--abandon-incomplete-run: reconciliation failed ({error}); reading its durable result also failed: {read_error}"
+                    )
+                })?;
+                let replay = hype_trigger_twap::journal::ValidatedJournalReplay::replay(&records)
+                    .map_err(|replay_error| {
+                        format!(
+                            "--abandon-incomplete-run: reconciliation failed ({error}); journal validation also failed: {replay_error}"
+                        )
+                    })?;
+                j.record(&hype_trigger_twap::journal::JournalRecord::FinalReport {
+                    completed: false,
+                    filled_total: replay.fill_totals.filled_sz.to_string(),
+                    outcome_unknown_cloids: replay.summary.unresolved_cloids(),
+                    note: format!("abandon reconciliation failed: {error}"),
+                    whole_run: Some(whole_run_from_replay(&replay)),
+                })
+                .map_err(|record_error| {
+                    format!(
+                        "--abandon-incomplete-run: reconciliation failed ({error}); recording failure also failed: {record_error}"
+                    )
+                })?;
+                emit_live_report_json(&cli, &resolved_state_dir, &incomplete_id)?;
+                return Err(format!(
+                    "--abandon-incomplete-run: reconciliation failed: {error}"
+                ));
+            }
             j.record(&hype_trigger_twap::journal::JournalRecord::Abandoned {
                 note: format!(
                     "operator passed --abandon-incomplete-run; run {incomplete_id} force-\
@@ -797,11 +2041,194 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
                 ),
             })
             .map_err(|e| e.to_string())?;
+            emit_live_report_json(&cli, &resolved_state_dir, &incomplete_id)?;
             println!(
                 "Abandoned incomplete run {incomplete_id} after forced reconciliation; \
                  nothing further will be executed for it."
             );
             return Ok(ExitCode::SUCCESS);
+        }
+    }
+
+    // Re-read after reconciliation: every subsequent accounting, deadline,
+    // and position decision is made from this one validated state-machine
+    // result. Unsupported/legacy plans are allowed to reconcile but are
+    // stopped here, before trigger/book/position preflight can create a new
+    // order intent.
+    let resume_replay_after_reconcile = if !cli.read_only {
+        if let Some(resume_id) = &cli.resume {
+            Some(validated_resume_replay(
+                &resolved_state_dir,
+                resume_id,
+                &network,
+                agent_address.as_ref(),
+                master.as_ref(),
+                &symbol,
+                (!position_mode_requested).then_some(side),
+            )?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let resumed_frozen_position = match (&cli.resume, resume_replay_after_reconcile.as_ref()) {
+        (Some(resume_id), Some(replay)) => match validate_resume_execution_fingerprint(
+            resume_id,
+            replay,
+            &cli,
+            &network,
+            agent_address.as_ref(),
+            master.as_ref(),
+            asset.sz_decimals,
+        ) {
+            Ok(position) => position,
+            Err(error) => {
+                let mut journal =
+                    hype_trigger_twap::journal::ExecutionJournal::open_existing(
+                        &resolved_state_dir,
+                        resume_id,
+                    )
+                    .map_err(|open_error| {
+                        format!(
+                            "{error}; failed to reopen journal for durable refusal report: {open_error}"
+                        )
+                    })?;
+                let records = hype_trigger_twap::journal::ExecutionJournal::read_all(
+                    &resolved_state_dir,
+                    resume_id,
+                )
+                .map_err(|read_error| {
+                    format!("{error}; failed to read journal for refusal report: {read_error}")
+                })?;
+                let mut observer = live_journal_observer(&journal, &observability);
+                observer.seed_from_records(&records, !resume_observability_started);
+                if !resume_observability_started {
+                    observer.emit_resume();
+                }
+                journal.set_observer(Box::new(observer));
+                journal
+                    .record(&hype_trigger_twap::journal::JournalRecord::FinalReport {
+                        completed: false,
+                        filled_total: replay.fill_totals.filled_sz.to_string(),
+                        outcome_unknown_cloids: replay.summary.unresolved_cloids(),
+                        note: format!("resume execution-plan validation failed: {error}"),
+                        whole_run: Some(whole_run_from_replay(replay)),
+                    })
+                    .map_err(|record_error| {
+                        format!("{error}; recording durable refusal also failed: {record_error}")
+                    })?;
+                emit_live_report_json(&cli, &resolved_state_dir, resume_id)?;
+                return Err(error);
+            }
+        },
+        _ => None,
+    };
+
+    // An expired logical deadline permits only the reconciliation above.  Do
+    // this before trigger/pre-flight book access, so a late resume cannot
+    // fetch a book or place a fresh child order.
+    if !cli.read_only {
+        if let (Some(resume_id), Some(replay)) =
+            (&cli.resume, resume_replay_after_reconcile.as_ref())
+        {
+            let header = replay
+                .summary
+                .header
+                .as_ref()
+                .ok_or_else(|| format!("--resume {resume_id}: journal has no Header"))?;
+            let deadline = header.execution_deadline_unix_ms.ok_or_else(|| {
+                format!("--resume {resume_id}: typed journal lacks absolute deadline")
+            })?;
+            if remaining_execution_window(deadline, wall_clock_now_ms()).is_none() {
+                let unresolved = replay.summary.unresolved_cloids();
+                let mut completed = unresolved.is_empty();
+                let note;
+                if let Some(frozen) = resumed_frozen_position.as_ref() {
+                    let expected = expected_position_from_replay(resume_id, replay, frozen)?;
+                    let master = master.as_ref().ok_or_else(|| {
+                        "position resume lost resolved master address".to_string()
+                    })?;
+                    let actual = match client.fetch_perp_position(master, &symbol).await {
+                        Ok(actual) => actual,
+                        Err(error) => {
+                            let mut journal =
+                                hype_trigger_twap::journal::ExecutionJournal::open_existing(
+                                    &resolved_state_dir,
+                                    resume_id,
+                                )
+                                .map_err(|open_error| {
+                                    format!(
+                                        "--resume {resume_id}: deadline elapsed and final position could not be verified ({error}); journal reopen also failed: {open_error}"
+                                    )
+                                })?;
+                            record_position_incomplete(
+                                &resolved_state_dir,
+                                &mut journal,
+                                frozen.target_szi,
+                                Err(error.to_string()),
+                                "resume deadline elapsed; final position verification failed",
+                            )?;
+                            emit_live_report_json(&cli, &resolved_state_dir, resume_id)?;
+                            return Err(format!(
+                                "--resume {resume_id}: deadline elapsed and final position could not be verified: {error}"
+                            ));
+                        }
+                    };
+                    completed &= expected == frozen.target_szi && actual.szi == frozen.target_szi;
+                    note = if completed {
+                        "resume: deadline elapsed, reconciliation complete, and authoritative position matches frozen target".into()
+                    } else {
+                        format!(
+                            "resume: deadline elapsed; no new order allowed; durable expected position {expected}, authoritative position {}, frozen target {}",
+                            actual.szi, frozen.target_szi
+                        )
+                    };
+                } else {
+                    let adjusted_target: Decimal = header
+                        .execution_fingerprint
+                        .as_ref()
+                        .ok_or_else(|| {
+                            format!("--resume {resume_id}: expired journal lacks fingerprint")
+                        })?
+                        .total_adjusted
+                        .parse()
+                        .map_err(|_| {
+                            format!(
+                                "--resume {resume_id}: expired journal has invalid total_adjusted"
+                            )
+                        })?;
+                    completed &= replay.fill_totals.filled_sz >= adjusted_target;
+                    note = if completed {
+                        "resume: deadline elapsed after durable fills already satisfied the original adjusted target".into()
+                    } else {
+                        format!(
+                            "resume: original deadline elapsed; durable filled size {} is below adjusted target {adjusted_target}; no new order or book fetch allowed",
+                            replay.fill_totals.filled_sz
+                        )
+                    };
+                }
+                let mut j = hype_trigger_twap::journal::ExecutionJournal::open_existing(
+                    &resolved_state_dir,
+                    resume_id,
+                )
+                .map_err(|e| format!("--resume {resume_id}: failed to open journal: {e}"))?;
+                j.record(&hype_trigger_twap::journal::JournalRecord::FinalReport {
+                    completed,
+                    filled_total: replay.fill_totals.filled_sz.to_string(),
+                    outcome_unknown_cloids: unresolved.clone(),
+                    note,
+                    whole_run: Some(whole_run_from_replay(replay)),
+                })
+                .map_err(|e| e.to_string())?;
+                emit_live_report_json(&cli, &resolved_state_dir, resume_id)?;
+                println!("TWAP resume stopped: original execution deadline elapsed; no new orders or book fetches were permitted.");
+                return Ok(if completed {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                });
+            }
         }
     }
 
@@ -890,25 +2317,333 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
 
     let mid = snapshot.mid;
 
-    let (total_coin, requested_desc) = match (cli.size, cli.usd) {
-        (Some(sz), _) => (sz, format!("{} {symbol}", human(sz))),
-        (_, Some(usd)) => {
-            let coin = usd_to_coin(usd, mid).map_err(|e| e.to_string())?;
-            (
-                coin,
-                format!(
-                    "${} → {} {symbol} at mid {}",
-                    human(usd),
-                    human(coin),
-                    human(mid)
-                ),
-            )
+    // Position-aware modes take exactly one signed snapshot after market
+    // metadata and the validated preflight price are known.  A malformed or
+    // absent master is a hard stop before any order intent is constructed.
+    // `target_usd` deliberately uses this one `mid` and freezes the resulting
+    // size in `position_plan`; later slice prices never alter the target.
+    let position_plan = if position_mode_requested {
+        if symbol.as_str().contains(':') {
+            return Err(
+                "position modes are limited to standard Hyperliquid perpetual markets; HIP-3/deployer markets are not accepted"
+                    .into(),
+            );
         }
-        (None, None) => return Err("no size specified".into()),
+        let master = master.as_ref().ok_or_else(|| {
+            "position modes require --master-address or HL_MASTER_ADDRESS in read-only mode; live mode resolves it from userRole".to_string()
+        })?;
+        let position = client
+            .fetch_perp_position(master, &symbol)
+            .await
+            .map_err(|e| {
+                format!("clearinghouseState position preflight failed; no order was sent: {e}")
+            })?;
+        let plan = if let (Some(resume_id), Some(frozen), Some(replay)) = (
+            cli.resume.as_deref(),
+            resumed_frozen_position.as_ref(),
+            resume_replay_after_reconcile.as_ref(),
+        ) {
+            if !replay.summary.unresolved_cloids().is_empty() {
+                let mut journal =
+                    hype_trigger_twap::journal::ExecutionJournal::open_existing(
+                        &resolved_state_dir,
+                        resume_id,
+                    )
+                    .map_err(|error| {
+                        format!("--resume {resume_id}: cannot record unresolved position stop: {error}")
+                    })?;
+                let records = hype_trigger_twap::journal::ExecutionJournal::read_all(
+                    &resolved_state_dir,
+                    resume_id,
+                )
+                .map_err(|error| format!("--resume {resume_id}: observability replay: {error}"))?;
+                let mut observer = live_journal_observer(&journal, &observability);
+                observer.seed_from_records(&records, !resume_observability_started);
+                journal.set_observer(Box::new(observer));
+                record_position_incomplete(
+                    &resolved_state_dir,
+                    &mut journal,
+                    frozen.target_szi,
+                    Ok(position.szi),
+                    "position resume reconciliation left unresolved orders",
+                )?;
+                emit_live_report_json(&cli, &resolved_state_dir, resume_id)?;
+                return Err(format!(
+                    "--resume {resume_id}: reconciliation left unresolved cloids; no new order was sent"
+                ));
+            }
+            let expected = expected_position_from_replay(resume_id, replay, frozen)?;
+            if position.szi != expected {
+                let mut journal =
+                    hype_trigger_twap::journal::ExecutionJournal::open_existing(
+                        &resolved_state_dir,
+                        resume_id,
+                    )
+                    .map_err(|error| {
+                        format!("--resume {resume_id}: cannot record position mismatch: {error}")
+                    })?;
+                let records = hype_trigger_twap::journal::ExecutionJournal::read_all(
+                    &resolved_state_dir,
+                    resume_id,
+                )
+                .map_err(|error| format!("--resume {resume_id}: observability replay: {error}"))?;
+                let mut observer = live_journal_observer(&journal, &observability);
+                observer.seed_from_records(&records, !resume_observability_started);
+                journal.set_observer(Box::new(observer));
+                record_position_incomplete(
+                    &resolved_state_dir,
+                    &mut journal,
+                    frozen.target_szi,
+                    Ok(position.szi),
+                    "position resume authoritative state mismatches durable fills",
+                )?;
+                emit_live_report_json(&cli, &resolved_state_dir, resume_id)?;
+                return Err(format!(
+                    "--resume {resume_id}: current position {} does not match durable expected position {expected}; external/manual activity or missing fills detected, so no new order was sent",
+                    position.szi
+                ));
+            }
+            PositionExecutionPlan::target_size(
+                &position,
+                &symbol,
+                frozen.target_szi,
+                asset.sz_decimals,
+            )
+        } else if cli.flatten {
+            PositionExecutionPlan::flatten(&position, &symbol, asset.sz_decimals)
+        } else if let Some(target) = cli.target_sz {
+            PositionExecutionPlan::target_size(&position, &symbol, target, asset.sz_decimals)
+        } else if let Some(target) = cli.target_usd {
+            PositionExecutionPlan::target_usd(&position, &symbol, target, mid, asset.sz_decimals)
+        } else {
+            unreachable!("position mode checked above")
+        }
+        .map_err(|e| format!("invalid position preflight; no order was sent: {e}"))?;
+
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&plan).map_err(|e| e.to_string())?
+            );
+        } else {
+            println!(
+                "POSITION PLAN: current={} target={} symbol={} phases={:?}",
+                human(plan.current_szi),
+                human(plan.target_szi),
+                plan.symbol,
+                plan.phases
+            );
+        }
+        if plan.is_noop() {
+            println!(
+                "POSITION PLAN: no-op (current exposure already equals target); no order was sent"
+            );
+            if let (Some(resume_id), Some(replay)) = (
+                cli.resume.as_deref(),
+                resume_replay_after_reconcile.as_ref(),
+            ) {
+                let mut journal = hype_trigger_twap::journal::ExecutionJournal::open_existing(
+                    &resolved_state_dir,
+                    resume_id,
+                )
+                .map_err(|e| format!("--resume {resume_id}: failed to open journal: {e}"))?;
+                journal
+                    .record(&hype_trigger_twap::journal::JournalRecord::FinalReport {
+                        completed: true,
+                        filled_total: replay.fill_totals.filled_sz.to_string(),
+                        outcome_unknown_cloids: Vec::new(),
+                        note: "resume: authoritative position already equals frozen target; no new order sent".into(),
+                        whole_run: Some(whole_run_from_replay(replay)),
+                })
+                    .map_err(|e| format!("--resume {resume_id}: recording completion: {e}"))?;
+                emit_live_report_json(&cli, &resolved_state_dir, resume_id)?;
+            }
+            emit_read_only_position_lifecycle(&cli, &observability, &plan, 0);
+            return Ok(ExitCode::SUCCESS);
+        }
+        let first_phase_notional = plan.phases[0]
+            .size
+            .checked_mul(mid)
+            .ok_or_else(|| "position delta notional overflow; no order was sent".to_string())?;
+        if first_phase_notional < MIN_NOTIONAL_USD {
+            if plan.crosses_zero() {
+                return Err(format!(
+                    "position reversal cannot safely reach flat first: close-to-flat notional {} is below minimum {}; no order was sent",
+                    human(first_phase_notional),
+                    human(MIN_NOTIONAL_USD)
+                ));
+            }
+            println!(
+                "POSITION PLAN: no-op (delta notional {} is below minimum {}); no order was sent",
+                human(first_phase_notional),
+                human(MIN_NOTIONAL_USD)
+            );
+            if let (Some(resume_id), Some(replay)) = (
+                cli.resume.as_deref(),
+                resume_replay_after_reconcile.as_ref(),
+            ) {
+                let mut journal = hype_trigger_twap::journal::ExecutionJournal::open_existing(
+                    &resolved_state_dir,
+                    resume_id,
+                )
+                .map_err(|e| format!("--resume {resume_id}: failed to open journal: {e}"))?;
+                journal
+                    .record(&hype_trigger_twap::journal::JournalRecord::FinalReport {
+                        completed: false,
+                        filled_total: replay.fill_totals.filled_sz.to_string(),
+                        outcome_unknown_cloids: Vec::new(),
+                        note: format!(
+                            "resume: remaining position delta is below minimum notional {}; no order sent and frozen target not asserted complete",
+                            MIN_NOTIONAL_USD
+                        ),
+                        whole_run: Some(whole_run_from_replay(replay)),
+                })
+                    .map_err(|e| format!("--resume {resume_id}: recording no-op: {e}"))?;
+                emit_live_report_json(&cli, &resolved_state_dir, resume_id)?;
+            }
+            emit_read_only_position_lifecycle(&cli, &observability, &plan, 0);
+            // A fresh target request may legitimately classify a sub-minimum
+            // delta as a no-op (#43). A resumed logical run is different: its
+            // durable report above remains explicitly incomplete and must not
+            // be surfaced to automation as successful target convergence.
+            return Ok(if cli.resume.is_some() {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            });
+        }
+        if cli.flatten {
+            // A resumed flatten may have partially reduced the position, so
+            // `plan` describes only the remaining delta.  The operator
+            // confirmation must stay bound to the ORIGINAL frozen exposure,
+            // maximum close size, and deadline recorded in the Header; using
+            // the smaller continuation plan here would silently mint a new
+            // token after every partial fill and, before this check existed,
+            // `--flatten --resume` bypassed confirmation altogether.
+            let confirmation_plan = resumed_frozen_position.as_ref().unwrap_or(&plan);
+            let phase = confirmation_plan.phases.first().ok_or_else(|| {
+                "flatten confirmation cannot be constructed without an executable close phase"
+                    .to_string()
+            })?;
+            let deadline = if let (Some(resume_id), Some(replay)) =
+                (cli.resume.as_deref(), resume_replay_after_reconcile.as_ref())
+            {
+                Some(
+                    replay
+                        .summary
+                        .header
+                        .as_ref()
+                        .and_then(|header| header.execution_deadline_unix_ms)
+                        .ok_or_else(|| {
+                            format!(
+                                "--resume {resume_id}: flatten journal lacks its original execution deadline"
+                            )
+                        })?,
+                )
+            } else {
+                cli.flatten_deadline_unix_ms
+            };
+            if !cli.read_only && deadline.is_none() {
+                return Err("live --flatten requires --flatten-deadline-unix-ms so its confirmation token is stable across prepare/confirm".into());
+            }
+            if deadline.is_none() && !cli.json {
+                println!("FLATTEN CONFIRMATION: set --flatten-deadline-unix-ms to print a reusable live confirmation token");
+            }
+            let Some(deadline) = deadline else {
+                emit_read_only_position_lifecycle(&cli, &observability, &plan, 0);
+                return Ok(ExitCode::SUCCESS);
+            };
+            let confirmation = FlattenConfirmation {
+                schema_version: FlattenConfirmation::SCHEMA_VERSION,
+                network: network.to_string(),
+                master: master.clone(),
+                symbol: symbol.clone(),
+                initial_szi: confirmation_plan.current_szi,
+                close_side: phase.side,
+                max_close_size: phase.size,
+                max_notional_usd: cli.max_notional_usd.unwrap_or(Decimal::ZERO),
+                child_algo: child_algo_name(cli.child_algo).to_owned(),
+                execution_deadline_unix_ms: deadline,
+            };
+            if confirmation.execution_deadline_unix_ms <= wall_clock_now_ms() {
+                return Err(
+                    "--flatten-deadline-unix-ms must be in the future; no order was sent".into(),
+                );
+            }
+            let token = confirmation
+                .token()
+                .map_err(|e| format!("flatten confirmation encoding failed: {e}"))?;
+            // `--json` reserves stdout for the position-plan JSON.  The
+            // normal operator path prints the fully bound, secret-free
+            // preflight BEFORE the opaque token; the `println!` wrapper also
+            // suppresses both lines when `--report-json -` owns stdout.
+            if !cli.json {
+                println!("{}", format_flatten_confirmation_preflight(&confirmation));
+                println!("FLATTEN CONFIRMATION: {token}");
+            }
+            if !cli.read_only && cli.confirm_flatten.as_deref() != Some(token.as_str()) {
+                return Err("live --flatten requires the exact --confirm-flatten token printed by this preflight; no order was sent".into());
+            }
+        }
+        if cli.read_only {
+            let planned_slices = cli
+                .slices
+                .saturating_mul(u32::try_from(plan.phases.len()).unwrap_or(u32::MAX));
+            emit_read_only_position_lifecycle(
+                &cli,
+                &observability,
+                &plan,
+                planned_slices,
+            );
+            println!("POSITION PLAN: read-only; no order or simulated fill was sent");
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(plan)
+    } else {
+        None
     };
 
-    let sizing = compute_sizing(total_coin, cli.slices, asset.sz_decimals, mid)
-        .map_err(|e| e.to_string())?;
+    let (total_coin, requested_desc) = if let Some(position_plan) = position_plan.as_ref() {
+        let phase = &position_plan.phases[0];
+        side = phase.side;
+        (
+            phase.size,
+            format!(
+                "position-aware: current {} → target {} ({} {:?}, reduce_only={})",
+                human(position_plan.current_szi),
+                human(position_plan.target_szi),
+                human(phase.size),
+                phase.kind,
+                phase.reduce_only
+            ),
+        )
+    } else {
+        match (cli.size, cli.usd) {
+            (Some(sz), _) => (sz, format!("{} {symbol}", human(sz))),
+            (_, Some(usd)) => {
+                let coin = usd_to_coin(usd, mid).map_err(|e| e.to_string())?;
+                (
+                    coin,
+                    format!(
+                        "${} → {} {symbol} at mid {}",
+                        human(usd),
+                        human(coin),
+                        human(mid)
+                    ),
+                )
+            }
+            (None, None) => return Err("no size specified".into()),
+        }
+    };
+
+    let sizing = execution_sizing(
+        total_coin,
+        cli.slices,
+        asset.sz_decimals,
+        mid,
+        position_plan.is_some(),
+    )
+    .map_err(|e| e.to_string())?;
     println!(
         "Rounded per-slice: {} × {} = {} (~${} at mid {}) [requested {}]",
         human(sizing.per_slice),
@@ -940,8 +2675,8 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     let max_notional_usd =
         RiskEnvelope::validate_max_notional_required(cli.read_only, risk.max_notional_usd)
             .map_err(|e| e.to_string())?;
-    let preflight_notional = match (cli.size, cli.usd) {
-        (Some(_), _) => {
+    let preflight_notional = match (cli.size, cli.usd, position_plan.as_ref()) {
+        (Some(_), _, _) => {
             let conservative_px = hype_trigger_twap::format::taker_limit_price(
                 snapshot.best_bid,
                 snapshot.best_ask,
@@ -959,8 +2694,26 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
             .map_err(|e| e.to_string())?;
             total_coin * conservative_px
         }
-        (_, Some(usd)) => usd,
-        (None, None) => return Err("no size specified".into()),
+        (_, Some(usd), _) => usd,
+        (None, None, Some(_)) => {
+            let conservative_px = hype_trigger_twap::format::taker_limit_price(
+                snapshot.best_bid,
+                snapshot.best_ask,
+                side,
+                risk.slippage_bps,
+                asset.sz_decimals,
+            );
+            RiskEnvelope::validate_limit_price(
+                conservative_px,
+                side,
+                risk.slippage_bps,
+                snapshot.best_bid,
+                snapshot.best_ask,
+            )
+            .map_err(|e| e.to_string())?;
+            total_coin * conservative_px
+        }
+        (None, None, None) => return Err("no size specified".into()),
     };
     RiskEnvelope::check_notional_cap(preflight_notional, max_notional_usd)
         .map_err(|e| e.to_string())?;
@@ -985,8 +2738,33 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         )
     );
 
+    // Fix one absolute deadline for the logical run before the journal is
+    // created/reopened. Every local send gate and wire `expiresAfter` uses
+    // this exact value, including ordinary and position-aware resumes.
+    let fixed_execution_deadline_unix_ms = if cli.read_only {
+        cli.flatten_deadline_unix_ms
+    } else if let Some(replay) = resume_replay_after_reconcile.as_ref() {
+        Some(
+            replay
+                .summary
+                .header
+                .as_ref()
+                .and_then(|header| header.execution_deadline_unix_ms)
+                .ok_or_else(|| {
+                    "resume journal has no absolute execution deadline; reconciliation succeeded but new orders are refused"
+                        .to_string()
+                })?,
+        )
+    } else {
+        Some(
+            cli.flatten_deadline_unix_ms.unwrap_or_else(|| {
+                wall_clock_now_ms().saturating_add(cli.duration.as_millis() as u64)
+            }),
+        )
+    };
+
     // §8: the loop.
-    let original_plan = TwapPlan {
+    let mut original_plan = TwapPlan {
         symbol: symbol.clone(),
         side,
         asset_index: asset.asset_index,
@@ -996,9 +2774,15 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         total_requested: total_coin,
         slices: cli.slices,
         duration: cli.duration,
+        absolute_deadline_unix_ms: fixed_execution_deadline_unix_ms,
         slippage_bps: risk.slippage_bps,
         max_book_age_ms: cli.max_book_age_ms,
+        settle_retries: cli.settle_retries,
         read_only: cli.read_only,
+        reduce_only: position_plan
+            .as_ref()
+            .and_then(|plan| plan.phases.first())
+            .is_some_and(|phase| phase.reduce_only),
         max_notional_usd,
         agent: agent_address.clone(),
         master: master.clone(),
@@ -1008,14 +2792,47 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         follow_threshold_bps: cli.follow_threshold_bps,
     };
 
-    // Issue #4: this plan's hash — computed identically whether starting a
-    // fresh run (stored in its new header) or resuming one (compared
-    // against the STORED header's hash below). Any drift means the operator
-    // passed different sizing/timing/risk parameters on the resume than the
-    // original invocation used, which is exactly the mismatch a `--resume`
-    // safety check exists to catch — resuming a 30-minute/10-slice run as
-    // if it were a 5-minute/1-slice run would silently reinterpret the
-    // remaining schedule.
+    // USD sizing normally depends on the current book.  A resumed logical
+    // run must instead retain the durable original sizing, otherwise a price
+    // move creates a false fingerprint mismatch (or, worse, reinterprets the
+    // intended size). The current typed fingerprint is authoritative.
+    if resumed_frozen_position.is_none() {
+        if let Some(resume_id) = &cli.resume {
+            let replay = validated_resume_replay(
+                &resolved_state_dir,
+                resume_id,
+                &network,
+                agent_address.as_ref(),
+                master.as_ref(),
+                &symbol,
+                (!position_mode_requested).then_some(side),
+            )?;
+            let stored = replay
+                .summary
+                .header
+                .as_ref()
+                .and_then(|h| h.execution_fingerprint.as_ref());
+            if let Some(stored) = stored {
+                if stored.version != hype_trigger_twap::journal::ExecutionPlanFingerprint::VERSION {
+                    return Err(format!("--resume {resume_id}: unsupported execution fingerprint version {}; refusing new orders", stored.version));
+                }
+                original_plan.per_slice = stored.per_slice.parse().map_err(|_| {
+                    format!("--resume {resume_id}: invalid stored fingerprint per_slice")
+                })?;
+                original_plan.total_adjusted = stored.total_adjusted.parse().map_err(|_| {
+                    format!("--resume {resume_id}: invalid stored fingerprint total_adjusted")
+                })?;
+                original_plan.total_requested = stored.total_requested.parse().map_err(|_| {
+                    format!("--resume {resume_id}: invalid stored fingerprint total_requested")
+                })?;
+                original_plan.duration = Duration::from_millis(stored.duration_ms);
+            }
+        }
+    }
+
+    // Retain the compact legacy hash for older tooling. Typed resume safety
+    // is enforced earlier by `validate_resume_execution_fingerprint`, which
+    // checks every named field plus the sizing/position relationships.
     let plan_hash = hype_trigger_twap::journal::hash_plan_params(&[
         original_plan.symbol.as_str(),
         &original_plan.side.to_string(),
@@ -1026,6 +2843,67 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         &original_plan.slippage_bps.to_string(),
         &original_plan.max_notional_usd.to_string(),
     ]);
+    let fingerprint = if let Some(replay) = resume_replay_after_reconcile.as_ref() {
+        replay
+            .summary
+            .header
+            .as_ref()
+            .and_then(|header| header.execution_fingerprint.clone())
+            .ok_or_else(|| "resume journal lost its validated typed fingerprint".to_string())?
+    } else {
+        execution_fingerprint(
+            &network,
+            &original_plan,
+            position_plan.as_ref(),
+            &cli,
+            Some(mid),
+        )
+    };
+
+    // Read-only must remain state-directory free, but operators may opt into
+    // the same schema-versioned event contract at an explicit standalone
+    // path. This stream contains simulation lifecycle events only; it is not
+    // a journal and never becomes resume authority.
+    let mut read_only_observer = if cli.read_only {
+        cli.event_jsonl.as_ref().map(|path| {
+            let mut observer = JournalEventObserver::open(
+                path,
+                ExecutionMode::ReadOnly,
+                Arc::clone(&observability.metrics),
+                observability.alerts.clone(),
+            )
+            .unwrap_or_else(|_| {
+                tracing::warn!(
+                    path = %path.display(),
+                    "read-only event log unavailable; simulation continues without JSONL"
+                );
+                JournalEventObserver::without_event_log(
+                    ExecutionMode::ReadOnly,
+                    Arc::clone(&observability.metrics),
+                    observability.alerts.clone(),
+                )
+            });
+            observer.observe_record(&hype_trigger_twap::journal::JournalRecord::Header(
+                hype_trigger_twap::journal::RunHeader {
+                    run_id: uuid::Uuid::now_v7().to_string(),
+                    network: network.to_string(),
+                    agent: agent_address.clone(),
+                    master: master.clone(),
+                    symbol: original_plan.symbol.clone(),
+                    side: original_plan.side,
+                    slices: original_plan.slices,
+                    plan_hash: plan_hash.clone(),
+                    execution_fingerprint: Some(fingerprint.clone()),
+                    started_at_unix_ms: wall_clock_now_ms(),
+                    execution_deadline_unix_ms: fixed_execution_deadline_unix_ms,
+                },
+            ));
+            observer.emit_preflight();
+            observer
+        })
+    } else {
+        None
+    };
 
     // Issue #4: open (or resume) the journal for a LIVE run only — read-only
     // never creates the state dir or a journal file (mirrors the incomplete-
@@ -1042,46 +2920,68 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     // never re-executes the full original plan on top of fills the prior
     // process already made.
     let mut already_filled: Option<Decimal> = None;
+    let mut logical_execution_deadline_unix_ms: Option<u64> = None;
     // The notional counterpart to `already_filled`. Unlike the continuation
     // plan's size target, the risk envelope is scoped to the entire logical
     // run, so this offset must survive a process boundary on `--resume`.
     let mut prior_filled_notional = Decimal::ZERO;
+    // The header is projected into the sidecar only after the journal exists;
+    // it is retained here solely for that best-effort replay.
+    let mut observability_header: Option<hype_trigger_twap::journal::RunHeader> = None;
 
     let mut journal = if cli.read_only {
         None
     } else if let Some(resume_id) = &cli.resume {
+        let replay = validated_resume_replay(
+            &resolved_state_dir,
+            resume_id,
+            &network,
+            agent_address.as_ref(),
+            master.as_ref(),
+            &symbol,
+            (!position_mode_requested).then_some(side),
+        )?;
+        let header = replay
+            .summary
+            .header
+            .as_ref()
+            .ok_or_else(|| format!("--resume {resume_id}: journal has no Header"))?;
+        observability_header = Some(header.clone());
+        logical_execution_deadline_unix_ms =
+            Some(header.execution_deadline_unix_ms.unwrap_or_else(|| {
+                if header.started_at_unix_ms == 0 {
+                    wall_clock_now_ms().saturating_add(original_plan.duration.as_millis() as u64)
+                } else {
+                    header
+                        .started_at_unix_ms
+                        .saturating_add(original_plan.duration.as_millis() as u64)
+                }
+            }));
+        if header.execution_fingerprint.is_none() {
+            return Err(format!(
+                "--resume {resume_id}: legacy journal cannot safely reconstruct all execution fields; reconciliation completed, but new orders are refused. Inspect and use --abandon-incomplete-run"
+            ));
+        }
         let records =
             hype_trigger_twap::journal::ExecutionJournal::read_all(&resolved_state_dir, resume_id)
                 .map_err(|e| format!("--resume {resume_id}: failed to read journal: {e}"))?;
-        let stored_hash = records.iter().find_map(|r| match r {
-            hype_trigger_twap::journal::JournalRecord::Header(h) => Some(h.plan_hash.clone()),
-            _ => None,
-        });
-        if let Some(stored_hash) = stored_hash {
-            if stored_hash != plan_hash {
-                return Err(format!(
-                    "--resume {resume_id}: this invocation's plan does not match the run being \
-                     resumed (stored plan_hash {stored_hash}, this invocation computes \
-                     {plan_hash}). Re-run --resume with the EXACT SAME --symbol/--side/--usd or \
-                     --size/--duration/--slices/--slippage-bps/--max-notional-usd the original \
-                     run used, or pass --abandon-incomplete-run instead if you intend to change \
-                     them."
-                ));
-            }
-        }
         // Issue #4 Finding 1 fix: `records` here reflects the journal AFTER
         // forced reconciliation ran above (reconciliation reopened/appended
         // to the SAME file via `reconcile_incomplete_run`, which fsyncs
         // every record it writes) — so this replay already includes every
         // cloid's resolved Terminal outcome, not just what the prior
         // (crashed) process itself observed.
-        let restored = hype_trigger_twap::journal::restore_fill_totals(&records).map_err(|e| {
-            format!(
+        let restored = hype_trigger_twap::journal::ValidatedJournalReplay::replay(&records)
+            .map_err(|e| {
+                format!(
                 "--resume {resume_id}: failed to restore prior fill accounting from the journal: \
                  {e}; refusing to continue because the notional cap cannot be enforced safely"
             )
-        })?;
-        already_filled = Some(restored.filled_sz);
+            })?
+            .fill_totals;
+        if resumed_frozen_position.is_none() {
+            already_filled = Some(restored.filled_sz);
+        }
         prior_filled_notional = restored.notional;
         Some(
             hype_trigger_twap::journal::ExecutionJournal::open_existing(
@@ -1092,6 +2992,17 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         )
     } else {
         let run_id = uuid::Uuid::now_v7().to_string();
+        let started_at_unix_ms = hype_trigger_twap::twap::wall_clock_now_ms();
+        let execution_deadline_unix_ms =
+            original_plan.absolute_deadline_unix_ms.unwrap_or_else(|| {
+                started_at_unix_ms.saturating_add(original_plan.duration.as_millis() as u64)
+            });
+        if execution_deadline_unix_ms <= started_at_unix_ms {
+            return Err(
+                "execution deadline already elapsed before journal start; no order was sent".into(),
+            );
+        }
+        logical_execution_deadline_unix_ms = Some(execution_deadline_unix_ms);
         let header = hype_trigger_twap::journal::RunHeader {
             run_id: run_id.clone(),
             network: network.to_string(),
@@ -1101,8 +3012,11 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
             side: original_plan.side,
             slices: original_plan.slices,
             plan_hash,
-            started_at_unix_ms: hype_trigger_twap::twap::wall_clock_now_ms(),
+            execution_fingerprint: Some(fingerprint),
+            started_at_unix_ms,
+            execution_deadline_unix_ms: Some(execution_deadline_unix_ms),
         };
+        observability_header = Some(header.clone());
         Some(
             hype_trigger_twap::journal::ExecutionJournal::start(
                 &resolved_state_dir,
@@ -1112,6 +3026,30 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
             .map_err(|e| format!("failed to start execution journal: {e}"))?,
         )
     };
+
+    // Attach only after `ExecutionJournal::start/open_existing` succeeded.
+    // Failed event-log creation is intentionally a warning: journal records,
+    // order placement, cancellation, resume, and exit status stay unchanged.
+    if let (Some(j), Some(header)) = (journal.as_mut(), observability_header.as_ref()) {
+        let mut observer = live_journal_observer(j, &observability);
+        if cli.resume.is_some() {
+            let records = hype_trigger_twap::journal::ExecutionJournal::read_all(
+                &resolved_state_dir,
+                j.run_id(),
+            )
+            .map_err(|error| format!("resume observability replay failed: {error}"))?;
+            observer.seed_from_records(&records, !resume_observability_started);
+            if !resume_observability_started {
+                observer.emit_resume();
+            }
+        } else {
+            observer.observe_record(&hype_trigger_twap::journal::JournalRecord::Header(
+                header.clone(),
+            ));
+        }
+        observer.emit_preflight();
+        j.set_observer(Box::new(observer));
+    }
 
     // Issue #4 Finding 1 fix: `--resume` must continue for the REMAINDER of
     // the original plan, never re-execute it from scratch — a slice already
@@ -1130,47 +3068,130 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     // already_filled`. If the
     // remainder cannot clear the same per-slice min-notional gate the
     // original plan was sized against (using the same trigger-time `mid`),
-    // there is nothing left this run can legally place: skip straight to a
-    // durable FinalReport and exit 0 without ever placing a new order. This
-    // mirrors `PreflightError::PerSliceBelowMinNotional`'s gate (same
+    // there is nothing this process can legally place. A genuinely satisfied
+    // target completes successfully; a positive but unplaceable remainder is
+    // durably incomplete and exits non-zero. This mirrors
+    // `PreflightError::PerSliceBelowMinNotional`'s gate (same
     // `MIN_NOTIONAL_USD` constant, no new threshold invented).
     let plan = match already_filled {
         None => original_plan,
         Some(filled) => {
             let remaining = original_plan.total_adjusted - filled;
-            if remaining <= Decimal::ZERO || remaining * mid < MIN_NOTIONAL_USD {
+            if remaining <= Decimal::ZERO {
                 tracing::info!(
                     already_filled = %human(filled),
                     original_total = %human(original_plan.total_adjusted),
-                    remaining = %human(remaining.max(Decimal::ZERO)),
-                    "--resume: remainder is already complete (or unplaceable below min notional); \
-                     nothing further will be executed"
+                    "--resume: prior fills already satisfy the original plan; nothing further will be executed"
                 );
-                if let Some(j) = journal.as_mut() {
-                    let _ = j.record(&hype_trigger_twap::journal::JournalRecord::FinalReport {
+                let whole_run = if let Some(j) = journal.as_mut() {
+                    let whole_run = replay_whole_run(&resolved_state_dir, j.run_id())
+                    .map_err(|error| {
+                        format!(
+                            "--resume: prior fills satisfy the plan, but its durable whole-run accounting could not be validated: {error}"
+                        )
+                    })?;
+                    j.record(&hype_trigger_twap::journal::JournalRecord::FinalReport {
                         completed: true,
                         filled_total: filled.to_string(),
                         outcome_unknown_cloids: Vec::new(),
-                        note: "resume: prior fills already satisfy (or leave an unplaceable \
-                               remainder of) the original plan; nothing further executed"
+                        note: "resume: prior fills already satisfy the original plan; nothing further executed"
                             .to_string(),
-                    });
-                }
+                        whole_run: Some(whole_run.clone()),
+                    })
+                    .map_err(|record_error| {
+                        format!(
+                            "--resume: prior fills satisfy the plan, but recording its durable completion failed: {record_error}"
+                        )
+                    })?;
+                    Some(whole_run)
+                } else {
+                    None
+                };
                 let report = hype_trigger_twap::twap::TwapReport {
                     symbol: original_plan.symbol.clone(),
                     side: original_plan.side,
                     total_requested: original_plan.total_requested,
                     total_adjusted: original_plan.total_adjusted,
                     filled,
-                    avg_px: None,
+                    avg_px: whole_run
+                        .as_ref()
+                        .and_then(|whole| whole.trusted_vwap.as_deref())
+                        .and_then(|value| value.parse().ok()),
                     slices_executed: 0,
                     slices_skipped: 0,
-                    elapsed: Duration::ZERO,
+                    elapsed: whole_run
+                        .as_ref()
+                        .map(|whole| Duration::from_millis(whole.logical_elapsed_ms))
+                        .unwrap_or(Duration::ZERO),
                     abort_reason: None,
                     read_only: cli.read_only,
                 };
                 print!("{}", report.render());
+                if let Some(j) = journal.as_ref() {
+                    emit_live_report_json(&cli, &resolved_state_dir, j.run_id())?;
+                }
                 return Ok(ExitCode::SUCCESS);
+            }
+            if remaining * mid < MIN_NOTIONAL_USD {
+                let reason = format!(
+                    "resume: positive remainder {} is below minimum notional {}; no order sent and original target not asserted complete",
+                    human(remaining),
+                    human(MIN_NOTIONAL_USD)
+                );
+                tracing::warn!(
+                    already_filled = %human(filled),
+                    original_total = %human(original_plan.total_adjusted),
+                    remaining = %human(remaining),
+                    "{reason}"
+                );
+                let whole_run = if let Some(j) = journal.as_mut() {
+                    let whole_run = replay_whole_run(&resolved_state_dir, j.run_id()).map_err(
+                        |error| {
+                            format!(
+                                "--resume: remainder is below minimum notional, but durable whole-run accounting could not be validated: {error}"
+                            )
+                        },
+                    )?;
+                    j.record(&hype_trigger_twap::journal::JournalRecord::FinalReport {
+                        completed: false,
+                        filled_total: filled.to_string(),
+                        outcome_unknown_cloids: Vec::new(),
+                        note: reason.clone(),
+                        whole_run: Some(whole_run.clone()),
+                    })
+                    .map_err(|record_error| {
+                        format!(
+                            "--resume: recording the below-minimum incomplete result failed: {record_error}"
+                        )
+                    })?;
+                    Some(whole_run)
+                } else {
+                    None
+                };
+                let report = hype_trigger_twap::twap::TwapReport {
+                    symbol: original_plan.symbol.clone(),
+                    side: original_plan.side,
+                    total_requested: original_plan.total_requested,
+                    total_adjusted: original_plan.total_adjusted,
+                    filled,
+                    avg_px: whole_run
+                        .as_ref()
+                        .and_then(|whole| whole.trusted_vwap.as_deref())
+                        .and_then(|value| value.parse().ok()),
+                    slices_executed: 0,
+                    slices_skipped: 0,
+                    elapsed: whole_run
+                        .as_ref()
+                        .map(|whole| Duration::from_millis(whole.logical_elapsed_ms))
+                        .unwrap_or(Duration::ZERO),
+                    abort_reason: Some(reason),
+                    read_only: cli.read_only,
+                };
+                print!("{}", report.render());
+                if let Some(j) = journal.as_ref() {
+                    emit_live_report_json(&cli, &resolved_state_dir, j.run_id())?;
+                }
+                return Ok(ExitCode::FAILURE);
             }
             // Continuation plan: SAME per-slice size as the original plan
             // (preserving the schedule's granularity), slices = ceil(
@@ -1198,6 +3219,12 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
                 continuation_slices,
                 "--resume: continuing with a plan scoped to the remainder only"
             );
+            let remaining_duration = remaining_execution_window(
+                logical_execution_deadline_unix_ms
+                    .ok_or_else(|| "live run has no execution deadline".to_string())?,
+                wall_clock_now_ms(),
+            )
+            .unwrap_or(Duration::ZERO);
             TwapPlan {
                 symbol: original_plan.symbol.clone(),
                 side: original_plan.side,
@@ -1207,10 +3234,16 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
                 total_adjusted: remaining,
                 total_requested: original_plan.total_requested,
                 slices: continuation_slices,
-                duration: original_plan.duration,
+                // Preserve the original absolute wall-clock deadline across
+                // process restarts.  `run_twap` turns this remaining window
+                // into its local monotonic deadline and exchange expiry.
+                duration: remaining_duration,
+                absolute_deadline_unix_ms: original_plan.absolute_deadline_unix_ms,
                 slippage_bps: original_plan.slippage_bps,
                 max_book_age_ms: original_plan.max_book_age_ms,
+                settle_retries: original_plan.settle_retries,
                 read_only: original_plan.read_only,
+                reduce_only: original_plan.reduce_only,
                 max_notional_usd: original_plan.max_notional_usd,
                 agent: original_plan.agent.clone(),
                 master: original_plan.master.clone(),
@@ -1222,6 +3255,40 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         }
     };
 
+    // The pair launcher is allowed to release execution only after both legs
+    // reached this point: signer/agent/master checks, metadata, trigger,
+    // sizing, and (for live runs) a durable journal are all ready.  This is
+    // immediately before `run_twap_*`, the sole path that can place orders.
+    if let Some(barrier) = pair_barrier.as_ref() {
+        if let Err(error) = wait_for_pair_start(barrier, journal.as_ref().map(|j| j.run_id())).await {
+            if let Some(j) = journal.as_mut() {
+                let whole_run = replay_whole_run(&resolved_state_dir, j.run_id())
+                .map_err(|accounting_error| {
+                    format!(
+                        "pair barrier aborted before any order: {error}; additionally failed to validate durable accounting: {accounting_error}"
+                    )
+                })?;
+                if let Err(record_error) =
+                    j.record(&hype_trigger_twap::journal::JournalRecord::FinalReport {
+                        completed: false,
+                        filled_total: Decimal::ZERO.to_string(),
+                        outcome_unknown_cloids: Vec::new(),
+                        note: format!("pair barrier aborted before any order: {error}"),
+                        whole_run: Some(whole_run),
+                    })
+                {
+                    return Err(format!(
+                        "pair barrier aborted before any order: {error}; additionally failed to record the durable incomplete report: {record_error}"
+                    ));
+                }
+            }
+            if let Some(j) = journal.as_ref() {
+                emit_live_report_json(&cli, &resolved_state_dir, j.run_id())?;
+            }
+            return Err(error);
+        }
+    }
+
     // Issue #4: SIGINT/SIGTERM cooperative shutdown. A tokio::sync::watch
     // channel is the shutdown token both the real signal task and (in
     // src/twap.rs's tests) a test harness can drive identically. The signal
@@ -1231,6 +3298,8 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     // normal end-of-run and a signal-interrupted one.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let shutdown_signal = hype_trigger_twap::twap::ShutdownSignal::new(shutdown_rx);
+    let first_phase_shutdown = shutdown_signal.clone();
+    let grace_shutdown = shutdown_signal.clone();
     let signal_task = if cli.read_only {
         None
     } else {
@@ -1255,57 +3324,55 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         }))
     };
 
-    let run_fut = hype_trigger_twap::twap::run_twap_journaled_with_prior_notional(
-        &client,
-        &plan,
-        prior_filled_notional,
-        journal.as_mut(),
-        Some(shutdown_signal),
-    );
-
-    // Issue #4: bound the WHOLE run (not just the shutdown-triggered tail)
-    // by `--shutdown-grace` ONLY once a signal has actually fired — a
-    // healthy run with no signal must never be timed out by this. The
-    // simplest correct way to express "grace only applies after shutdown"
-    // without duplicating run_twap_journaled's internal reconcile/cancel
-    // logic is: race the run against the grace timer, but only START the
-    // grace timer once the signal task has completed (i.e. a signal fired).
-    let report = if let Some(task) = signal_task {
-        tokio::select! {
-            report = run_fut => report,
-            _ = async {
-                let _ = task.await;
-                tokio::time::sleep(cli.shutdown_grace).await;
-            } => {
-                tracing::error!(
-                    grace = ?cli.shutdown_grace,
-                    "shutdown grace period exceeded; giving up with outcome_unknown"
-                );
-                if let Some(j) = journal.as_mut() {
-                    // Finding 2 fix: derive both fields from the ACTUAL
-                    // journal state at this moment, via `grace_timeout_report_fields`
-                    // (unit-tested directly below), rather than hardcoding
-                    // zero/empty, which silently discarded every real fill
-                    // and every genuinely-still-open cloid this run needed
-                    // to flag as outcome_unknown.
-                    let (filled_total, outcome_unknown_cloids) =
-                        grace_timeout_report_fields(&resolved_state_dir, j.run_id());
-                    let _ = j.record(&hype_trigger_twap::journal::JournalRecord::FinalReport {
-                        completed: false,
-                        filled_total: filled_total.to_string(),
-                        outcome_unknown_cloids,
-                        note: format!(
-                            "shutdown grace period ({:?}) exceeded before reconciliation finished",
-                            cli.shutdown_grace
-                        ),
-                    });
-                }
-                return Ok(ExitCode::FAILURE);
-            }
+    // Everything from the first phase through position verification belongs
+    // to one shutdown-grace scope.  In particular, do not let a completed
+    // close phase drop the grace timer before zero-crossing's exact-zero read
+    // or the non-reduce-only open phase begins.
+    let execution_result = {
+    let execution_fut = async {
+    let first_phase_position_guard = position_plan
+        .as_ref()
+        .map(|position| {
+            let phase_target = if position.crosses_zero() {
+                Decimal::ZERO
+            } else {
+                position.target_szi
+            };
+            let guard_master = master
+                .as_ref()
+                .ok_or_else(|| "position mode lost its resolved master address".to_string())?
+                .clone();
+            Ok::<_, String>(hype_trigger_twap::twap::PositionTargetGuard::new(
+                guard_master,
+                phase_target,
+                plan.side,
+            ))
+        })
+        .transpose()?;
+    let run_fut = async {
+        if let Some(position_guard) = first_phase_position_guard.clone() {
+            hype_trigger_twap::twap::run_twap_journaled_with_prior_notional_deferred_position_guard(
+                &client,
+                &plan,
+                prior_filled_notional,
+                journal.as_mut(),
+                Some(first_phase_shutdown),
+                position_guard,
+            )
+            .await
+        } else {
+            hype_trigger_twap::twap::run_twap_journaled_with_prior_notional(
+                &client,
+                &plan,
+                prior_filled_notional,
+                journal.as_mut(),
+                Some(first_phase_shutdown),
+            )
+            .await
         }
-    } else {
-        run_fut.await
     };
+
+    let report = run_fut.await;
 
     // Issue #4 Finding 1 fix: a resumed run's `report` only reflects fills
     // this process itself placed (the continuation plan, scoped to
@@ -1325,13 +3392,737 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         },
         None => report,
     };
+    // A sign-changing target is two strictly ordered executions under the
+    // same journal. The close plan is reduce-only, so twap.rs deliberately
+    // leaves its FinalReport incomplete. Only after every close cloid is
+    // terminal and a fresh authoritative snapshot is exactly zero may the
+    // non-reduce-only open plan be constructed.
+    let report = if position_plan
+        .as_ref()
+        .is_some_and(PositionExecutionPlan::crosses_zero)
+    {
+        if report.exit_code() != 0 {
+            let frozen_target = position_plan
+                .as_ref()
+                .map(|position| position.target_szi)
+                .unwrap_or(Decimal::ZERO);
+            let observation = match master.as_ref() {
+                Some(master) => client
+                    .fetch_perp_position(master, &symbol)
+                    .await
+                    .map(|position| position.szi)
+                    .map_err(|error| error.to_string()),
+                None => Err("resolved master address is unavailable".into()),
+            };
+            if let Some(j) = journal.as_mut() {
+                record_position_incomplete(
+                    &resolved_state_dir,
+                    j,
+                    frozen_target,
+                    observation,
+                    "zero-crossing close-to-flat phase failed",
+                )?;
+            }
+            if let Some(j) = journal.as_ref() {
+                emit_live_report_json(&cli, &resolved_state_dir, j.run_id())?;
+            }
+            return Err("close-to-flat phase did not complete; open phase was not started".into());
+        }
+        let close_has_unresolved = if let Some(j) = journal.as_ref() {
+            let records = hype_trigger_twap::journal::ExecutionJournal::read_all(
+                &resolved_state_dir,
+                j.run_id(),
+            )
+            .map_err(|e| format!("zero-crossing: cannot read close journal: {e}"))?;
+            let replay = hype_trigger_twap::journal::ValidatedJournalReplay::replay(&records)
+                .map_err(|e| format!("zero-crossing: invalid close journal: {e}"))?;
+            !replay.summary.unresolved_cloids().is_empty()
+        } else {
+            false
+        };
+        if close_has_unresolved {
+            let frozen_target = position_plan
+                .as_ref()
+                .map(|position| position.target_szi)
+                .unwrap_or(Decimal::ZERO);
+            let observation = match master.as_ref() {
+                Some(master) => client
+                    .fetch_perp_position(master, &symbol)
+                    .await
+                    .map(|position| position.szi)
+                    .map_err(|error| error.to_string()),
+                None => Err("resolved master address is unavailable".into()),
+            };
+            if let Some(j) = journal.as_mut() {
+                record_position_incomplete(
+                    &resolved_state_dir,
+                    j,
+                    frozen_target,
+                    observation,
+                    "zero-crossing close phase left unresolved orders",
+                )?;
+            }
+            if let Some(j) = journal.as_ref() {
+                emit_live_report_json(&cli, &resolved_state_dir, j.run_id())?;
+            }
+            return Err(
+                "zero-crossing: close phase has unresolved cloids; open phase was not started"
+                    .into(),
+            );
+        }
+        let master = master
+            .as_ref()
+            .ok_or_else(|| "zero-crossing: missing master address".to_string())?;
+        let latest = match client.fetch_perp_position(master, &symbol).await {
+            Ok(position) => position,
+            Err(error) => {
+                if let (Some(j), Some(position)) = (journal.as_mut(), position_plan.as_ref()) {
+                    record_position_incomplete(
+                        &resolved_state_dir,
+                        j,
+                        position.target_szi,
+                        Err(error.to_string()),
+                        "zero-crossing close-to-flat verification unavailable",
+                    )?;
+                }
+                if let Some(j) = journal.as_ref() {
+                    emit_live_report_json(&cli, &resolved_state_dir, j.run_id())?;
+                }
+                return Err(format!(
+                    "zero-crossing: cannot verify close-to-flat position; open phase was not started: {error}"
+                ));
+            }
+        };
+        if latest.szi != Decimal::ZERO {
+            if let (Some(j), Some(position)) = (journal.as_mut(), position_plan.as_ref()) {
+                record_position_incomplete(
+                    &resolved_state_dir,
+                    j,
+                    position.target_szi,
+                    Ok(latest.szi),
+                    "zero-crossing close-to-flat verification found residual position",
+                )?;
+            }
+            if let Some(j) = journal.as_ref() {
+                emit_live_report_json(&cli, &resolved_state_dir, j.run_id())?;
+            }
+            return Err(format!(
+                "zero-crossing: close phase expected exact zero, got {}; open phase was not started",
+                latest.szi
+            ));
+        }
+        let position = position_plan
+            .as_ref()
+            .ok_or_else(|| "zero-crossing: missing frozen position plan".to_string())?;
+        let open = &position.phases[1];
+        let open_sizing = execution_sizing(open.size, cli.slices, asset.sz_decimals, mid, true)
+            .map_err(|e| format!("zero-crossing: open phase sizing invalid: {e}"))?;
+        let remaining_duration = remaining_execution_window(
+            logical_execution_deadline_unix_ms.unwrap_or_else(|| {
+                wall_clock_now_ms().saturating_add(cli.duration.as_millis() as u64)
+            }),
+            wall_clock_now_ms(),
+        )
+        .unwrap_or(Duration::ZERO);
+        if remaining_duration.is_zero() {
+            if let Some(j) = journal.as_mut() {
+                record_position_incomplete(
+                    &resolved_state_dir,
+                    j,
+                    position.target_szi,
+                    Ok(latest.szi),
+                    "zero-crossing deadline elapsed after close-to-flat",
+                )?;
+            }
+            if let Some(j) = journal.as_ref() {
+                emit_live_report_json(&cli, &resolved_state_dir, j.run_id())?;
+            }
+            return Err(
+                "zero-crossing: deadline elapsed after close phase; open phase was not started"
+                    .into(),
+            );
+        }
+        let open_plan = TwapPlan {
+            symbol: symbol.clone(),
+            side: open.side,
+            asset_index: asset.asset_index,
+            sz_decimals: asset.sz_decimals,
+            per_slice: open_sizing.per_slice,
+            total_adjusted: open_sizing.total_adjusted,
+            total_requested: open.size,
+            slices: cli.slices,
+            duration: remaining_duration,
+            absolute_deadline_unix_ms: logical_execution_deadline_unix_ms,
+            slippage_bps: risk.slippage_bps,
+            max_book_age_ms: cli.max_book_age_ms,
+            settle_retries: cli.settle_retries,
+            read_only: cli.read_only,
+            reduce_only: false,
+            max_notional_usd,
+            agent: agent_address.clone(),
+            master: Some(master.clone()),
+            child_algo: cli.child_algo.into(),
+            follow_poll_secs: cli.follow_poll_secs,
+            follow_repost_secs: cli.follow_repost_secs,
+            follow_threshold_bps: cli.follow_threshold_bps,
+        };
+        let prior = if let Some(j) = journal.as_ref() {
+            let records = hype_trigger_twap::journal::ExecutionJournal::read_all(
+                &resolved_state_dir,
+                j.run_id(),
+            )
+            .map_err(|e| format!("zero-crossing: cannot restore cap accounting: {e}"))?;
+            hype_trigger_twap::journal::ValidatedJournalReplay::replay(&records)
+                .map_err(|e| format!("zero-crossing: invalid cap accounting journal: {e}"))?
+                .fill_totals
+                .notional
+        } else {
+            Decimal::ZERO
+        };
+        let open_report = hype_trigger_twap::twap::run_twap_journaled_with_prior_notional_deferred_position_guard(
+            &client,
+            &open_plan,
+            prior,
+            journal.as_mut(),
+            Some(shutdown_signal),
+            hype_trigger_twap::twap::PositionTargetGuard::new(
+                master.clone(),
+                position.target_szi,
+                open_plan.side,
+            ),
+        )
+        .await;
+        hype_trigger_twap::twap::TwapReport {
+            filled: report
+                .filled
+                .checked_add(open_report.filled)
+                .unwrap_or(Decimal::MAX),
+            slices_executed: report
+                .slices_executed
+                .saturating_add(open_report.slices_executed),
+            slices_skipped: report
+                .slices_skipped
+                .saturating_add(open_report.slices_skipped),
+            elapsed: report
+                .elapsed
+                .checked_add(open_report.elapsed)
+                .unwrap_or(Duration::MAX),
+            ..open_report
+        }
+    } else {
+        report
+    };
+    // The durable journal, not this process-local FillStats, is the source
+    // of truth for a resumed report.  In particular its execution VWAP is
+    // withheld when any terminal lacks exchange `avg_px`; cap-accounting's
+    // conservative Prepared-price fallback is never presented as a fill.
+    let (report, durable_whole_run) = if let Some(j) = journal.as_ref() {
+        let records = hype_trigger_twap::journal::ExecutionJournal::read_all(
+            &resolved_state_dir,
+            j.run_id(),
+        )
+        .map_err(|error| {
+            format!(
+                "execution finished, but its durable journal cannot be read; refusing an in-memory success report: {error}"
+            )
+        })?;
+        let replay = hype_trigger_twap::journal::ValidatedJournalReplay::replay(&records)
+            .map_err(|error| {
+                format!(
+                    "execution finished, but its durable journal is invalid; refusing an in-memory success report: {error}"
+                )
+            })?;
+        let whole_run = whole_run_from_replay(&replay);
+        (
+            hype_trigger_twap::twap::TwapReport {
+                filled: replay.fill_totals.filled_sz,
+                avg_px: replay.execution_vwap,
+                ..report
+            },
+            Some(whole_run),
+        )
+    } else {
+        (report, None)
+    };
+    let logical_position_total = resumed_frozen_position
+        .as_ref()
+        .or(position_plan.as_ref())
+        .map(|position| {
+            position
+                .phases
+                .iter()
+                .try_fold(Decimal::ZERO, |total, phase| total.checked_add(phase.size))
+                .ok_or_else(|| "position phase total overflowed".to_string())
+        })
+        .transpose()?;
+    let mut report = match logical_position_total {
+        Some(total) => hype_trigger_twap::twap::TwapReport {
+            total_requested: total,
+            total_adjusted: total,
+            ..report
+        },
+        None => report,
+    };
     print!("{}", report.render());
+    if let Some(whole) = durable_whole_run.as_ref() {
+        println!(
+            "whole run: accounted_notional={} cap_remaining={} unresolved={} logical_elapsed_ms={}",
+            whole.accounted_notional,
+            whole.cap_remaining.as_deref().unwrap_or("unbounded"),
+            whole.unresolved_cloids,
+            whole.logical_elapsed_ms
+        );
+    }
+    if position_plan.is_some() && report.exit_code() != 0 {
+        let expected = position_plan
+            .as_ref()
+            .ok_or_else(|| "position plan disappeared while recording abort".to_string())?;
+        let observation = match master.as_ref() {
+            Some(master) => client
+                .fetch_perp_position(master, &symbol)
+                .await
+                .map(|position| position.szi)
+                .map_err(|error| error.to_string()),
+            None => Err("resolved master address is unavailable".into()),
+        };
+        // A reduce-only child can be rejected as already-flat even though an
+        // external/manual fill reached the frozen target in the meantime.
+        // The TWAP report correctly treats the exchange rejection as an
+        // abort, but an authoritative exact-target read is stronger evidence
+        // for position modes.  Promote it to completion only when the
+        // journal itself replays cleanly and has no unresolved cloids; never
+        // use this path to hide an ambiguous order.
+        if observation.as_ref() == Ok(&expected.target_szi) {
+            let unresolved = if let Some(j) = journal.as_ref() {
+                let records = hype_trigger_twap::journal::ExecutionJournal::read_all(
+                    &resolved_state_dir,
+                    j.run_id(),
+                )
+                .map_err(|error| {
+                    format!(
+                        "position target matched after abort, but journal cannot be read; refusing completion: {error}"
+                    )
+                })?;
+                hype_trigger_twap::journal::ValidatedJournalReplay::replay(&records)
+                    .map_err(|error| {
+                        format!(
+                            "position target matched after abort, but journal is invalid; refusing completion: {error}"
+                        )
+                    })?
+                    .summary
+                    .unresolved_cloids()
+            } else {
+                Vec::new()
+            };
+            if unresolved.is_empty() {
+                tracing::warn!(
+                    target = %human(expected.target_szi),
+                    "authoritative position matched frozen target after child abort; accepting safe completion"
+                );
+                report.abort_reason = None;
+            } else {
+                if let Some(j) = journal.as_mut() {
+                    record_position_incomplete(
+                        &resolved_state_dir,
+                        j,
+                        expected.target_szi,
+                        observation,
+                        "position target matched after abort but journal has unresolved cloids",
+                    )?;
+                }
+                if let Some(j) = journal.as_ref() {
+                    emit_live_report_json(&cli, &resolved_state_dir, j.run_id())?;
+                }
+                return Err(
+                    "position target matched after abort, but unresolved child orders prevent safe completion"
+                        .into(),
+                );
+            }
+        }
+        if report.exit_code() == 0 {
+            // Continue into the normal terminal verification below, which
+            // records the sole completed FinalReport from authoritative
+            // exchange state.
+        } else if let Some(j) = journal.as_mut() {
+            record_position_incomplete(
+                &resolved_state_dir,
+                j,
+                expected.target_szi,
+                observation,
+                "position-aware execution aborted",
+            )?;
+        }
+        if report.exit_code() != 0 {
+            if let Some(j) = journal.as_ref() {
+                emit_live_report_json(&cli, &resolved_state_dir, j.run_id())?;
+            }
+            return Ok(ExitCode::FAILURE);
+        }
+    }
+    // A reduce-only exchange rejection (including the common "already flat"
+    // case) is not evidence that a close succeeded.  Position modes always
+    // re-read the authoritative signed size after all child orders have
+    // settled; any mismatch or failed read leaves the last journal report
+    // incomplete so `--resume` remains the only recovery path.
+    if let Some(expected) = position_plan.as_ref() {
+        let master = master
+            .as_ref()
+            .ok_or_else(|| "position mode lost its resolved master address".to_string())?;
+        let verified = client.fetch_perp_position(master, &symbol).await;
+        let verified_szi = match verified {
+            Ok(position) if position.szi == expected.target_szi => position.szi,
+            Ok(position) => {
+                if let Some(j) = journal.as_mut() {
+                    record_position_incomplete(
+                        &resolved_state_dir,
+                        j,
+                        expected.target_szi,
+                        Ok(position.szi),
+                        "position-aware terminal verification mismatched frozen target",
+                    )?;
+                }
+                if let Some(j) = journal.as_ref() {
+                    emit_live_report_json(&cli, &resolved_state_dir, j.run_id())?;
+                }
+                return Err(format!(
+                    "position-aware terminal verification failed: expected {}, got {}; no further order was sent",
+                    expected.target_szi, position.szi
+                ));
+            }
+            Err(error) => {
+                if let Some(j) = journal.as_mut() {
+                    record_position_incomplete(
+                        &resolved_state_dir,
+                        j,
+                        expected.target_szi,
+                        Err(error.to_string()),
+                        "position-aware terminal verification unavailable",
+                    )?;
+                }
+                if let Some(j) = journal.as_ref() {
+                    emit_live_report_json(&cli, &resolved_state_dir, j.run_id())?;
+                }
+                return Err(format!(
+                    "position-aware terminal verification failed closed: {error}; no further order was sent"
+                ));
+            }
+        };
+        println!("POSITION VERIFIED: signed size {}", human(verified_szi));
+        if let Some(j) = journal.as_mut() {
+            let records = hype_trigger_twap::journal::ExecutionJournal::read_all(
+                &resolved_state_dir,
+                j.run_id(),
+            )
+            .map_err(|error| {
+                format!(
+                    "position verification matched the target, but its durable journal cannot be read: {error}"
+                )
+            })?;
+            let replay = hype_trigger_twap::journal::ValidatedJournalReplay::replay(&records)
+                .map_err(|error| {
+                    format!(
+                        "position verification matched the target, but its durable journal is invalid: {error}"
+                    )
+                })?;
+            let whole_run = whole_run_from_replay(&replay);
+            j.record(&hype_trigger_twap::journal::JournalRecord::FinalReport {
+                completed: true,
+                filled_total: replay.fill_totals.filled_sz.to_string(),
+                outcome_unknown_cloids: Vec::new(),
+                note: "position-aware terminal verification matched frozen target".into(),
+                whole_run: Some(whole_run),
+            })
+            .map_err(|e| format!("recording position verification failed: {e}"))?;
+        }
+    }
+    if let Some(j) = journal.as_ref() {
+        emit_live_report_json(&cli, &resolved_state_dir, j.run_id())?;
+    }
+
+    if let Some(observer) = read_only_observer.as_mut() {
+        observer.emit_simulation_final(report.slices_executed, report.exit_code() == 0);
+    }
 
     if report.exit_code() == 0 {
         Ok(ExitCode::SUCCESS)
     } else {
         Ok(ExitCode::FAILURE)
     }
+    };
+
+    if signal_task.is_some() {
+        complete_before_shutdown_grace(execution_fut, grace_shutdown, cli.shutdown_grace)
+            .await
+    } else {
+        Ok(execution_fut.await)
+    }
+    };
+    let result = match execution_result {
+        Ok(result) => result,
+        Err(()) => {
+            tracing::error!(
+                grace = ?cli.shutdown_grace,
+                "shutdown grace period exceeded; giving up with outcome_unknown"
+            );
+            if let Some(j) = journal.as_mut() {
+                // Derive every FinalReport accounting field from one validated
+                // replay. A malformed/unreadable journal must not be papered
+                // over with guessed zero/empty values.
+                let replay = grace_timeout_report_fields(&resolved_state_dir, j.run_id())
+                    .map_err(|replay_error| {
+                        format!(
+                            "shutdown grace period ({:?}) exceeded before reconciliation finished; durable journal accounting could not be validated: {replay_error}",
+                            cli.shutdown_grace
+                        )
+                    })?;
+                let whole_run = whole_run_from_replay(&replay);
+                j.record(&hype_trigger_twap::journal::JournalRecord::FinalReport {
+                    completed: false,
+                    filled_total: replay.fill_totals.filled_sz.to_string(),
+                    outcome_unknown_cloids: replay.summary.unresolved_cloids(),
+                    note: format!(
+                        "shutdown grace period ({:?}) exceeded before reconciliation finished",
+                        cli.shutdown_grace
+                    ),
+                    whole_run: Some(whole_run),
+                })
+                .map_err(|record_error| {
+                    format!(
+                        "shutdown grace period ({:?}) exceeded before reconciliation finished; additionally failed to record the durable incomplete report: {record_error}",
+                        cli.shutdown_grace
+                    )
+                })?;
+            }
+            if let Some(j) = journal.as_ref() {
+                emit_live_report_json(&cli, &resolved_state_dir, j.run_id())?;
+            }
+            Ok(ExitCode::FAILURE)
+        }
+    };
+    result
+    }
+    .await;
+    // All journal/event observers captured by the execution future are gone
+    // here. Close the final alert sender and give the isolated worker a
+    // bounded flush window before Tokio tears the runtime down.
+    observability.shutdown().await;
+    result
+}
+
+/// Emit the same schema-v1 DTO used by `hype-twap-runs`, after re-reading the
+/// durable journal.  The live process never serializes its in-memory report,
+/// ensuring resume/abort/early-complete output shares the one validated
+/// interpretation used by the dedicated inspection command.
+fn emit_live_report_json(cli: &Cli, state_dir: &Path, run_id: &str) -> Result<(), String> {
+    let Some(destination) = cli.report_json.as_deref() else {
+        return Ok(());
+    };
+    let report = hype_trigger_twap::run_reports::inspect(state_dir, run_id);
+    let json = serde_json::to_vec(&report).map_err(|e| format!("encoding --report-json: {e}"))?;
+    if destination == Path::new("-") {
+        std::io::stdout()
+            .write_all(&json)
+            .and_then(|_| std::io::stdout().write_all(b"\n"))
+            .map_err(|e| format!("writing --report-json stdout: {e}"))?;
+        return Ok(());
+    }
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let temporary = parent.join(format!(
+        ".hype-twap-report-{}-{}.tmp",
+        std::process::id(),
+        uuid::Uuid::now_v7()
+    ));
+    let write_result = (|| -> Result<(), String> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|e| format!("creating --report-json temporary file: {e}"))?;
+        file.write_all(&json)
+            .and_then(|_| file.write_all(b"\n"))
+            .and_then(|_| file.sync_all())
+            .map_err(|e| format!("writing --report-json temporary file: {e}"))?;
+        fs::rename(&temporary, destination)
+            .map_err(|e| format!("publishing --report-json file: {e}"))?;
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| format!("syncing --report-json directory: {e}"))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+fn whole_run_from_replay(
+    replay: &hype_trigger_twap::journal::ValidatedJournalReplay,
+) -> hype_trigger_twap::journal::WholeRunSummary {
+    let started_at_unix_ms = replay
+        .summary
+        .header
+        .as_ref()
+        .map(|header| header.started_at_unix_ms)
+        .unwrap_or_else(wall_clock_now_ms);
+    hype_trigger_twap::journal::WholeRunSummary {
+        requested_total: replay
+            .summary
+            .header
+            .as_ref()
+            .and_then(|header| header.execution_fingerprint.as_ref())
+            .map(|fingerprint| {
+                fingerprint
+                    .logical_position_total()
+                    .unwrap_or_else(|| fingerprint.total_requested.clone())
+            }),
+        adjusted_total: replay
+            .summary
+            .header
+            .as_ref()
+            .and_then(|header| header.execution_fingerprint.as_ref())
+            .map(|fingerprint| {
+                fingerprint
+                    .logical_position_total()
+                    .unwrap_or_else(|| fingerprint.total_adjusted.clone())
+            }),
+        accounted_notional: replay.fill_totals.notional.to_string(),
+        cap_remaining: replay.fingerprint_max_notional.map(|cap| {
+            (cap - replay.fill_totals.notional)
+                .max(Decimal::ZERO)
+                .to_string()
+        }),
+        trusted_vwap: replay.execution_vwap.map(|value| value.to_string()),
+        logical_elapsed_ms: wall_clock_now_ms().saturating_sub(started_at_unix_ms),
+        unresolved_cloids: replay.summary.unresolved_cloids().len(),
+    }
+}
+
+fn replay_whole_run(
+    state_root: &Path,
+    run_id: &str,
+) -> Result<hype_trigger_twap::journal::WholeRunSummary, String> {
+    let records = hype_trigger_twap::journal::ExecutionJournal::read_all(state_root, run_id)
+        .map_err(|e| format!("reading journal for whole-run report: {e}"))?;
+    let replay = hype_trigger_twap::journal::ValidatedJournalReplay::replay(&records)
+        .map_err(|e| format!("validating journal for whole-run report: {e}"))?;
+    Ok(whole_run_from_replay(&replay))
+}
+
+fn live_journal_observer(
+    journal: &hype_trigger_twap::journal::ExecutionJournal,
+    observability: &ObservabilityRuntime,
+) -> JournalEventObserver {
+    match JournalEventObserver::open(
+        &journal.dir().join("events.jsonl"),
+        ExecutionMode::Live,
+        Arc::clone(&observability.metrics),
+        observability.alerts.clone(),
+    ) {
+        Ok(observer) => observer,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "observability event log unavailable; continuing with metrics/hook only"
+            );
+            JournalEventObserver::without_event_log(
+                ExecutionMode::Live,
+                Arc::clone(&observability.metrics),
+                observability.alerts.clone(),
+            )
+        }
+    }
+}
+
+/// Emit a complete, state-free lifecycle for every successful position-mode
+/// read-only exit, including preflight-only no-op branches that never build a
+/// [`TwapPlan`]. The side is the first executable phase when one exists;
+/// otherwise it describes the already-held target orientation required by the
+/// schema-v1 DTO. Event-log failures remain best-effort and never change the
+/// trading/simulation result.
+fn emit_read_only_position_lifecycle(
+    cli: &Cli,
+    observability: &ObservabilityRuntime,
+    plan: &PositionExecutionPlan,
+    planned_slices: u32,
+) {
+    if !cli.read_only {
+        return;
+    }
+    let Some(path) = cli.event_jsonl.as_ref() else {
+        return;
+    };
+    let mut observer = JournalEventObserver::open(
+        path,
+        ExecutionMode::ReadOnly,
+        Arc::clone(&observability.metrics),
+        observability.alerts.clone(),
+    )
+    .unwrap_or_else(|_| {
+        tracing::warn!(
+            path = %path.display(),
+            "read-only event log unavailable; position plan continues without JSONL"
+        );
+        JournalEventObserver::without_event_log(
+            ExecutionMode::ReadOnly,
+            Arc::clone(&observability.metrics),
+            observability.alerts.clone(),
+        )
+    });
+    let side = plan.phases.first().map_or_else(
+        || {
+            if plan.target_szi < Decimal::ZERO {
+                Side::Short
+            } else {
+                Side::Long
+            }
+        },
+        |phase| phase.side,
+    );
+    observer.emit_simulation_started(
+        uuid::Uuid::now_v7(),
+        plan.symbol.clone(),
+        side,
+        planned_slices,
+    );
+    observer.emit_simulation_final(0, true);
+}
+
+/// Append a fail-closed position terminal report using the durable replay for
+/// fill/unknown accounting. The authoritative position observation is kept
+/// in the journal note for operator recovery, while the observability sidecar
+/// projects only its closed, secret-free failure vocabulary.
+fn record_position_incomplete(
+    state_root: &Path,
+    journal: &mut hype_trigger_twap::journal::ExecutionJournal,
+    target_szi: Decimal,
+    observation: Result<Decimal, String>,
+    context: &str,
+) -> Result<(), String> {
+    let records =
+        hype_trigger_twap::journal::ExecutionJournal::read_all(state_root, journal.run_id())
+            .map_err(|error| format!("{context}: cannot read durable journal: {error}"))?;
+    let replay = hype_trigger_twap::journal::ValidatedJournalReplay::replay(&records)
+        .map_err(|error| format!("{context}: cannot validate durable journal: {error}"))?;
+    let note = match observation {
+        Ok(actual_szi) => format!(
+            "{context}: authoritative signed position is {actual_szi}; frozen target is {target_szi}; automatic continuation stopped"
+        ),
+        Err(error) => format!(
+            "{context}: authoritative position unavailable ({error}); frozen target is {target_szi}; automatic continuation stopped"
+        ),
+    };
+    journal
+        .record(&hype_trigger_twap::journal::JournalRecord::FinalReport {
+            completed: false,
+            filled_total: replay.fill_totals.filled_sz.to_string(),
+            outcome_unknown_cloids: replay.summary.unresolved_cloids(),
+            note,
+            whole_run: Some(whole_run_from_replay(&replay)),
+        })
+        .map_err(|error| format!("{context}: recording incomplete position report: {error}"))
 }
 
 /// Finding 2 fix: the `(filled_total, outcome_unknown_cloids)` a
@@ -1340,27 +4131,17 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
 /// the pre-fix hardcoded `(0, [])`, which discarded every real fill and
 /// every genuinely-still-open cloid.
 ///
-/// A read failure (journal file vanished, malformed, ...) falls back to
-/// `(0, [])` with a warning rather than panicking — the grace-timeout path
-/// is already the "giving up" branch; best-effort accounting here is still
-/// strictly better than the pre-fix behaviour, which was ALWAYS `(0, [])`.
+/// A read or validation failure is returned to the caller. A grace-timeout
+/// is already a failure, but it must never append a plausible-looking report
+/// with fabricated zero/empty accounting.
 fn grace_timeout_report_fields(
     state_root: &std::path::Path,
     run_id: &str,
-) -> (Decimal, Vec<hype_trigger_twap::types::Cloid>) {
-    hype_trigger_twap::journal::ExecutionJournal::read_all(state_root, run_id)
-        .map(|records| {
-            let summary = hype_trigger_twap::journal::summarize(&records);
-            (summary.total_filled(), summary.unresolved_cloids())
-        })
-        .unwrap_or_else(|e| {
-            tracing::warn!(
-                error = %e,
-                "grace-timeout FinalReport: failed to replay this run's own journal for \
-                 accounting; falling back to zero/empty"
-            );
-            (Decimal::ZERO, Vec::new())
-        })
+) -> Result<hype_trigger_twap::journal::ValidatedJournalReplay, String> {
+    let records = hype_trigger_twap::journal::ExecutionJournal::read_all(state_root, run_id)
+        .map_err(|error| format!("cannot read journal: {error}"))?;
+    hype_trigger_twap::journal::ValidatedJournalReplay::replay(&records)
+        .map_err(|error| format!("cannot validate journal: {error}"))
 }
 
 /// Issue #4: force-reconcile every submitted/unknown cloid in an incomplete
@@ -1391,72 +4172,15 @@ async fn reconcile_incomplete_run(
         journal.run_id(),
     )
     .map_err(|e| e.to_string())?;
-    let summary = hype_trigger_twap::journal::summarize(&records);
+    let replay = hype_trigger_twap::journal::ValidatedJournalReplay::replay(&records)
+        .map_err(|e| format!("cannot reconcile invalid journal: {e}"))?;
 
-    // Finding 3 fix: recover the TRUE original `slice_idx` for each
-    // unresolved cloid from its own `Prepared` record (joined by cloid) in
-    // the SAME prior journal, rather than writing a `0` placeholder. Every
-    // cloid this function ever reconciles was, by construction, placed by
-    // this same run's own `place_slice_reconciled` (which always journals
-    // `Prepared` before the network send — see src/twap.rs), so the join
-    // always succeeds for any cloid actually reachable via
-    // `unresolved_cloids()`; the `unwrap_or(0)` fallback exists only for a
-    // theoretically malformed/hand-edited journal missing its own Prepared
-    // record; see `docs` note in this function's caller-facing report if
-    // that ever fires in practice.
-    let slice_idx_by_cloid: std::collections::HashMap<hype_trigger_twap::types::Cloid, u32> =
-        records
-            .iter()
-            .filter_map(|r| match r {
-                hype_trigger_twap::journal::JournalRecord::Prepared {
-                    slice_idx, cloid, ..
-                } => Some((*cloid, *slice_idx)),
-                _ => None,
-            })
-            .collect();
-
-    // A2: `reconcile_unresolved_cloid` validates every fill it credits
-    // (`ValidatedFill::try_from_status`, bounds: 0<=filled<=intent.sz,
-    // avg_px>0 when filled>0) against the ORIGINAL Prepared intent for its
-    // cloid — the same trusted-boundary treatment every other fill in this
-    // codebase gets (Issue #7). Build that map alongside slice_idx's, from
-    // the SAME `Prepared` records (every cloid reconciled here was, by
-    // construction, journaled with one — see the note above).
-    let prepared_by_cloid: std::collections::HashMap<
-        hype_trigger_twap::types::Cloid,
-        hype_trigger_twap::twap::PreparedIntent,
-    > = records
-        .iter()
-        .filter_map(|r| match r {
-            hype_trigger_twap::journal::JournalRecord::Prepared {
-                cloid,
-                symbol,
-                side,
-                tif,
-                px,
-                sz,
-                ..
-            } => {
-                let px: Decimal = px.parse().ok()?;
-                let sz: Decimal = sz.parse().ok()?;
-                Some((
-                    *cloid,
-                    hype_trigger_twap::twap::PreparedIntent {
-                        symbol: symbol.clone(),
-                        side: *side,
-                        tif: *tif,
-                        px,
-                        sz,
-                    },
-                ))
-            }
-            _ => None,
-        })
-        .collect();
-
-    for cloid in summary.unresolved_cloids() {
-        let slice_idx = slice_idx_by_cloid.get(&cloid).copied().unwrap_or(0);
-        let prepared = prepared_by_cloid.get(&cloid).ok_or_else(|| {
+    // The validated replay is the sole source of both state and original
+    // intent. Reconciliation cross-checks each cloid with its own durable
+    // side (important for a zero-crossing position run), never a CLI
+    // placeholder or a separately reconstructed map.
+    for cloid in replay.summary.unresolved_cloids() {
+        let stored = replay.prepared.get(&cloid).ok_or_else(|| {
             format!(
                 "cannot reconcile cloid {cloid}: no Prepared record found in this run's own \
                  journal — the journal is malformed (every cloid reachable via \
@@ -1464,8 +4188,27 @@ async fn reconcile_incomplete_run(
                  the send that made it unresolved)"
             )
         })?;
+        let prepared = hype_trigger_twap::twap::PreparedIntent {
+            symbol: stored.symbol.clone(),
+            side: stored.side,
+            tif: stored.tif,
+            px: stored.px.parse().map_err(|_| {
+                format!("cannot reconcile cloid {cloid}: invalid durable Prepared.px")
+            })?,
+            sz: stored.sz.parse().map_err(|_| {
+                format!("cannot reconcile cloid {cloid}: invalid durable Prepared.sz")
+            })?,
+        };
+        let mut cloid_plan = plan.clone();
+        cloid_plan.symbol = stored.symbol.clone();
+        cloid_plan.side = stored.side;
         hype_trigger_twap::twap::reconcile_unresolved_cloid(
-            client, plan, cloid, slice_idx, prepared, journal,
+            client,
+            &cloid_plan,
+            cloid,
+            stored.slice_idx,
+            &prepared,
+            journal,
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -1498,6 +4241,148 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_grace_bounds_blocking_later_position_work() {
+        // Model the exact-zero/final-position read after a first phase has
+        // returned: it is outside the slice loop, but still inside the one
+        // lifecycle future passed to `complete_before_shutdown_grace`.
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(complete_before_shutdown_grace(
+            std::future::pending::<()>(),
+            ShutdownSignal::new(rx),
+            Duration::from_secs(1),
+        ));
+        tokio::task::yield_now().await;
+        tx.send(true).unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(task.await.unwrap(), Err(()));
+    }
+
+    #[test]
+    fn report_json_is_atomic_secret_safe_and_matches_inspection_schema() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+        let run_id = "report-fixture";
+        let mut journal = hype_trigger_twap::journal::ExecutionJournal::start(
+            &state_dir,
+            run_id.into(),
+            hype_trigger_twap::journal::RunHeader {
+                run_id: run_id.into(),
+                network: "testnet".into(),
+                agent: None,
+                master: None,
+                symbol: Symbol::new("HYPE"),
+                side: Side::Long,
+                slices: 1,
+                plan_hash: "public-plan-hash".into(),
+                execution_fingerprint: None,
+                started_at_unix_ms: 1,
+                execution_deadline_unix_ms: Some(2),
+            },
+        )
+        .unwrap();
+        journal
+            .record(&hype_trigger_twap::journal::JournalRecord::FinalReport {
+                completed: true,
+                filled_total: "0".into(),
+                outcome_unknown_cloids: Vec::new(),
+                note: "potential-secret-that-must-not-appear".into(),
+                whole_run: None,
+            })
+            .unwrap();
+        let report_path = tmp.path().join("final-report.json");
+        fs::write(&report_path, b"stale").unwrap();
+        let cli = Cli::try_parse_from([
+            "hype-twap",
+            "--symbol",
+            "HYPE",
+            "--side",
+            "long",
+            "--usd",
+            "1",
+            "--duration",
+            "1m",
+            "--report-json",
+            report_path.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        emit_live_report_json(&cli, &state_dir, run_id).unwrap();
+        let written = fs::read_to_string(&report_path).unwrap();
+        let actual: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let expected =
+            serde_json::to_value(hype_trigger_twap::run_reports::inspect(&state_dir, run_id))
+                .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual["schema_version"], 1);
+        assert!(!written.contains("potential-secret-that-must-not-appear"));
+        assert!(
+            !tmp.path()
+                .read_dir()
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".hype-twap-report-")),
+            "atomic write must not leave a temporary report behind"
+        );
+    }
+
+    fn test_pair_barrier() -> (PathBuf, PairBarrier) {
+        let dir =
+            std::env::temp_dir().join(format!("hype-twap-pair-test-{}", uuid::Uuid::now_v7()));
+        fs::create_dir(&dir).unwrap();
+        let barrier = PairBarrier {
+            ready_file: dir.join("leg.ready.json"),
+            start_file: dir.join("start.json"),
+            run_id: "pair-test-1".into(),
+            timeout: Duration::from_millis(200),
+        };
+        (dir, barrier)
+    }
+
+    #[test]
+    fn pair_barrier_flags_are_all_or_nothing() {
+        let mut args = base_args();
+        args.extend(["--pair-run-id", "pair-1"]);
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(cli
+            .pair_barrier()
+            .unwrap_err()
+            .contains("supplied together"));
+    }
+
+    #[tokio::test]
+    async fn pair_barrier_publishes_ready_then_waits_for_common_release() {
+        let (dir, barrier) = test_pair_barrier();
+        let start = PairStartFile {
+            run_id: barrier.run_id.clone(),
+            start_at_unix_ms: wall_clock_now_ms() + 40,
+        };
+        fs::write(&barrier.start_file, serde_json::to_vec(&start).unwrap()).unwrap();
+        wait_for_pair_start(&barrier, Some("live-journal-123"))
+            .await
+            .unwrap();
+        let ready: serde_json::Value =
+            serde_json::from_slice(&fs::read(&barrier.ready_file).unwrap()).unwrap();
+        assert_eq!(ready["run_id"], barrier.run_id);
+        assert!(ready["ready_at_unix_ms"].as_u64().is_some());
+        assert_eq!(ready["journal_run_id"], "live-journal-123");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pair_barrier_timeout_fails_before_execution() {
+        let (dir, mut barrier) = test_pair_barrier();
+        barrier.timeout = Duration::from_millis(25);
+        let error = wait_for_pair_start(&barrier, None).await.unwrap_err();
+        assert!(error.contains("no order was placed"));
+        assert!(barrier.ready_file.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     // === F3: --help documents the environment contract ===
 
     #[test]
@@ -1528,8 +4413,11 @@ mod tests {
             help.contains("AGENT (API wallet) address — NOT the master"),
             "{help}"
         );
-        // And HL_MASTER_ADDRESS must be documented as optional / auto-probed.
+        // New runs may auto-probe it, while resume/abandon must supply it
+        // before any API call so durable identity cannot be rebound.
         assert!(help.contains("userRole"), "{help}");
+        assert!(help.contains("required"), "{help}");
+        assert!(help.contains("--resume/--abandon-incomplete-run"), "{help}");
     }
 
     #[test]
@@ -1561,7 +4449,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cli.symbol, "HYPE");
-        assert_eq!(cli.side, SideArg::Long);
+        assert_eq!(cli.side, Some(SideArg::Long));
         assert_eq!(cli.usd, Some(Decimal::from(1500)));
         assert_eq!(cli.duration, Duration::from_secs(1800));
         assert!(!cli.read_only);
@@ -1583,6 +4471,95 @@ mod tests {
         assert_eq!(cli.max_book_age_ms, 3000);
         assert_eq!(cli.trigger_poll_secs, 2);
         assert_eq!(cli.wait_network_grace, Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn equivalent_decimal_spellings_have_one_fingerprint_representation() {
+        for spelling in ["1", "1.0", "1.000000"] {
+            let value: Decimal = spelling.parse().unwrap();
+            assert_eq!(canonical_decimal(value), "1");
+        }
+        let a = Cli::try_parse_from([
+            "hype-twap",
+            "--symbol",
+            "HYPE",
+            "--side",
+            "long",
+            "--size",
+            "1.0",
+            "--duration",
+            "1m",
+        ])
+        .unwrap();
+        let b = Cli::try_parse_from([
+            "hype-twap",
+            "--symbol",
+            "HYPE",
+            "--side",
+            "long",
+            "--size",
+            "1.000",
+            "--duration",
+            "1m",
+        ])
+        .unwrap();
+        assert_eq!(requested_mode_and_value(&a), requested_mode_and_value(&b));
+    }
+
+    #[test]
+    fn position_sizing_preserves_the_final_grid_aligned_remainder() {
+        let ordinary = execution_sizing(dec!(1.01), 2, 2, dec!(50), false).unwrap();
+        assert_eq!(
+            (ordinary.per_slice, ordinary.total_adjusted),
+            (dec!(0.50), dec!(1.00))
+        );
+
+        let position = execution_sizing(dec!(1.01), 2, 2, dec!(50), true).unwrap();
+        assert_eq!(
+            (position.per_slice, position.total_adjusted),
+            (dec!(0.50), dec!(1.01))
+        );
+        assert_eq!(
+            hype_trigger_twap::twap::target_at_slice(
+                2,
+                2,
+                position.per_slice,
+                position.total_adjusted,
+            ),
+            dec!(1.01),
+            "the final slice must target the exact frozen position delta"
+        );
+    }
+
+    #[test]
+    fn public_addresses_are_strict_and_canonical() {
+        let upper = "0xABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD";
+        assert_eq!(
+            parse_public_address("address", upper).unwrap().as_str(),
+            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        );
+        for invalid in [
+            "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "0x1234",
+            "0xgggggggggggggggggggggggggggggggggggggggg",
+            "0Xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        ] {
+            assert!(
+                parse_public_address("address", invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn flatten_deadline_is_rejected_outside_flatten_mode() {
+        let mut args = base_args();
+        args.extend(["--flatten-deadline-unix-ms", "9999999999999"]);
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert_eq!(
+            cli.validate().unwrap_err(),
+            "--flatten-deadline-unix-ms requires --flatten"
+        );
     }
 
     // === Issue #1: --child-algo ===
@@ -2101,6 +5078,71 @@ mod tests {
     const AGENT: &str = "0x14791697260e4c9a71f18484c9f997b308e59325";
     const MASTER: &str = "0x00000000000000000000000000000000000000aa";
 
+    #[test]
+    fn flatten_confirmation_preflight_renders_every_token_bound_field_in_stable_order() {
+        let confirmation = FlattenConfirmation {
+            schema_version: FlattenConfirmation::SCHEMA_VERSION,
+            network: "testnet".into(),
+            master: Address::new(MASTER),
+            symbol: Symbol::new("HYPE"),
+            initial_szi: dec!(-2.50),
+            close_side: Side::Long,
+            max_close_size: dec!(2.50),
+            max_notional_usd: dec!(1234.50),
+            child_algo: "passive".into(),
+            execution_deadline_unix_ms: 1_800_000_000_123,
+        };
+        assert_eq!(
+            format_flatten_confirmation_preflight(&confirmation),
+            format!(
+                "FLATTEN PREFLIGHT:\nnetwork: testnet\nmaster: {MASTER}\nsymbol: HYPE\ninitial_szi: -2.5\nclose_side: long\nmax_close_size: 2.5\nmax_notional_usd: 1234.5\nchild_algo: passive\nexecution_deadline_unix_ms: 1800000000123"
+            )
+        );
+    }
+
+    #[test]
+    fn resume_deadline_boundary_and_multiple_restarts_never_extend_the_window() {
+        let absolute_deadline = 10_000;
+        let attempts = [1_000, 7_500, 9_999];
+        let remaining: Vec<_> = attempts
+            .into_iter()
+            .map(|now| {
+                remaining_execution_window(absolute_deadline, now)
+                    .expect("every pre-deadline resume has a positive window")
+            })
+            .collect();
+
+        assert_eq!(
+            remaining,
+            [
+                Duration::from_millis(9_000),
+                Duration::from_millis(2_500),
+                Duration::from_millis(1),
+            ]
+        );
+        for (now, window) in attempts.into_iter().zip(remaining) {
+            assert_eq!(
+                now + u64::try_from(window.as_millis()).unwrap(),
+                absolute_deadline,
+                "each restarted process must reconstruct the same immutable deadline"
+            );
+        }
+        assert!(
+            remaining_execution_window(absolute_deadline, 9_999).is_some(),
+            "a positive remainder shorter than one nominal slice interval is allowed; the send gate still owns the exact deadline"
+        );
+        assert_eq!(
+            remaining_execution_window(absolute_deadline, absolute_deadline),
+            None,
+            "the exact boundary is reconciliation-only"
+        );
+        assert_eq!(
+            remaining_execution_window(absolute_deadline, absolute_deadline + 1),
+            None,
+            "a post-boundary restart cannot regain an execution window"
+        );
+    }
+
     fn book_body_at(coin: &str, bid: &str, ask: &str, time_ms: i64) -> String {
         format!(
             r#"{{"coin":"{coin}","time":{time_ms},"levels":[
@@ -2233,6 +5275,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(hl_env_vars)]
     async fn issue2_live_skew_beyond_tolerance_fails_closed_at_execution_entry_not_prewait() {
+        let state_dir = TempDir::new();
+        let state_dir_arg = state_dir.path().to_string_lossy().into_owned();
         let mut server = mockito::Server::new_async().await;
         let _meta = server
             .mock("POST", "/info")
@@ -2305,6 +5349,8 @@ mod tests {
             // no TLS support), which the loopback carve-out on
             // validate_endpoint_override permits once this flag is passed.
             "--allow-custom-endpoints",
+            "--state-dir",
+            &state_dir_arg,
             "--read-only",
             "false",
         ])
@@ -2426,7 +5472,9 @@ mod tests {
                 side: hype_trigger_twap::types::Side::Long,
                 slices: 2,
                 plan_hash: "irrelevant".into(),
+                execution_fingerprint: None,
                 started_at_unix_ms: 0,
+                execution_deadline_unix_ms: None,
             },
         )
         .unwrap();
@@ -2470,19 +5518,25 @@ mod tests {
         // No FinalReport: this is the still-open state a grace-timeout
         // would fire against.
 
-        let (filled_total, outcome_unknown_cloids) =
-            grace_timeout_report_fields(&state_dir, "run-grace-timeout");
+        let replay = grace_timeout_report_fields(&state_dir, "run-grace-timeout").unwrap();
 
         assert_eq!(
-            filled_total,
+            replay.fill_totals.filled_sz,
             rust_decimal::Decimal::from(3),
             "must reflect the ACTUAL prior fill (3), not the hardcoded 0"
         );
         assert_eq!(
-            outcome_unknown_cloids,
+            replay.summary.unresolved_cloids(),
             vec![unresolved_cloid],
             "must list the ACTUAL still-unresolved cloid, not an empty list"
         );
+    }
+
+    #[test]
+    fn grace_timeout_report_fields_refuse_missing_journal_instead_of_fabricating_zeroes() {
+        let tmp = TempDir::new();
+        let error = grace_timeout_report_fields(tmp.path(), "missing-run").unwrap_err();
+        assert!(error.contains("cannot read journal"), "{error}");
     }
 
     fn live_cli(extra: &[&str], state_dir: &std::path::Path) -> Vec<String> {
@@ -2500,14 +5554,385 @@ mod tests {
             "1".into(),
             "--max-notional-usd".into(),
             "1000000".into(),
+            "--master-address".into(),
+            MASTER.into(),
             "--allow-custom-endpoints".into(),
             "--read-only".into(),
             "false".into(),
             "--state-dir".into(),
             state_dir.display().to_string(),
         ];
-        args.extend(extra.iter().map(|s| s.to_string()));
+        args.extend(extra.iter().map(|s| (*s).to_string()));
         args
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn resume_requires_an_explicit_master_before_any_external_api_call() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+        let mut server = mockito::Server::new_async().await;
+        let info = server.mock("POST", "/info").expect(0).create_async().await;
+
+        let prior_master = std::env::var_os("HL_MASTER_ADDRESS");
+        std::env::remove_var("HL_MASTER_ADDRESS");
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+        let cli = Cli::try_parse_from([
+            "hype-twap",
+            "--symbol",
+            "HYPE",
+            "--side",
+            "long",
+            "--usd",
+            "50",
+            "--duration",
+            "1m",
+            "--network",
+            "testnet",
+            "--max-notional-usd",
+            "100",
+            "--allow-custom-endpoints",
+            "--read-only",
+            "false",
+            "--state-dir",
+            &state_dir.display().to_string(),
+            "--resume",
+            "run-never-read",
+        ])
+        .unwrap();
+
+        let result = run_with_cli(cli).await;
+
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+        if let Some(value) = prior_master {
+            std::env::set_var("HL_MASTER_ADDRESS", value);
+        }
+        let error = result.expect_err("resume without an explicit master must fail closed");
+        assert!(error.contains("require --master-address"), "{error}");
+        assert!(error.contains("before any external API call"), "{error}");
+        info.assert_async().await;
+        assert!(
+            !state_dir.exists(),
+            "identity refusal must happen before journal/state access"
+        );
+    }
+
+    #[test]
+    fn resume_identity_rejects_each_header_field_before_a_client_exists() {
+        type Mutation = Box<dyn Fn(&mut hype_trigger_twap::journal::RunHeader)>;
+        let cases: Vec<(&str, Mutation)> = vec![
+            (
+                "network",
+                Box::new(|header| header.network = "mainnet".into()),
+            ),
+            (
+                "agent",
+                Box::new(|header| {
+                    header.agent = Some(Address::new("0x3333333333333333333333333333333333333333"))
+                }),
+            ),
+            (
+                "master",
+                Box::new(|header| {
+                    header.master = Some(Address::new("0x4444444444444444444444444444444444444444"))
+                }),
+            ),
+            (
+                "symbol",
+                Box::new(|header| header.symbol = Symbol::new("BTC")),
+            ),
+            ("side", Box::new(|header| header.side = Side::Short)),
+        ];
+
+        for (field, mutate) in cases {
+            let tmp = TempDir::new();
+            let state_dir = tmp.path().join("state");
+            let run_id = format!("identity-{field}");
+            let mut header = hype_trigger_twap::journal::RunHeader {
+                run_id: run_id.clone(),
+                network: "testnet".into(),
+                agent: Some(Address::new(AGENT)),
+                master: Some(Address::new(MASTER)),
+                symbol: Symbol::new("HYPE"),
+                side: Side::Long,
+                slices: 1,
+                plan_hash: "legacy-is-readable-for-identity".into(),
+                execution_fingerprint: None,
+                started_at_unix_ms: 1,
+                execution_deadline_unix_ms: Some(2),
+            };
+            mutate(&mut header);
+            drop(
+                hype_trigger_twap::journal::ExecutionJournal::start(
+                    &state_dir,
+                    run_id.clone(),
+                    header,
+                )
+                .unwrap(),
+            );
+
+            // This validator has no HTTP client parameter. Reaching this
+            // typed mismatch therefore proves rejection precedes meta,
+            // userRole, orderStatus, and every other external request.
+            let error = validated_resume_replay(
+                &state_dir,
+                &run_id,
+                &Network::Testnet,
+                Some(&Address::new(AGENT)),
+                Some(&Address::new(MASTER)),
+                &Symbol::new("HYPE"),
+                Some(Side::Long),
+            )
+            .unwrap_err();
+            assert!(error.contains(field), "{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn resume_rejects_each_typed_fingerprint_field_before_order_construction() {
+        let cli = Cli::try_parse_from([
+            "hype-twap",
+            "--symbol",
+            "HYPE",
+            "--side",
+            "long",
+            "--size",
+            "10.0",
+            "--network",
+            "testnet",
+            "--duration",
+            "1m",
+            "--slices",
+            "10",
+            "--max-notional-usd",
+            "1000.0",
+            "--child-algo",
+            "market",
+            "--read-only",
+            "false",
+        ])
+        .unwrap();
+        cli.validate().unwrap();
+        let deadline = 1_900_000_000_000;
+        let plan = TwapPlan {
+            symbol: Symbol::new("HYPE"),
+            side: Side::Long,
+            asset_index: 0,
+            sz_decimals: 2,
+            per_slice: Decimal::ONE,
+            total_adjusted: Decimal::TEN,
+            total_requested: Decimal::TEN,
+            slices: 10,
+            duration: Duration::from_secs(60),
+            absolute_deadline_unix_ms: Some(deadline),
+            slippage_bps: cli.slippage_bps,
+            max_book_age_ms: cli.max_book_age_ms,
+            settle_retries: cli.settle_retries,
+            read_only: false,
+            reduce_only: false,
+            max_notional_usd: Decimal::from(1000),
+            agent: Some(Address::new(AGENT)),
+            master: Some(Address::new(MASTER)),
+            child_algo: ChildAlgo::Market,
+            follow_poll_secs: cli.follow_poll_secs,
+            follow_repost_secs: cli.follow_repost_secs,
+            follow_threshold_bps: cli.follow_threshold_bps,
+        };
+        let base = execution_fingerprint(&Network::Testnet, &plan, None, &cli, None);
+        type Mutation = Box<dyn Fn(&mut hype_trigger_twap::journal::ExecutionPlanFingerprint)>;
+        let cases: Vec<(&str, Mutation)> = vec![
+            ("version", Box::new(|f| f.version += 1)),
+            ("symbol", Box::new(|f| f.symbol = "BTC".into())),
+            ("side", Box::new(|f| f.side = "short".into())),
+            ("request_mode", Box::new(|f| f.request_mode = "usd".into())),
+            ("request_value", Box::new(|f| f.request_value = "11".into())),
+            ("per_slice", Box::new(|f| f.per_slice = "2".into())),
+            (
+                "total_adjusted",
+                Box::new(|f| f.total_adjusted = "11".into()),
+            ),
+            (
+                "total_requested",
+                Box::new(|f| f.total_requested = "11".into()),
+            ),
+            ("slices", Box::new(|f| f.slices = 11)),
+            ("duration_ms", Box::new(|f| f.duration_ms += 1)),
+            ("slippage_bps", Box::new(|f| f.slippage_bps = "21".into())),
+            (
+                "max_notional_usd",
+                Box::new(|f| f.max_notional_usd = "999".into()),
+            ),
+            ("max_book_age_ms", Box::new(|f| f.max_book_age_ms += 1)),
+            ("settle_retries", Box::new(|f| f.settle_retries += 1)),
+            ("child_algo", Box::new(|f| f.child_algo = "passive".into())),
+            ("follow_poll_secs", Box::new(|f| f.follow_poll_secs += 1)),
+            (
+                "follow_repost_secs",
+                Box::new(|f| f.follow_repost_secs += 1),
+            ),
+            (
+                "follow_threshold_bps",
+                Box::new(|f| f.follow_threshold_bps = "2".into()),
+            ),
+            ("network", Box::new(|f| f.network = "mainnet".into())),
+            ("agent", Box::new(|f| f.agent = None)),
+            ("master", Box::new(|f| f.master = None)),
+            (
+                "position_mode",
+                Box::new(|f| f.position_mode = Some("target_sz".into())),
+            ),
+            (
+                "initial_position_szi",
+                Box::new(|f| f.initial_position_szi = Some("0".into())),
+            ),
+            (
+                "target_position_szi",
+                Box::new(|f| f.target_position_szi = Some("10".into())),
+            ),
+            (
+                "position_requested_value",
+                Box::new(|f| f.position_requested_value = Some("10".into())),
+            ),
+            (
+                "position_reference_price",
+                Box::new(|f| f.position_reference_price = Some("50".into())),
+            ),
+            (
+                "position_phases",
+                Box::new(|f| {
+                    f.position_phases =
+                        vec![hype_trigger_twap::journal::PositionPhaseFingerprint {
+                            kind: "adjust".into(),
+                            side: "long".into(),
+                            size: "10".into(),
+                            reduce_only: false,
+                        }];
+                }),
+            ),
+            ("reduce_only", Box::new(|f| f.reduce_only = true)),
+            (
+                "absolute_deadline_unix_ms",
+                Box::new(move |f| f.absolute_deadline_unix_ms = Some(deadline + 1)),
+            ),
+        ];
+
+        let valid_replay = |fingerprint| {
+            hype_trigger_twap::journal::ValidatedJournalReplay::replay(&[
+                hype_trigger_twap::journal::JournalRecord::Header(
+                    hype_trigger_twap::journal::RunHeader {
+                        run_id: "fingerprint-test".into(),
+                        network: "testnet".into(),
+                        agent: Some(Address::new(AGENT)),
+                        master: Some(Address::new(MASTER)),
+                        symbol: Symbol::new("HYPE"),
+                        side: Side::Long,
+                        slices: 10,
+                        plan_hash: "legacy-compat-only".into(),
+                        execution_fingerprint: Some(fingerprint),
+                        started_at_unix_ms: deadline - 60_000,
+                        execution_deadline_unix_ms: Some(deadline),
+                    },
+                ),
+            ])
+            .unwrap()
+        };
+        let replay = valid_replay(base.clone());
+        assert!(validate_resume_execution_fingerprint(
+            "fingerprint-test",
+            &replay,
+            &cli,
+            &Network::Testnet,
+            Some(&Address::new(AGENT)),
+            Some(&Address::new(MASTER)),
+            2,
+        )
+        .unwrap()
+        .is_none());
+
+        let mut mismatched_header = valid_replay(base.clone()).summary.header.expect("header");
+        mismatched_header.slices = 9;
+        let error = hype_trigger_twap::journal::ValidatedJournalReplay::replay(&[
+            hype_trigger_twap::journal::JournalRecord::Header(mismatched_header),
+        ])
+        .expect_err("header/fingerprint slices mismatch");
+        assert!(
+            matches!(
+                error,
+                hype_trigger_twap::journal::JournalReplayError::InvalidFingerprint {
+                    field: "slices",
+                    ..
+                }
+            ),
+            "{error}"
+        );
+
+        for (field, mutate) in cases {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            let error = match hype_trigger_twap::journal::ValidatedJournalReplay::replay(&[
+                hype_trigger_twap::journal::JournalRecord::Header(
+                    hype_trigger_twap::journal::RunHeader {
+                        run_id: "fingerprint-test".into(),
+                        network: "testnet".into(),
+                        agent: Some(Address::new(AGENT)),
+                        master: Some(Address::new(MASTER)),
+                        symbol: Symbol::new("HYPE"),
+                        side: Side::Long,
+                        slices: 10,
+                        plan_hash: "legacy-compat-only".into(),
+                        execution_fingerprint: Some(changed),
+                        started_at_unix_ms: deadline - 60_000,
+                        execution_deadline_unix_ms: Some(deadline),
+                    },
+                ),
+            ]) {
+                Ok(replay) => validate_resume_execution_fingerprint(
+                    "fingerprint-test",
+                    &replay,
+                    &cli,
+                    &Network::Testnet,
+                    Some(&Address::new(AGENT)),
+                    Some(&Address::new(MASTER)),
+                    2,
+                )
+                .expect_err(field),
+                Err(error) => error.to_string(),
+            };
+            let field_words = field.replace('_', " ");
+            assert!(
+                error.contains(field)
+                    || error.contains(&field_words)
+                    || error.contains("position-only fields")
+                    || error.contains("position-only values")
+                    || error.contains("position target"),
+                "{field}: {error}"
+            );
+        }
+    }
+
+    fn resumable_header_from_probe(
+        run_id: &str,
+        records: &[hype_trigger_twap::journal::JournalRecord],
+    ) -> hype_trigger_twap::journal::RunHeader {
+        let mut header = match records.first() {
+            Some(hype_trigger_twap::journal::JournalRecord::Header(header)) => header.clone(),
+            other => panic!("expected probe Header, got {other:?}"),
+        };
+        // The probe's own short deadline may have elapsed while the fixture
+        // was copied. Give the synthetic crash journal a future immutable
+        // deadline while preserving every other canonical plan field.
+        let deadline = wall_clock_now_ms().saturating_add(60_000);
+        header.run_id = run_id.to_owned();
+        header.started_at_unix_ms = wall_clock_now_ms();
+        header.execution_deadline_unix_ms = Some(deadline);
+        header
+            .execution_fingerprint
+            .as_mut()
+            .expect("fresh probe writes a typed fingerprint")
+            .absolute_deadline_unix_ms = Some(deadline);
+        header
     }
 
     /// Registers the full mock set a complete one-slice live run needs: meta,
@@ -2556,6 +5981,1386 @@ mod tests {
             .await;
     }
 
+    async fn mock_position_preflight(
+        server: &mut mockito::ServerGuard,
+        position_body: &str,
+        include_role: bool,
+    ) {
+        mock_position_preflight_common(server, include_role).await;
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "clearinghouseState"}),
+            ))
+            .with_status(200)
+            .with_body(position_body)
+            .expect(1)
+            .create_async()
+            .await;
+    }
+
+    async fn mock_position_preflight_common(server: &mut mockito::ServerGuard, include_role: bool) {
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({"type": "meta"})))
+            .with_status(200)
+            .with_body(r#"{"universe":[{"name":"HYPE","szDecimals":2,"maxLeverage":10,"onlyIsolated":false}]}"#)
+            .create_async()
+            .await;
+        if include_role {
+            server
+                .mock("POST", "/info")
+                .match_body(mockito::Matcher::PartialJson(
+                    serde_json::json!({"type": "userRole"}),
+                ))
+                .with_status(200)
+                .with_body(format!(
+                    r#"{{"role":"agent","data":{{"user":"{MASTER}"}}}}"#
+                ))
+                .create_async()
+                .await;
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "l2Book"}),
+            ))
+            .with_status(200)
+            .with_body(book_body_at("HYPE", "49.9", "50.1", now_ms))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+    }
+
+    async fn mock_position_preflight_sequence(
+        server: &mut mockito::ServerGuard,
+        position_bodies: &[&str],
+        include_role: bool,
+    ) -> mockito::Mock {
+        assert!(!position_bodies.is_empty());
+        mock_position_preflight_common(server, include_role).await;
+        let bodies: Vec<Vec<u8>> = position_bodies
+            .iter()
+            .map(|body| body.as_bytes().to_vec())
+            .collect();
+        let response_count = bodies.len();
+        let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "clearinghouseState"}),
+            ))
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                bodies
+                    .get(index)
+                    .or_else(|| bodies.last())
+                    .expect("position response sequence is non-empty")
+                    .clone()
+            })
+            .expect(response_count)
+            .create_async()
+            .await
+    }
+
+    async fn mock_position_snapshot(server: &mut mockito::ServerGuard, body: &str) {
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "clearinghouseState"}),
+            ))
+            .with_status(200)
+            .with_body(body)
+            .expect(1)
+            .create_async()
+            .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn position_invalid_state_and_flat_noop_send_zero_exchange_calls() {
+        for (position_body, expect_success) in [
+            (r#"{"assetPositions":{}}"#, false),
+            (r#"{"assetPositions":[]}"#, true),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            mock_position_preflight(&mut server, position_body, false).await;
+            let exchange = server
+                .mock("POST", "/exchange")
+                .expect(0)
+                .create_async()
+                .await;
+            std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+            std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+            let cli = Cli::try_parse_from([
+                "hype-twap",
+                "--symbol",
+                "HYPE",
+                "--flatten",
+                "--master-address",
+                MASTER,
+                "--duration",
+                "1m",
+                "--slices",
+                "1",
+            ])
+            .unwrap();
+            let result = run_with_cli(cli).await;
+            std::env::remove_var("HL_INFO_URL");
+            std::env::remove_var("HL_EXCHANGE_URL");
+            assert_eq!(result.is_ok(), expect_success, "{result:?}");
+            exchange.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn read_only_position_noop_emits_complete_state_free_lifecycle() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("would-be-state-dir");
+        let event_path = tmp.path().join("position-noop-events.jsonl");
+        let mut server = mockito::Server::new_async().await;
+        mock_position_preflight(&mut server, r#"{"assetPositions":[]}"#, false).await;
+        let exchange = server
+            .mock("POST", "/exchange")
+            .expect(0)
+            .create_async()
+            .await;
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+        let cli = Cli::try_parse_from([
+            "hype-twap",
+            "--symbol",
+            "HYPE",
+            "--flatten",
+            "--master-address",
+            MASTER,
+            "--duration",
+            "1m",
+            "--slices",
+            "1",
+            "--state-dir",
+            &state_dir.display().to_string(),
+            "--event-jsonl",
+            &event_path.display().to_string(),
+        ])
+        .unwrap();
+        let result = run_with_cli(cli).await;
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+
+        assert_eq!(result.unwrap(), ExitCode::SUCCESS);
+        assert!(!state_dir.exists());
+        exchange.assert_async().await;
+        let events: Vec<hype_trigger_twap::observability::ExecutionEvent> =
+            std::fs::read_to_string(event_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert!(matches!(
+            events.first().map(|event| &event.payload),
+            Some(
+                hype_trigger_twap::observability::ExecutionEventPayload::RunStarted {
+                    planned_slices: 0,
+                    mode: ExecutionMode::ReadOnly,
+                    ..
+                }
+            )
+        ));
+        assert!(matches!(
+            events.last().map(|event| &event.payload),
+            Some(
+                hype_trigger_twap::observability::ExecutionEventPayload::FinalReport {
+                    outcome: hype_trigger_twap::observability::RunOutcome::Completed,
+                    completed_slices: 0,
+                }
+            )
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn live_flatten_without_exact_confirmation_sends_zero_exchange_calls() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+        let mut server = mockito::Server::new_async().await;
+        mock_position_preflight(
+            &mut server,
+            r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"1"}}]}"#,
+            true,
+        )
+        .await;
+        let exchange = server
+            .mock("POST", "/exchange")
+            .expect(0)
+            .create_async()
+            .await;
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+        let deadline = wall_clock_now_ms().saturating_add(60_000).to_string();
+        let args = vec![
+            "hype-twap".to_owned(),
+            "--symbol".into(),
+            "HYPE".into(),
+            "--flatten".into(),
+            "--duration".into(),
+            "1m".into(),
+            "--slices".into(),
+            "1".into(),
+            "--flatten-deadline-unix-ms".into(),
+            deadline,
+            "--max-notional-usd".into(),
+            "1000".into(),
+            "--master-address".into(),
+            MASTER.into(),
+            "--allow-custom-endpoints".into(),
+            "--read-only".into(),
+            "false".into(),
+            "--state-dir".into(),
+            state_dir.display().to_string(),
+        ];
+        let result = run_with_cli(Cli::try_parse_from(args).unwrap()).await;
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+        let error = result.unwrap_err();
+        assert!(error.contains("--confirm-flatten"), "{error}");
+        exchange.assert_async().await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn resumed_live_flatten_without_original_confirmation_sends_zero_exchange_calls() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+        let run_id = "flatten-resume-needs-confirmation";
+        let deadline = wall_clock_now_ms().saturating_add(60_000);
+        let args = vec![
+            "hype-twap".to_owned(),
+            "--symbol".into(),
+            "HYPE".into(),
+            "--flatten".into(),
+            "--network".into(),
+            "testnet".into(),
+            "--duration".into(),
+            "1m".into(),
+            "--slices".into(),
+            "1".into(),
+            "--max-notional-usd".into(),
+            "1000".into(),
+            "--master-address".into(),
+            MASTER.into(),
+            "--allow-custom-endpoints".into(),
+            "--read-only".into(),
+            "false".into(),
+            "--state-dir".into(),
+            state_dir.display().to_string(),
+            "--resume".into(),
+            run_id.into(),
+        ];
+        let cli = Cli::try_parse_from(&args).unwrap();
+        let frozen_position = PositionExecutionPlan::flatten(
+            &SignedPerpPosition {
+                symbol: Symbol::new("HYPE"),
+                szi: Decimal::ONE,
+            },
+            &Symbol::new("HYPE"),
+            2,
+        )
+        .unwrap();
+        let plan = TwapPlan {
+            symbol: Symbol::new("HYPE"),
+            side: Side::Short,
+            asset_index: 0,
+            sz_decimals: 2,
+            per_slice: Decimal::ONE,
+            total_adjusted: Decimal::ONE,
+            total_requested: Decimal::ONE,
+            slices: 1,
+            duration: Duration::from_secs(60),
+            absolute_deadline_unix_ms: Some(deadline),
+            slippage_bps: cli.slippage_bps,
+            max_book_age_ms: cli.max_book_age_ms,
+            settle_retries: cli.settle_retries,
+            read_only: false,
+            reduce_only: true,
+            max_notional_usd: Decimal::from(1000),
+            agent: Some(Address::new(AGENT)),
+            master: Some(Address::new(MASTER)),
+            child_algo: ChildAlgo::Market,
+            follow_poll_secs: cli.follow_poll_secs,
+            follow_repost_secs: cli.follow_repost_secs,
+            follow_threshold_bps: cli.follow_threshold_bps,
+        };
+        let fingerprint =
+            execution_fingerprint(&Network::Testnet, &plan, Some(&frozen_position), &cli, None);
+        drop(
+            hype_trigger_twap::journal::ExecutionJournal::start(
+                &state_dir,
+                run_id.into(),
+                hype_trigger_twap::journal::RunHeader {
+                    run_id: run_id.into(),
+                    network: "testnet".into(),
+                    agent: Some(Address::new(AGENT)),
+                    master: Some(Address::new(MASTER)),
+                    symbol: Symbol::new("HYPE"),
+                    side: Side::Short,
+                    slices: 1,
+                    plan_hash: "typed-flatten-plan".into(),
+                    execution_fingerprint: Some(fingerprint),
+                    started_at_unix_ms: deadline.saturating_sub(60_000),
+                    execution_deadline_unix_ms: Some(deadline),
+                },
+            )
+            .unwrap(),
+        );
+
+        let mut server = mockito::Server::new_async().await;
+        mock_position_preflight(
+            &mut server,
+            r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"1"}}]}"#,
+            true,
+        )
+        .await;
+        let exchange = server
+            .mock("POST", "/exchange")
+            .expect(0)
+            .create_async()
+            .await;
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+
+        let result = run_with_cli(cli).await;
+
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+        let error = result.expect_err("a resumed live flatten still requires confirmation");
+        assert!(error.contains("--confirm-flatten"), "{error}");
+        exchange.assert_async().await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn confirmed_flatten_sends_only_reduce_only_and_verifies_flat() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+        let mut server = mockito::Server::new_async().await;
+        mock_position_preflight(
+            &mut server,
+            r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"1"}}]}"#,
+            true,
+        )
+        .await;
+        // The position-aware runner now checks the authoritative size again
+        // immediately before placing.  Keep this snapshot distinct from the
+        // terminal flat verification below.
+        mock_position_snapshot(
+            &mut server,
+            r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"1"}}]}"#,
+        )
+        .await;
+        // The second fresh snapshot is the immediate commit-point guard,
+        // after the slice-level guard above and before `/exchange`.
+        mock_position_snapshot(
+            &mut server,
+            r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"1"}}]}"#,
+        )
+        .await;
+        let final_flat = server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "clearinghouseState"}),
+            ))
+            .with_status(200)
+            .with_body(r#"{"assetPositions":[]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let reduce_order = server
+            .mock("POST", "/exchange")
+            .match_body(mockito::Matcher::Regex(r#""r":true"#.into()))
+            .with_status(200)
+            .with_body(
+                r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"filled":{"oid":1,"totalSz":"1","avgPx":"50"}}]}}}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+        let deadline = wall_clock_now_ms().saturating_add(60_000);
+        let confirmation = FlattenConfirmation {
+            schema_version: FlattenConfirmation::SCHEMA_VERSION,
+            network: Network::Testnet.to_string(),
+            master: Address::new(MASTER),
+            symbol: Symbol::new("HYPE"),
+            initial_szi: Decimal::ONE,
+            close_side: Side::Short,
+            max_close_size: Decimal::ONE,
+            max_notional_usd: Decimal::from(1000),
+            child_algo: "market".into(),
+            execution_deadline_unix_ms: deadline,
+        };
+        let token = confirmation.token().unwrap();
+        let args = vec![
+            "hype-twap".to_owned(),
+            "--symbol".into(),
+            "HYPE".into(),
+            "--flatten".into(),
+            "--network".into(),
+            "testnet".into(),
+            "--duration".into(),
+            "1m".into(),
+            "--slices".into(),
+            "1".into(),
+            "--flatten-deadline-unix-ms".into(),
+            deadline.to_string(),
+            "--confirm-flatten".into(),
+            token,
+            "--max-notional-usd".into(),
+            "1000".into(),
+            "--master-address".into(),
+            MASTER.into(),
+            "--allow-custom-endpoints".into(),
+            "--read-only".into(),
+            "false".into(),
+            "--state-dir".into(),
+            state_dir.display().to_string(),
+        ];
+        let result = run_with_cli(Cli::try_parse_from(args).unwrap()).await;
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+        assert_eq!(result.unwrap(), ExitCode::SUCCESS);
+        reduce_order.assert_async().await;
+        final_flat.assert_async().await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn already_flat_reduce_only_rejection_completes_after_exact_authoritative_recheck() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+        let mut server = mockito::Server::new_async().await;
+        mock_position_preflight(
+            &mut server,
+            r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"1"}}]}"#,
+            true,
+        )
+        .await;
+        // Pre-place guard: the original long is still present, so attempting
+        // the reduce-only close is legitimate.
+        mock_position_snapshot(
+            &mut server,
+            r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"1"}}]}"#,
+        )
+        .await;
+        // Immediate commit-point guard: the close is still required at the
+        // last possible point before the exchange request.
+        mock_position_snapshot(
+            &mut server,
+            r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"1"}}]}"#,
+        )
+        .await;
+        // An external fill wins the race and HL rejects our now-unneeded
+        // reduce-only close.  Both the abort-path check and normal terminal
+        // verification must see exact flat before success is recorded.
+        mock_position_snapshot(&mut server, r#"{"assetPositions":[]}"#).await;
+        mock_position_snapshot(&mut server, r#"{"assetPositions":[]}"#).await;
+        let rejected_close = server
+            .mock("POST", "/exchange")
+            .match_body(mockito::Matcher::Regex(r#""r":true"#.into()))
+            .with_status(200)
+            .with_body(
+                r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"Reduce only order would increase position"}]}}}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+        let deadline = wall_clock_now_ms().saturating_add(60_000);
+        let token = FlattenConfirmation {
+            schema_version: FlattenConfirmation::SCHEMA_VERSION,
+            network: Network::Testnet.to_string(),
+            master: Address::new(MASTER),
+            symbol: Symbol::new("HYPE"),
+            initial_szi: Decimal::ONE,
+            close_side: Side::Short,
+            max_close_size: Decimal::ONE,
+            max_notional_usd: Decimal::from(1000),
+            child_algo: "market".into(),
+            execution_deadline_unix_ms: deadline,
+        }
+        .token()
+        .unwrap();
+        let args = vec![
+            "hype-twap".to_owned(),
+            "--symbol".into(),
+            "HYPE".into(),
+            "--flatten".into(),
+            "--network".into(),
+            "testnet".into(),
+            "--duration".into(),
+            "1m".into(),
+            "--slices".into(),
+            "1".into(),
+            "--flatten-deadline-unix-ms".into(),
+            deadline.to_string(),
+            "--confirm-flatten".into(),
+            token,
+            "--max-notional-usd".into(),
+            "1000".into(),
+            "--allow-custom-endpoints".into(),
+            "--read-only".into(),
+            "false".into(),
+            "--state-dir".into(),
+            state_dir.display().to_string(),
+        ];
+        let result = run_with_cli(Cli::try_parse_from(args).unwrap()).await;
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+
+        assert_eq!(result.unwrap(), ExitCode::SUCCESS);
+        rejected_close.assert_async().await;
+        let run_id = std::fs::read_dir(state_dir.join("runs"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        let records =
+            hype_trigger_twap::journal::ExecutionJournal::read_all(&state_dir, &run_id).unwrap();
+        let replay = hype_trigger_twap::journal::ValidatedJournalReplay::replay(&records).unwrap();
+        assert_eq!(replay.summary.last_final_report_completed, Some(true));
+        assert!(replay.summary.unresolved_cloids().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn zero_crossing_residual_position_blocks_non_reduce_open_order() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+        let mut server = mockito::Server::new_async().await;
+        let positions = mock_position_preflight_sequence(
+            &mut server,
+            &[
+                r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"1"}}]}"#,
+                // Slice-level and commit-point guards before the reduce-only
+                // child, followed by the residual exact-flat verification.
+                r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"1"}}]}"#,
+                r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"1"}}]}"#,
+                r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"0.1"}}]}"#,
+            ],
+            true,
+        )
+        .await;
+        let close = server
+            .mock("POST", "/exchange")
+            .match_body(mockito::Matcher::Regex(r#""r":true"#.into()))
+            .with_status(200)
+            .with_body(
+                r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"filled":{"oid":1,"totalSz":"1","avgPx":"50"}}]}}}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let forbidden_open = server
+            .mock("POST", "/exchange")
+            .match_body(mockito::Matcher::Regex(r#""r":false"#.into()))
+            .expect(0)
+            .create_async()
+            .await;
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+        let args = vec![
+            "hype-twap".to_owned(),
+            "--symbol".into(),
+            "HYPE".into(),
+            "--target-sz".into(),
+            "-1".into(),
+            "--network".into(),
+            "testnet".into(),
+            "--duration".into(),
+            "1m".into(),
+            "--slices".into(),
+            "1".into(),
+            "--max-notional-usd".into(),
+            "1000".into(),
+            "--master-address".into(),
+            MASTER.into(),
+            "--allow-custom-endpoints".into(),
+            "--read-only".into(),
+            "false".into(),
+            "--state-dir".into(),
+            state_dir.display().to_string(),
+        ];
+        let result = run_with_cli(Cli::try_parse_from(args).unwrap()).await;
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+        let error = result.unwrap_err();
+        assert!(error.contains("expected exact zero"), "{error}");
+        close.assert_async().await;
+        positions.assert_async().await;
+        forbidden_open.assert_async().await;
+
+        let run_id = std::fs::read_dir(state_dir.join("runs"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        let records =
+            hype_trigger_twap::journal::ExecutionJournal::read_all(&state_dir, &run_id).unwrap();
+        let replay = hype_trigger_twap::journal::ValidatedJournalReplay::replay(&records).unwrap();
+        assert_eq!(replay.summary.last_final_report_completed, Some(false));
+        assert!(matches!(
+            records.last(),
+            Some(hype_trigger_twap::journal::JournalRecord::FinalReport { note, .. })
+                if note.contains("0.1") && note.contains("-1")
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn zero_crossing_opens_only_after_exact_flat_and_finishes_at_target() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+        let mut server = mockito::Server::new_async().await;
+        let positions = mock_position_preflight_sequence(
+            &mut server,
+            &[
+                r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"1"}}]}"#,
+                // Close-phase slice guard and immediate commit-point guard,
+                // then exact-flat verification.
+                r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"1"}}]}"#,
+                r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"1"}}]}"#,
+                r#"{"assetPositions":[]}"#,
+                // Open-phase slice guard and immediate commit-point guard,
+                // then final target verification.
+                r#"{"assetPositions":[]}"#,
+                r#"{"assetPositions":[]}"#,
+                r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"-1"}}]}"#,
+            ],
+            true,
+        )
+        .await;
+        let close = server
+            .mock("POST", "/exchange")
+            .match_body(mockito::Matcher::Regex(r#""r":true"#.into()))
+            .with_status(200)
+            .with_body(
+                r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"filled":{"oid":1,"totalSz":"1","avgPx":"50"}}]}}}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let open = server
+            .mock("POST", "/exchange")
+            .match_body(mockito::Matcher::Regex(r#""r":false"#.into()))
+            .with_status(200)
+            .with_body(
+                r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"filled":{"oid":2,"totalSz":"1","avgPx":"50"}}]}}}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+        let args = vec![
+            "hype-twap".to_owned(),
+            "--symbol".into(),
+            "HYPE".into(),
+            "--target-sz".into(),
+            "-1".into(),
+            "--network".into(),
+            "testnet".into(),
+            "--duration".into(),
+            "1m".into(),
+            "--slices".into(),
+            "1".into(),
+            "--max-notional-usd".into(),
+            "1000".into(),
+            "--allow-custom-endpoints".into(),
+            "--read-only".into(),
+            "false".into(),
+            "--state-dir".into(),
+            state_dir.display().to_string(),
+        ];
+        let result = run_with_cli(Cli::try_parse_from(args).unwrap()).await;
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+        assert_eq!(result.unwrap(), ExitCode::SUCCESS);
+        close.assert_async().await;
+        positions.assert_async().await;
+        open.assert_async().await;
+
+        let run_id = std::fs::read_dir(state_dir.join("runs"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        let records =
+            hype_trigger_twap::journal::ExecutionJournal::read_all(&state_dir, &run_id).unwrap();
+        let replay = hype_trigger_twap::journal::ValidatedJournalReplay::replay(&records).unwrap();
+        assert_eq!(replay.summary.last_final_report_completed, Some(true));
+        assert_eq!(replay.fill_totals.filled_sz, Decimal::from(2));
+        let events: Vec<hype_trigger_twap::observability::ExecutionEvent> =
+            std::fs::read_to_string(state_dir.join("runs").join(&run_id).join("events.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    &event.payload,
+                    hype_trigger_twap::observability::ExecutionEventPayload::RunStopped { .. }
+                ))
+                .count(),
+            1,
+            "phase checkpoints must not announce a stopped logical run: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    &event.payload,
+                    hype_trigger_twap::observability::ExecutionEventPayload::FinalReport { .. }
+                ))
+                .count(),
+            1,
+            "only authoritative target verification finishes the run: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn position_resume_state_mismatch_is_durable_and_places_nothing() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+        let run_id = uuid::Uuid::now_v7().to_string();
+        let deadline = wall_clock_now_ms().saturating_add(60_000);
+        let args = vec![
+            "hype-twap".to_owned(),
+            "--symbol".into(),
+            "HYPE".into(),
+            "--target-sz".into(),
+            "-1".into(),
+            "--network".into(),
+            "testnet".into(),
+            "--duration".into(),
+            "1m".into(),
+            "--slices".into(),
+            "1".into(),
+            "--max-notional-usd".into(),
+            "1000".into(),
+            "--master-address".into(),
+            MASTER.into(),
+            "--allow-custom-endpoints".into(),
+            "--read-only".into(),
+            "false".into(),
+            "--state-dir".into(),
+            state_dir.display().to_string(),
+            "--resume".into(),
+            run_id.clone(),
+        ];
+        let cli = Cli::try_parse_from(&args).unwrap();
+        let initial = SignedPerpPosition {
+            symbol: Symbol::new("HYPE"),
+            szi: Decimal::ONE,
+        };
+        let frozen =
+            PositionExecutionPlan::target_size(&initial, &Symbol::new("HYPE"), -Decimal::ONE, 2)
+                .unwrap();
+        let plan = TwapPlan {
+            symbol: Symbol::new("HYPE"),
+            side: Side::Short,
+            asset_index: 0,
+            sz_decimals: 2,
+            per_slice: Decimal::ONE,
+            total_adjusted: Decimal::ONE,
+            total_requested: Decimal::ONE,
+            slices: 1,
+            duration: Duration::from_secs(60),
+            absolute_deadline_unix_ms: Some(deadline),
+            slippage_bps: cli.slippage_bps,
+            max_book_age_ms: cli.max_book_age_ms,
+            settle_retries: cli.settle_retries,
+            read_only: false,
+            reduce_only: true,
+            max_notional_usd: Decimal::from(1000),
+            agent: Some(Address::new(AGENT)),
+            master: Some(Address::new(MASTER)),
+            child_algo: ChildAlgo::Market,
+            follow_poll_secs: cli.follow_poll_secs,
+            follow_repost_secs: cli.follow_repost_secs,
+            follow_threshold_bps: cli.follow_threshold_bps,
+        };
+        let fingerprint = execution_fingerprint(
+            &Network::Testnet,
+            &plan,
+            Some(&frozen),
+            &cli,
+            Some(Decimal::from(50)),
+        );
+        let close_cloid = hype_trigger_twap::types::Cloid::new();
+        let mut journal = hype_trigger_twap::journal::ExecutionJournal::start(
+            &state_dir,
+            run_id.clone(),
+            hype_trigger_twap::journal::RunHeader {
+                run_id: run_id.clone(),
+                network: "testnet".into(),
+                agent: Some(Address::new(AGENT)),
+                master: Some(Address::new(MASTER)),
+                symbol: Symbol::new("HYPE"),
+                side: Side::Short,
+                slices: 1,
+                plan_hash: "typed-plan".into(),
+                execution_fingerprint: Some(fingerprint),
+                started_at_unix_ms: wall_clock_now_ms(),
+                execution_deadline_unix_ms: Some(deadline),
+            },
+        )
+        .unwrap();
+        journal
+            .record(&hype_trigger_twap::journal::JournalRecord::Prepared {
+                slice_idx: 1,
+                cloid: close_cloid,
+                nonce: Some(1),
+                symbol: Symbol::new("HYPE"),
+                side: Side::Short,
+                tif: Some(hype_trigger_twap::types::Tif::Ioc),
+                px: "49".into(),
+                sz: "1".into(),
+            })
+            .unwrap();
+        journal
+            .record(&hype_trigger_twap::journal::JournalRecord::Terminal {
+                slice_idx: 1,
+                cloid: close_cloid,
+                status: "filled".into(),
+                filled_sz: "1".into(),
+                avg_px: Some("50".into()),
+            })
+            .unwrap();
+        journal
+            .record(&hype_trigger_twap::journal::JournalRecord::FinalReport {
+                completed: false,
+                filled_total: "1".into(),
+                outcome_unknown_cloids: Vec::new(),
+                note: "crashed after close before authoritative flat verification".into(),
+                whole_run: None,
+            })
+            .unwrap();
+        drop(journal);
+
+        let mut server = mockito::Server::new_async().await;
+        mock_position_preflight(
+            &mut server,
+            r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"0.2"}}]}"#,
+            true,
+        )
+        .await;
+        let exchange = server
+            .mock("POST", "/exchange")
+            .expect(0)
+            .create_async()
+            .await;
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+        let result = run_with_cli(cli).await;
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+        let error = result.unwrap_err();
+        assert!(error.contains("durable expected position 0"), "{error}");
+        exchange.assert_async().await;
+
+        let records =
+            hype_trigger_twap::journal::ExecutionJournal::read_all(&state_dir, &run_id).unwrap();
+        let replay = hype_trigger_twap::journal::ValidatedJournalReplay::replay(&records).unwrap();
+        assert_eq!(replay.summary.last_final_report_completed, Some(false));
+        assert!(matches!(
+            records.last(),
+            Some(hype_trigger_twap::journal::JournalRecord::FinalReport { note, .. })
+                if note.contains("0.2") && note.contains("-1")
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn position_resume_below_minimum_stays_incomplete_and_returns_failure() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+        let run_id = uuid::Uuid::now_v7().to_string();
+        let deadline = wall_clock_now_ms().saturating_add(60_000);
+        let args = vec![
+            "hype-twap".to_owned(),
+            "--symbol".into(),
+            "HYPE".into(),
+            "--target-sz".into(),
+            "0".into(),
+            "--network".into(),
+            "testnet".into(),
+            "--duration".into(),
+            "1m".into(),
+            "--slices".into(),
+            "1".into(),
+            "--max-notional-usd".into(),
+            "1000".into(),
+            "--master-address".into(),
+            MASTER.into(),
+            "--allow-custom-endpoints".into(),
+            "--read-only".into(),
+            "false".into(),
+            "--state-dir".into(),
+            state_dir.display().to_string(),
+            "--resume".into(),
+            run_id.clone(),
+        ];
+        let cli = Cli::try_parse_from(&args).unwrap();
+        let initial = SignedPerpPosition {
+            symbol: Symbol::new("HYPE"),
+            szi: Decimal::ONE,
+        };
+        let frozen =
+            PositionExecutionPlan::target_size(&initial, &Symbol::new("HYPE"), Decimal::ZERO, 2)
+                .unwrap();
+        let plan = TwapPlan {
+            symbol: Symbol::new("HYPE"),
+            side: Side::Short,
+            asset_index: 0,
+            sz_decimals: 2,
+            per_slice: Decimal::ONE,
+            total_adjusted: Decimal::ONE,
+            total_requested: Decimal::ONE,
+            slices: 1,
+            duration: Duration::from_secs(60),
+            absolute_deadline_unix_ms: Some(deadline),
+            slippage_bps: cli.slippage_bps,
+            max_book_age_ms: cli.max_book_age_ms,
+            settle_retries: cli.settle_retries,
+            read_only: false,
+            reduce_only: true,
+            max_notional_usd: Decimal::from(1000),
+            agent: Some(Address::new(AGENT)),
+            master: Some(Address::new(MASTER)),
+            child_algo: ChildAlgo::Market,
+            follow_poll_secs: cli.follow_poll_secs,
+            follow_repost_secs: cli.follow_repost_secs,
+            follow_threshold_bps: cli.follow_threshold_bps,
+        };
+        let fingerprint = execution_fingerprint(
+            &Network::Testnet,
+            &plan,
+            Some(&frozen),
+            &cli,
+            Some(Decimal::from(50)),
+        );
+        let cloid = hype_trigger_twap::types::Cloid::new();
+        let mut journal = hype_trigger_twap::journal::ExecutionJournal::start(
+            &state_dir,
+            run_id.clone(),
+            hype_trigger_twap::journal::RunHeader {
+                run_id: run_id.clone(),
+                network: "testnet".into(),
+                agent: Some(Address::new(AGENT)),
+                master: Some(Address::new(MASTER)),
+                symbol: Symbol::new("HYPE"),
+                side: Side::Short,
+                slices: 1,
+                plan_hash: "typed-plan".into(),
+                execution_fingerprint: Some(fingerprint),
+                started_at_unix_ms: wall_clock_now_ms(),
+                execution_deadline_unix_ms: Some(deadline),
+            },
+        )
+        .unwrap();
+        journal
+            .record(&hype_trigger_twap::journal::JournalRecord::Prepared {
+                slice_idx: 1,
+                cloid,
+                nonce: Some(1),
+                symbol: Symbol::new("HYPE"),
+                side: Side::Short,
+                tif: Some(hype_trigger_twap::types::Tif::Ioc),
+                px: "49".into(),
+                sz: "1".into(),
+            })
+            .unwrap();
+        journal
+            .record(&hype_trigger_twap::journal::JournalRecord::Terminal {
+                slice_idx: 1,
+                cloid,
+                status: "filled".into(),
+                filled_sz: "0.9".into(),
+                avg_px: Some("50".into()),
+            })
+            .unwrap();
+        drop(journal);
+
+        let mut server = mockito::Server::new_async().await;
+        mock_position_preflight(
+            &mut server,
+            r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"0.1"}}]}"#,
+            true,
+        )
+        .await;
+        let exchange = server
+            .mock("POST", "/exchange")
+            .expect(0)
+            .create_async()
+            .await;
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+        let result = run_with_cli(cli).await;
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+
+        assert_eq!(
+            result.unwrap(),
+            ExitCode::FAILURE,
+            "a still-unmet frozen target must not be reported as success"
+        );
+        exchange.assert_async().await;
+        let records =
+            hype_trigger_twap::journal::ExecutionJournal::read_all(&state_dir, &run_id).unwrap();
+        let replay = hype_trigger_twap::journal::ValidatedJournalReplay::replay(&records).unwrap();
+        assert_eq!(replay.summary.last_final_report_completed, Some(false));
+        assert!(matches!(
+            records.last(),
+            Some(hype_trigger_twap::journal::JournalRecord::FinalReport { note, .. })
+                if note.contains("below minimum") && note.contains("not asserted complete")
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn ordinary_resume_below_minimum_stays_incomplete_and_returns_failure() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+        let run_id = uuid::Uuid::now_v7().to_string();
+        let deadline = wall_clock_now_ms().saturating_add(60_000);
+        let args = live_cli(
+            &["--network", "testnet", "--resume", run_id.as_str()],
+            &state_dir,
+        );
+        let cli = Cli::try_parse_from(&args).unwrap();
+        let plan = TwapPlan {
+            symbol: Symbol::new("HYPE"),
+            side: Side::Long,
+            asset_index: 0,
+            sz_decimals: 2,
+            per_slice: Decimal::ONE,
+            total_adjusted: Decimal::ONE,
+            total_requested: Decimal::ONE,
+            slices: 1,
+            duration: Duration::from_secs(2),
+            absolute_deadline_unix_ms: Some(deadline),
+            slippage_bps: cli.slippage_bps,
+            max_book_age_ms: cli.max_book_age_ms,
+            settle_retries: cli.settle_retries,
+            read_only: false,
+            reduce_only: false,
+            max_notional_usd: Decimal::from(1_000_000),
+            agent: Some(Address::new(AGENT)),
+            master: Some(Address::new(MASTER)),
+            child_algo: ChildAlgo::Market,
+            follow_poll_secs: cli.follow_poll_secs,
+            follow_repost_secs: cli.follow_repost_secs,
+            follow_threshold_bps: cli.follow_threshold_bps,
+        };
+        let fingerprint = execution_fingerprint(
+            &Network::Testnet,
+            &plan,
+            None,
+            &cli,
+            Some(Decimal::from(50)),
+        );
+        let cloid = hype_trigger_twap::types::Cloid::new();
+        let mut journal = hype_trigger_twap::journal::ExecutionJournal::start(
+            &state_dir,
+            run_id.clone(),
+            hype_trigger_twap::journal::RunHeader {
+                run_id: run_id.clone(),
+                network: "testnet".into(),
+                agent: Some(Address::new(AGENT)),
+                master: Some(Address::new(MASTER)),
+                symbol: Symbol::new("HYPE"),
+                side: Side::Long,
+                slices: 1,
+                plan_hash: "typed-plan".into(),
+                execution_fingerprint: Some(fingerprint),
+                started_at_unix_ms: wall_clock_now_ms(),
+                execution_deadline_unix_ms: Some(deadline),
+            },
+        )
+        .unwrap();
+        journal
+            .record(&hype_trigger_twap::journal::JournalRecord::Prepared {
+                slice_idx: 1,
+                cloid,
+                nonce: Some(1),
+                symbol: Symbol::new("HYPE"),
+                side: Side::Long,
+                tif: Some(hype_trigger_twap::types::Tif::Ioc),
+                px: "50".into(),
+                sz: "1".into(),
+            })
+            .unwrap();
+        journal
+            .record(&hype_trigger_twap::journal::JournalRecord::Terminal {
+                slice_idx: 1,
+                cloid,
+                status: "filled".into(),
+                filled_sz: "0.9".into(),
+                avg_px: Some("50".into()),
+            })
+            .unwrap();
+        drop(journal);
+
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({"type": "meta"})))
+            .with_status(200)
+            .with_body(r#"{"universe":[{"name":"HYPE","szDecimals":2,"maxLeverage":10,"onlyIsolated":false}]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "userRole"}),
+            ))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"role":"agent","data":{{"user":"{MASTER}"}}}}"#
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "l2Book"}),
+            ))
+            .with_status(200)
+            .with_body(book_body_at("HYPE", "49.9", "50.1", now_ms))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let exchange = server
+            .mock("POST", "/exchange")
+            .expect(0)
+            .create_async()
+            .await;
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+        let result = run_with_cli(cli).await;
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+
+        assert_eq!(result.unwrap(), ExitCode::FAILURE);
+        exchange.assert_async().await;
+        let records =
+            hype_trigger_twap::journal::ExecutionJournal::read_all(&state_dir, &run_id).unwrap();
+        let replay = hype_trigger_twap::journal::ValidatedJournalReplay::replay(&records).unwrap();
+        assert_eq!(replay.summary.last_final_report_completed, Some(false));
+        assert!(matches!(
+            records.last(),
+            Some(hype_trigger_twap::journal::JournalRecord::FinalReport { note, .. })
+                if note.contains("below minimum") && note.contains("not asserted complete")
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn expired_resume_reconciles_then_fetches_no_book_and_stays_incomplete() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+        let run_id = uuid::Uuid::now_v7().to_string();
+        let deadline = wall_clock_now_ms().saturating_sub(1);
+        let args = vec![
+            "hype-twap".to_owned(),
+            "--symbol".into(),
+            "HYPE".into(),
+            "--side".into(),
+            "long".into(),
+            "--usd".into(),
+            "50".into(),
+            "--network".into(),
+            "testnet".into(),
+            "--duration".into(),
+            "1m".into(),
+            "--slices".into(),
+            "1".into(),
+            "--max-notional-usd".into(),
+            "1000".into(),
+            "--master-address".into(),
+            MASTER.into(),
+            "--allow-custom-endpoints".into(),
+            "--read-only".into(),
+            "false".into(),
+            "--state-dir".into(),
+            state_dir.display().to_string(),
+            "--resume".into(),
+            run_id.clone(),
+        ];
+        let cli = Cli::try_parse_from(&args).unwrap();
+        let plan = TwapPlan {
+            symbol: Symbol::new("HYPE"),
+            side: Side::Long,
+            asset_index: 0,
+            sz_decimals: 2,
+            per_slice: Decimal::ONE,
+            total_adjusted: Decimal::ONE,
+            total_requested: Decimal::ONE,
+            slices: 1,
+            duration: Duration::from_secs(60),
+            absolute_deadline_unix_ms: Some(deadline),
+            slippage_bps: cli.slippage_bps,
+            max_book_age_ms: cli.max_book_age_ms,
+            settle_retries: cli.settle_retries,
+            read_only: false,
+            reduce_only: false,
+            max_notional_usd: Decimal::from(1000),
+            agent: Some(Address::new(AGENT)),
+            master: Some(Address::new(MASTER)),
+            child_algo: ChildAlgo::Market,
+            follow_poll_secs: cli.follow_poll_secs,
+            follow_repost_secs: cli.follow_repost_secs,
+            follow_threshold_bps: cli.follow_threshold_bps,
+        };
+        let fingerprint = execution_fingerprint(
+            &Network::Testnet,
+            &plan,
+            None,
+            &cli,
+            Some(Decimal::from(50)),
+        );
+        drop(
+            hype_trigger_twap::journal::ExecutionJournal::start(
+                &state_dir,
+                run_id.clone(),
+                hype_trigger_twap::journal::RunHeader {
+                    run_id: run_id.clone(),
+                    network: "testnet".into(),
+                    agent: Some(Address::new(AGENT)),
+                    master: Some(Address::new(MASTER)),
+                    symbol: Symbol::new("HYPE"),
+                    side: Side::Long,
+                    slices: 1,
+                    plan_hash: "typed-plan".into(),
+                    execution_fingerprint: Some(fingerprint),
+                    started_at_unix_ms: deadline.saturating_sub(60_000),
+                    execution_deadline_unix_ms: Some(deadline),
+                },
+            )
+            .unwrap(),
+        );
+
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({"type": "meta"})))
+            .with_status(200)
+            .with_body(r#"{"universe":[{"name":"HYPE","szDecimals":2,"maxLeverage":10,"onlyIsolated":false}]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "userRole"}),
+            ))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"role":"agent","data":{{"user":"{MASTER}"}}}}"#
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+        let no_book = server
+            .mock("POST", "/info")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"type": "l2Book"}),
+            ))
+            .expect(0)
+            .create_async()
+            .await;
+        let no_exchange = server
+            .mock("POST", "/exchange")
+            .expect(0)
+            .create_async()
+            .await;
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+        let result = run_with_cli(cli).await;
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+        assert_eq!(result.unwrap(), ExitCode::FAILURE);
+        no_book.assert_async().await;
+        no_exchange.assert_async().await;
+        let records =
+            hype_trigger_twap::journal::ExecutionJournal::read_all(&state_dir, &run_id).unwrap();
+        let replay = hype_trigger_twap::journal::ValidatedJournalReplay::replay(&records).unwrap();
+        assert_eq!(replay.summary.last_final_report_completed, Some(false));
+        assert_eq!(replay.fill_totals.filled_sz, Decimal::ZERO);
+    }
+
     /// Read-only regression (Issue #4 acceptance criterion): a read-only run
     /// must create NEITHER the state directory NOR a journal file, even when
     /// `--state-dir` points at a path that does not exist yet.
@@ -2564,6 +7369,7 @@ mod tests {
     async fn read_only_creates_no_state_dir_or_journal_file() {
         let tmp = TempDir::new();
         let state_dir = tmp.path().join("would-be-state-dir");
+        let event_path = tmp.path().join("simulation-events.jsonl");
         assert!(!state_dir.exists());
 
         let mut server = mockito::Server::new_async().await;
@@ -2602,6 +7408,8 @@ mod tests {
             "1",
             "--state-dir",
             &state_dir.display().to_string(),
+            "--event-jsonl",
+            &event_path.display().to_string(),
             "--read-only",
             "true",
         ])
@@ -2616,6 +7424,30 @@ mod tests {
             !state_dir.exists(),
             "a read-only run must never create the state directory"
         );
+        let events: Vec<hype_trigger_twap::observability::ExecutionEvent> =
+            std::fs::read_to_string(event_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert!(matches!(
+            events.first().map(|event| &event.payload),
+            Some(
+                hype_trigger_twap::observability::ExecutionEventPayload::RunStarted {
+                    mode: ExecutionMode::ReadOnly,
+                    ..
+                }
+            )
+        ));
+        assert!(matches!(
+            events.last().map(|event| &event.payload),
+            Some(
+                hype_trigger_twap::observability::ExecutionEventPayload::FinalReport {
+                    outcome: hype_trigger_twap::observability::RunOutcome::Completed,
+                    ..
+                }
+            )
+        ));
     }
 
     /// A complete one-slice LIVE run creates the state dir and a journal
@@ -2674,6 +7506,55 @@ mod tests {
             )),
             "a completed run must end with a completed FinalReport: {records:?}"
         );
+
+        let events_path = runs_dir.join(&run_ids[0]).join("events.jsonl");
+        let events: Vec<hype_trigger_twap::observability::ExecutionEvent> =
+            std::fs::read_to_string(&events_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            (1..=events.len() as u64).collect::<Vec<_>>()
+        );
+        let kinds: Vec<_> = events
+            .iter()
+            .map(|event| {
+                serde_json::to_value(&event.payload).unwrap()["kind"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "run_started",
+                "cap_remaining",
+                "preflight_completed",
+                "slice_prepared",
+                "slice_terminal",
+                "fill",
+                "slice_completed",
+                "cap_remaining",
+                "cap_remaining",
+                "run_stopped",
+                "final_report",
+            ]
+        );
+        assert!(matches!(
+            events.first().map(|event| &event.payload),
+            Some(
+                hype_trigger_twap::observability::ExecutionEventPayload::RunStarted {
+                    mode: ExecutionMode::Live,
+                    ..
+                }
+            )
+        ));
     }
 
     /// Issue #4 acceptance criterion: an incomplete run for the same
@@ -2701,14 +7582,28 @@ mod tests {
                     side: hype_trigger_twap::types::Side::Long,
                     slices: 1,
                     plan_hash: "irrelevant".into(),
+                    execution_fingerprint: None,
                     started_at_unix_ms: 0,
+                    execution_deadline_unix_ms: None,
                 },
             )
+            .unwrap();
+            let cloid = hype_trigger_twap::types::Cloid::new();
+            j.record(&hype_trigger_twap::journal::JournalRecord::Prepared {
+                slice_idx: 1,
+                cloid,
+                nonce: None,
+                symbol: hype_trigger_twap::types::Symbol::new("HYPE"),
+                side: hype_trigger_twap::types::Side::Long,
+                tif: None,
+                px: "50".into(),
+                sz: "1".into(),
+            })
             .unwrap();
             j.record(
                 &hype_trigger_twap::journal::JournalRecord::SubmittedUnknown {
                     slice_idx: 1,
-                    cloid: hype_trigger_twap::types::Cloid::new(),
+                    cloid,
                 },
             )
             .unwrap();
@@ -2970,10 +7865,8 @@ mod tests {
         let probe_records =
             hype_trigger_twap::journal::ExecutionJournal::read_all(&probe_state_dir, &probe_run_id)
                 .unwrap();
-        let plan_hash = match &probe_records[0] {
-            hype_trigger_twap::journal::JournalRecord::Header(h) => h.plan_hash.clone(),
-            other => panic!("expected Header, got {other:?}"),
-        };
+        let resume_header =
+            resumable_header_from_probe("stale-lock-incomplete-run", &probe_records);
 
         // Seed the incomplete run this process will --resume, with the same
         // plan_hash derived above.
@@ -2981,17 +7874,7 @@ mod tests {
             let mut j = hype_trigger_twap::journal::ExecutionJournal::start(
                 &state_dir,
                 "stale-lock-incomplete-run".into(),
-                hype_trigger_twap::journal::RunHeader {
-                    run_id: "stale-lock-incomplete-run".into(),
-                    network: "testnet".into(),
-                    agent: Some(hype_trigger_twap::types::Address::new(AGENT)),
-                    master: Some(hype_trigger_twap::types::Address::new(MASTER)),
-                    symbol: hype_trigger_twap::types::Symbol::new("HYPE"),
-                    side: hype_trigger_twap::types::Side::Long,
-                    slices: 1,
-                    plan_hash,
-                    started_at_unix_ms: 0,
-                },
+                resume_header,
             )
             .unwrap();
             j.record(&hype_trigger_twap::journal::JournalRecord::Prepared {
@@ -3147,29 +8030,13 @@ mod tests {
         let probe_records =
             hype_trigger_twap::journal::ExecutionJournal::read_all(&probe_state_dir, &probe_run_id)
                 .unwrap();
-        let matching_plan_hash = probe_records
-            .iter()
-            .find_map(|r| match r {
-                hype_trigger_twap::journal::JournalRecord::Header(h) => Some(h.plan_hash.clone()),
-                _ => None,
-            })
-            .unwrap();
+        let resume_header = resumable_header_from_probe("run-to-resume", &probe_records);
 
         {
             let mut j = hype_trigger_twap::journal::ExecutionJournal::start(
                 &state_dir,
                 "run-to-resume".into(),
-                hype_trigger_twap::journal::RunHeader {
-                    run_id: "run-to-resume".into(),
-                    network: "testnet".into(),
-                    agent: Some(hype_trigger_twap::types::Address::new(AGENT)),
-                    master: Some(hype_trigger_twap::types::Address::new(MASTER)),
-                    symbol: hype_trigger_twap::types::Symbol::new("HYPE"),
-                    side: hype_trigger_twap::types::Side::Long,
-                    slices: 1,
-                    plan_hash: matching_plan_hash,
-                    started_at_unix_ms: 0,
-                },
+                resume_header,
             )
             .unwrap();
             j.record(&hype_trigger_twap::journal::JournalRecord::Prepared {
@@ -3230,7 +8097,7 @@ mod tests {
         let records =
             hype_trigger_twap::journal::ExecutionJournal::read_all(&state_dir, "run-to-resume")
                 .unwrap();
-        let summary = hype_trigger_twap::journal::summarize(&records);
+        let summary = hype_trigger_twap::journal::summarize(&records).unwrap();
         assert!(
             summary.unresolved_cloids().is_empty(),
             "the resumed cloid must be resolved, not left dangling: {records:?}"
@@ -3256,13 +8123,15 @@ mod tests {
             "2".into(),
             "--max-notional-usd".into(),
             "1000000".into(),
+            "--master-address".into(),
+            MASTER.into(),
             "--allow-custom-endpoints".into(),
             "--read-only".into(),
             "false".into(),
             "--state-dir".into(),
             state_dir.display().to_string(),
         ];
-        args.extend(extra.iter().map(|s| s.to_string()));
+        args.extend(extra.iter().map(|s| (*s).to_string()));
         args
     }
 
@@ -3331,13 +8200,10 @@ mod tests {
         let probe_records =
             hype_trigger_twap::journal::ExecutionJournal::read_all(&probe_state_dir, &probe_run_id)
                 .unwrap();
-        let matching_plan_hash = probe_records
-            .iter()
-            .find_map(|r| match r {
-                hype_trigger_twap::journal::JournalRecord::Header(h) => Some(h.plan_hash.clone()),
-                _ => None,
-            })
-            .unwrap();
+        let resume_header = resumable_header_from_probe("run-to-resume-partial", &probe_records);
+        let original_deadline = resume_header
+            .execution_deadline_unix_ms
+            .expect("resumable typed header stores an absolute execution deadline");
 
         // Seed the incomplete run: slice 1 already Terminal/filled (1 HYPE),
         // slice 2 SubmittedUnknown (ambiguous — needs reconciliation).
@@ -3345,17 +8211,7 @@ mod tests {
             let mut j = hype_trigger_twap::journal::ExecutionJournal::start(
                 &state_dir,
                 "run-to-resume-partial".into(),
-                hype_trigger_twap::journal::RunHeader {
-                    run_id: "run-to-resume-partial".into(),
-                    network: "testnet".into(),
-                    agent: Some(hype_trigger_twap::types::Address::new(AGENT)),
-                    master: Some(hype_trigger_twap::types::Address::new(MASTER)),
-                    symbol: hype_trigger_twap::types::Symbol::new("HYPE"),
-                    side: hype_trigger_twap::types::Side::Long,
-                    slices: 2,
-                    plan_hash: matching_plan_hash,
-                    started_at_unix_ms: 0,
-                },
+                resume_header,
             )
             .unwrap();
             j.record(&hype_trigger_twap::journal::JournalRecord::Prepared {
@@ -3459,7 +8315,11 @@ mod tests {
         let exchange_mock = server
             .mock("POST", "/exchange")
             .match_body(mockito::Matcher::PartialJson(serde_json::json!({
-                "action": { "orders": [{ "s": "1" }] }
+                "action": { "orders": [{ "s": "1" }] },
+                // The continuation is started in a later process, but its
+                // signed/wire expiry must remain bounded by the Header from
+                // the original logical run — never "now + --duration".
+                "expiresAfter": original_deadline,
             })))
             .with_status(200)
             .with_body(
@@ -3507,7 +8367,7 @@ mod tests {
             "run-to-resume-partial",
         )
         .unwrap();
-        let summary = hype_trigger_twap::journal::summarize(&records);
+        let summary = hype_trigger_twap::journal::summarize(&records).unwrap();
         assert_eq!(
             summary.total_filled(),
             rust_decimal::Decimal::from(2),
@@ -3520,14 +8380,11 @@ mod tests {
         );
     }
 
-    /// `--resume <run-id>` must be rejected when this invocation's plan
-    /// (sizing/timing/risk parameters) does not match the plan_hash stored
-    /// in the run being resumed — protects against silently reinterpreting
-    /// the remaining schedule of a run under different parameters than it
-    /// was started with.
+    /// A legacy hash-only journal is reconciled, but can never authorize a
+    /// new order because it omits execution-affecting fields added later.
     #[tokio::test]
     #[serial_test::serial(hl_env_vars)]
-    async fn resume_is_rejected_when_the_plan_hash_does_not_match() {
+    async fn legacy_hash_only_resume_reconciles_then_refuses_new_orders() {
         let tmp = TempDir::new();
         let state_dir = tmp.path().join("state");
         let prior_cloid = hype_trigger_twap::types::Cloid::new();
@@ -3545,7 +8402,9 @@ mod tests {
                     side: hype_trigger_twap::types::Side::Long,
                     slices: 1,
                     plan_hash: "this-will-never-match-a-real-hash".into(),
+                    execution_fingerprint: None,
                     started_at_unix_ms: 0,
+                    execution_deadline_unix_ms: None,
                 },
             )
             .unwrap();
@@ -3607,14 +8466,29 @@ mod tests {
         std::env::remove_var("HL_INFO_URL");
         std::env::remove_var("HL_EXCHANGE_URL");
 
-        let err = result.expect_err("a plan_hash mismatch must reject --resume");
-        assert!(err.contains("does not match"), "{err}");
-        assert!(err.contains("plan_hash"), "{err}");
+        let err = result.expect_err("a legacy journal must reject continuation");
+        assert!(err.contains("legacy journal"), "{err}");
+        assert!(err.contains("reconciled"), "{err}");
+        assert!(err.contains("--abandon-incomplete-run"), "{err}");
+        let records =
+            hype_trigger_twap::journal::ExecutionJournal::read_all(&state_dir, "run-mismatched")
+                .unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(
+                    record,
+                    hype_trigger_twap::journal::JournalRecord::Prepared { .. }
+                ))
+                .count(),
+            1,
+            "continuation must not add a new Prepared intent: {records:?}"
+        );
     }
 
     /// `--abandon-incomplete-run` force-reconciles the incomplete run's
-    /// cloid, marks the run `Abandoned`, and does NOT continue/place
-    /// anything new (the mock `/exchange` endpoint must never be hit).
+    /// live cloid, signs its cancel with the symbol's metadata-resolved asset
+    /// index, marks the run `Abandoned`, and never places anything new.
     #[tokio::test]
     #[serial_test::serial(hl_env_vars)]
     async fn abandon_incomplete_run_reconciles_then_stops_without_placing_anything_new() {
@@ -3635,7 +8509,9 @@ mod tests {
                     side: hype_trigger_twap::types::Side::Long,
                     slices: 1,
                     plan_hash: "irrelevant".into(),
+                    execution_fingerprint: None,
                     started_at_unix_ms: 0,
+                    execution_deadline_unix_ms: None,
                 },
             )
             .unwrap();
@@ -3660,13 +8536,14 @@ mod tests {
         }
 
         let mut server = mockito::Server::new_async().await;
-        // Only meta/userRole (startup) + orderStatus (forced reconciliation)
-        // are mocked — NO /exchange mock, so a resend/new-place would 501.
+        // Put HYPE at index 1. The historical resume placeholder used index
+        // 0, which would sign a cancel for the wrong asset and leave this
+        // resting order live.
         server
             .mock("POST", "/info")
             .match_body(mockito::Matcher::PartialJson(serde_json::json!({"type": "meta"})))
             .with_status(200)
-            .with_body(r#"{"universe":[{"name":"HYPE","szDecimals":2,"maxLeverage":10,"onlyIsolated":false}]}"#)
+            .with_body(r#"{"universe":[{"name":"BTC","szDecimals":5,"maxLeverage":40,"onlyIsolated":false},{"name":"HYPE","szDecimals":2,"maxLeverage":10,"onlyIsolated":false}]}"#)
             .create_async()
             .await;
         server
@@ -3680,15 +8557,47 @@ mod tests {
             ))
             .create_async()
             .await;
-        server
+        let status_bodies = [
+            format!(
+                r#"{{"status":"order","order":{{"order":{{"oid":42,"coin":"HYPE","side":"B","cloid":"{prior_cloid}","origSz":"1","sz":"1"}},"status":"open","statusTimestamp":0}}}}"#
+            )
+            .into_bytes(),
+            format!(
+                r#"{{"status":"order","order":{{"order":{{"oid":42,"coin":"HYPE","side":"B","cloid":"{prior_cloid}","origSz":"1","sz":"1"}},"status":"canceled","statusTimestamp":1}}}}"#
+            )
+            .into_bytes(),
+        ];
+        let status_index = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let statuses = server
             .mock("POST", "/info")
             .match_body(mockito::Matcher::PartialJson(
-                serde_json::json!({"type": "orderStatus", "oid": prior_cloid.to_hex_string()}),
+                serde_json::json!({"type": "orderStatus"}),
             ))
             .with_status(200)
-            .with_body(format!(
-                r#"{{"status":"order","order":{{"order":{{"oid":42,"coin":"HYPE","side":"B","cloid":"{prior_cloid}","origSz":"1","sz":"1"}},"status":"canceled","statusTimestamp":0}}}}"#
-            ))
+            .with_body_from_request(move |_| {
+                let index = status_index.fetch_add(1, Ordering::Relaxed);
+                status_bodies
+                    .get(index)
+                    .or_else(|| status_bodies.last())
+                    .expect("orderStatus sequence is non-empty")
+                    .clone()
+            })
+            .expect(2)
+            .create_async()
+            .await;
+        let cancel = server
+            .mock("POST", "/exchange")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "action": {
+                    "type": "cancelByCloid",
+                    "cancels": [{"asset": 1, "cloid": prior_cloid.to_hex_string()}]
+                }
+            })))
+            .with_status(200)
+            .with_body(
+                r#"{"status":"ok","response":{"type":"cancel","data":{"statuses":["success"]}}}"#,
+            )
+            .expect(1)
             .create_async()
             .await;
 
@@ -3710,11 +8619,13 @@ mod tests {
         std::env::remove_var("HL_EXCHANGE_URL");
 
         result.expect("abandon of a fully-mocked incomplete run must succeed");
+        statuses.assert_async().await;
+        cancel.assert_async().await;
 
         let records =
             hype_trigger_twap::journal::ExecutionJournal::read_all(&state_dir, "run-to-abandon")
                 .unwrap();
-        let summary = hype_trigger_twap::journal::summarize(&records);
+        let summary = hype_trigger_twap::journal::summarize(&records).unwrap();
         assert!(
             summary.abandoned,
             "the run must be marked Abandoned: {records:?}"

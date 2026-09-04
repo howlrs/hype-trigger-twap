@@ -14,16 +14,18 @@
 //!   carry is automatic). On the final slice this is a warning, not an error:
 //!   the residual is simply unexecutable.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 use crate::api::HlApi;
-use crate::client::{OrderStatusFill, PlaceOutcome, ValidatedFill, ValidatedMarketSnapshot};
+use crate::client::{
+    OrderStatusFill, PlaceOutcome, UserFill, ValidatedFill, ValidatedMarketSnapshot,
+};
 use crate::errors::{HlError, RejectionKind};
 use crate::format::{human, round_price, round_size, taker_limit_price};
-use crate::journal::{summarize, ExecutionJournal, JournalRecord};
+use crate::journal::{ExecutionJournal, JournalRecord};
 use crate::risk::RiskEnvelope;
 use crate::types::{Address, CancelIntent, Cloid, OrderIntent, Side, Symbol, Tif};
 
@@ -127,7 +129,9 @@ const STALE_BOOK_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// 15500 + 285000 = 300500ms, i.e. 300.5s (~5 minutes). This only widens the
 /// window before giving up; it does not change what counts as terminal, and
 /// exhausting the budget is still a hard stop (see `poll_terminal_status`).
-const ORDER_STATUS_RETRIES_SETTLE: u32 = 25;
+pub const DEFAULT_SETTLE_RETRIES: u32 = 25;
+#[cfg(test)]
+const ORDER_STATUS_RETRIES_SETTLE: u32 = DEFAULT_SETTLE_RETRIES;
 const ORDER_STATUS_RETRY_INTERVAL_BASE_SETTLE: Duration = Duration::from_millis(500);
 const ORDER_STATUS_RETRY_INTERVAL_CAP_SETTLE: Duration = Duration::from_secs(15);
 
@@ -233,7 +237,6 @@ impl ExecutionDeadline {
     /// Construct directly from both clock values. Exposed for tests that need
     /// to control the wall-clock expiry independently of `Instant::now`
     /// (virtual time).
-    #[cfg(test)]
     pub fn from_parts(monotonic: tokio::time::Instant, expires_after_ms: u64) -> Self {
         Self {
             monotonic,
@@ -349,6 +352,7 @@ pub enum ChildAlgo {
 }
 
 /// Everything the loop needs, resolved before the first slice.
+#[derive(Clone)]
 pub struct TwapPlan {
     pub symbol: Symbol,
     pub side: Side,
@@ -362,9 +366,20 @@ pub struct TwapPlan {
     pub total_requested: Decimal,
     pub slices: u32,
     pub duration: Duration,
+    /// When set, this exact wall-clock deadline is used for both every
+    /// exchange `expiresAfter` and the local monotonic deadline. It is needed
+    /// by confirmation-bound emergency operations.
+    pub absolute_deadline_unix_ms: Option<u64>,
     pub slippage_bps: Decimal,
     pub max_book_age_ms: u64,
+    /// Number of status polls permitted while settling a known resting ALO.
+    /// This affects only cancel/settle recovery, never ambiguous-place resend.
+    pub settle_retries: u32,
     pub read_only: bool,
+    /// Force every child-order wire to be reduce-only. Position-aware close
+    /// phases set this before the runner starts; it is deliberately owned by
+    /// the plan so ALO, follow/repost and reconciliation all share it.
+    pub reduce_only: bool,
     /// Issue #3: the notional cap resolved before the run started —
     /// required in live mode, `Decimal::MAX` (effectively unbounded) in
     /// read-only. Re-checked before EVERY order against all prior fills
@@ -398,6 +413,50 @@ pub struct TwapPlan {
     pub follow_threshold_bps: Decimal,
 }
 
+/// Authoritative guard for a position-aware phase.  The normal TWAP fill
+/// accounting only knows about this process's child orders; a manual or
+/// external fill can therefore satisfy the frozen position target without
+/// appearing in that accounting.  Callers opt into this guard for every
+/// position phase so a fresh clearinghouse snapshot is required before each
+/// new slice can be placed.
+#[derive(Clone, Debug)]
+pub struct PositionTargetGuard {
+    master: Address,
+    target_szi: Decimal,
+    side: Side,
+}
+
+impl PositionTargetGuard {
+    pub fn new(master: Address, target_szi: Decimal, side: Side) -> Self {
+        Self {
+            master,
+            target_szi,
+            side,
+        }
+    }
+
+    /// True when the exchange position has reached, or gone beyond, this
+    /// phase's frozen endpoint in the phase direction.  Exact equality is
+    /// intentionally included: terminal verification in `main` decides
+    /// whether the whole logical target is complete; the loop must not send
+    /// another child first.
+    fn reached_or_crossed(&self, current_szi: Decimal) -> bool {
+        match self.side {
+            Side::Long => current_szi >= self.target_szi,
+            Side::Short => current_szi <= self.target_szi,
+        }
+    }
+
+    async fn check_before_place(
+        &self,
+        client: &dyn HlApi,
+        symbol: &Symbol,
+    ) -> Result<bool, HlError> {
+        let current = client.fetch_perp_position(&self.master, symbol).await?.szi;
+        Ok(self.reached_or_crossed(current))
+    }
+}
+
 impl TwapPlan {
     /// The address `orderStatus` must be queried as (F1): the MASTER.
     fn status_user(&self) -> Result<&Address, HlError> {
@@ -412,13 +471,17 @@ impl TwapPlan {
 /// Pre-flight sizing errors (§8).
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PreflightError {
-    #[error("per-slice size rounds to zero at szDecimals={sz_decimals} (total {total} / {slices} slices); increase --usd/--size or reduce --slices")]
+    #[error(
+        "per-slice size rounds to zero at szDecimals={sz_decimals} (total {total} / {slices} slices); increase --usd/--size or reduce --slices"
+    )]
     PerSliceZero {
         total: Decimal,
         slices: u32,
         sz_decimals: u32,
     },
-    #[error("per-slice notional ${notional} is below the ${min} minimum; increase --usd/--size or reduce --slices")]
+    #[error(
+        "per-slice notional ${notional} is below the ${min} minimum; increase --usd/--size or reduce --slices"
+    )]
     PerSliceBelowMinNotional { notional: Decimal, min: Decimal },
     #[error("total size must be > 0, got {0}")]
     NonPositiveTotal(Decimal),
@@ -825,20 +888,28 @@ pub async fn fetch_fresh_book(
 /// terminal status is adopted; a non-terminal one keeps retrying, and running
 /// out of retries is a hard stop, deliberately the safe side.
 ///
-/// Issue #7: also cross-checks the response's coin/side against `plan` —
-/// oid is trivially correct (we queried by it), but a coin/side mismatch
-/// means the response does not describe the order we placed.
+/// Issue #7: also cross-checks every identity field carried by the response.
+/// Even though the request was keyed by `oid`, a buggy proxy/client or a
+/// future response-shape change must not let a different order's terminal
+/// fill enter accounting.
 async fn poll_terminal_status(
     client: &dyn HlApi,
     plan: &TwapPlan,
     user: &Address,
     oid: crate::types::OrderId,
+    expected_cloid: Cloid,
 ) -> Result<OrderStatusFill, HlError> {
     let mut last_err: Option<String> = None;
-    for attempt in 0..ORDER_STATUS_RETRIES_SETTLE {
+    for attempt in 0..plan.settle_retries {
         match client.fetch_order_status(user, oid).await {
             Ok(Some(st)) if st.is_terminal() => {
-                st.cross_check(plan.symbol.as_str(), &plan.side, None)?;
+                if st.oid != oid {
+                    return Err(HlError::InvalidResponse(format!(
+                        "orderStatus cross-check: oid mismatch (expected {oid}, got {})",
+                        st.oid
+                    )));
+                }
+                st.cross_check(plan.symbol.as_str(), &plan.side, Some(expected_cloid))?;
                 tracing::info!(
                     oid = %oid,
                     filled = %human(st.filled_sz),
@@ -884,14 +955,15 @@ async fn poll_terminal_status(
             }
             Err(e) => last_err = Some(e.to_string()),
         }
-        if attempt + 1 < ORDER_STATUS_RETRIES_SETTLE {
+        if attempt + 1 < plan.settle_retries {
             tokio::time::sleep(order_status_retry_delay_settle(attempt)).await;
         }
     }
     Err(HlError::InvalidResponse(format!(
-        "could not determine a terminal fill for oid {oid} after {ORDER_STATUS_RETRIES_SETTLE} \
-         attempts (~300.5s budget) due to a persistently non-terminal status and/or persistent \
+        "could not determine a terminal fill for oid {oid} after {} \
+         attempts (retry delays capped at 15s) due to a persistently non-terminal status and/or persistent \
          unknown-oid (HL info-index lag) responses ({}); stopping rather than risk over-ordering",
+        plan.settle_retries,
         last_err.unwrap_or_else(|| "no detail".into())
     )))
 }
@@ -910,6 +982,7 @@ async fn recover_resting_fill(
     plan: &TwapPlan,
     cloid: Cloid,
     oid: crate::types::OrderId,
+    intent: &OrderIntent,
 ) -> Result<OrderStatusFill, HlError> {
     tracing::warn!(oid = %oid, cloid = %cloid, "IOC order rested unexpectedly; cancelling");
     let cancel = CancelIntent {
@@ -918,13 +991,197 @@ async fn recover_resting_fill(
     };
     // A cancel failure is not fatal by itself — the order may have filled in
     // the interim. orderStatus below is what decides.
-    if let Err(e) = client.cancel_by_cloid(&cancel, plan.asset_index).await {
-        tracing::warn!(error = %e, "cancelByCloid failed; querying orderStatus anyway");
-    }
+    // Keep the ledger query tightly bounded around the cancel.  A fill that
+    // belongs to this oid is independently identified below, but bounding the
+    // read still prevents a lagging `/info` index from turning this recovery
+    // into an open-ended account-ledger scan.
+    let cancel_started_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| HlError::InvalidResponse(format!("system clock before Unix epoch: {e}")))?
+        .as_millis() as u64;
+    let cancel_acknowledged = match client.cancel_by_cloid(&cancel, plan.asset_index).await {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "cancelByCloid failed; querying orderStatus anyway");
+            false
+        }
+    };
 
     // F1: orderStatus must be queried as the MASTER, not the agent.
     let user = plan.status_user()?;
-    poll_terminal_status(client, plan, user, oid).await
+    match poll_terminal_status(client, plan, user, oid, cloid).await {
+        Ok(status) => Ok(status),
+        Err(status_err) if cancel_acknowledged => {
+            // After an acknowledged cancel the order can no longer accrue
+            // fills.  The official fill ledger is safe to consult only now;
+            // query a small pre-cancel overlap to cover exchange timestamps
+            // around the cancel race.
+            let cancel_settled_ms = (SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| {
+                    HlError::InvalidResponse(format!("system clock before Unix epoch: {e}"))
+                })?
+                .as_millis() as u64)
+                // Wall clocks can step backwards.  Preserve a non-empty,
+                // deterministic bounded window rather than issuing an
+                // inverted range to the ledger endpoint.
+                .max(cancel_started_ms);
+            let fills = client
+                .fetch_user_fills_by_time(
+                    user,
+                    cancel_started_ms.saturating_sub(10_000),
+                    Some(cancel_settled_ms),
+                )
+                .await
+                .map_err(|fill_err| {
+                    HlError::InvalidResponse(format!(
+                        "{status_err}; userFillsByTime fallback failed: {fill_err}"
+                    ))
+                })?;
+            let aggregate =
+                aggregate_verified_user_fills(&fills, intent, oid, true).map_err(|fill_err| {
+                    HlError::InvalidResponse(format!(
+                        "{status_err}; userFillsByTime fallback rejected: {fill_err}"
+                    ))
+                })?;
+            // The acknowledged cancel is the settlement boundary: no further
+            // fills for this child can accrue.  The ledger endpoint is still
+            // a bounded view, however, so a positive partial total does not
+            // prove that older fills for this oid were included.  Only a
+            // verified total equal to the signed order size is complete
+            // enough to adopt here.  Any smaller total remains fail-closed
+            // until orderStatus catches up on a later --resume.
+            // Reuse the existing price/size boundary validation rather than
+            // creating a second price-policy implementation for the ledger.
+            let aggregate_status = OrderStatusFill {
+                filled_sz: aggregate.sz,
+                avg_px: Some(aggregate.px),
+                // The cancel acknowledgement, rather than a possibly
+                // lagging status read, is the terminal fact we established.
+                // Keep the durable state truthful for a partial ledger
+                // result: this child was cancelled after the credited fills.
+                status: "canceled".into(),
+                oid,
+                cloid: Some(cloid),
+                coin: plan.symbol.as_str().to_string(),
+                side: match plan.side {
+                    Side::Long => "B",
+                    Side::Short => "A",
+                }
+                .into(),
+            };
+            ValidatedFill::try_from_status(&aggregate_status, intent)?;
+            Ok(aggregate_status)
+        }
+        Err(status_err) => Err(status_err),
+    }
+}
+
+/// Strictly aggregate the official, non-aggregated fill ledger for one
+/// cancelled child.  This stays deliberately separate from `orderStatus`:
+/// an empty response, an order identity mismatch, or a ledger total above
+/// the signed size is a hard error rather than a best-effort accounting hint.
+/// The caller must establish the safety boundary first: either cancel was
+/// acknowledged, or HL had already reported this order fully filled.
+fn aggregate_verified_user_fills(
+    fills: &[UserFill],
+    intent: &OrderIntent,
+    oid: crate::types::OrderId,
+    cancel_acknowledged_or_full: bool,
+) -> Result<SliceOutcome, HlError> {
+    if !cancel_acknowledged_or_full {
+        return Err(HlError::InvalidResponse(
+            "refusing to adopt userFillsByTime before cancel acknowledgement or full fill".into(),
+        ));
+    }
+    let expected_side = match intent.side {
+        Side::Long => "B",
+        Side::Short => "A",
+    };
+    let matching: Vec<&UserFill> = fills.iter().filter(|fill| fill.oid == oid).collect();
+    if matching.is_empty() {
+        return Err(HlError::InvalidResponse(format!(
+            "userFillsByTime contains no fill for cancelled oid {oid}"
+        )));
+    }
+    let mut seen_fills = std::collections::HashMap::new();
+    let mut sz = Decimal::ZERO;
+    let mut notional = Decimal::ZERO;
+    for fill in matching {
+        if fill.coin != intent.symbol.as_str() || fill.side != expected_side {
+            return Err(HlError::InvalidResponse(format!(
+                "userFillsByTime identity mismatch for oid {oid}: expected {} {expected_side}, got {} {}",
+                intent.symbol, fill.coin, fill.side
+            )));
+        }
+        if let Some(cloid) = fill.cloid {
+            if cloid != intent.cloid {
+                return Err(HlError::InvalidResponse(format!(
+                    "userFillsByTime cloid mismatch for oid {oid}"
+                )));
+            }
+        }
+        if fill.sz <= Decimal::ZERO || fill.px <= Decimal::ZERO {
+            return Err(HlError::InvalidResponse(format!(
+                "userFillsByTime has non-positive px/sz for oid {oid}"
+            )));
+        }
+        if let Some(previous) = seen_fills.insert(fill.tid, fill) {
+            // A repeated trade id must be an exact replay of the same ledger
+            // row.  Silently accepting a conflicting duplicate would make
+            // which version we credited an implementation accident; counting
+            // both would double-count.  Exact replays are harmlessly ignored.
+            if previous != fill {
+                return Err(HlError::InvalidResponse(format!(
+                    "userFillsByTime has conflicting duplicate tid {} for oid {oid}",
+                    fill.tid
+                )));
+            }
+            continue;
+        }
+        sz = sz.checked_add(fill.sz).ok_or_else(|| {
+            HlError::InvalidResponse(format!(
+                "userFillsByTime size overflow while aggregating oid {oid}"
+            ))
+        })?;
+        let fill_notional = fill.sz.checked_mul(fill.px).ok_or_else(|| {
+            HlError::InvalidResponse(format!(
+                "userFillsByTime notional overflow while aggregating oid {oid}"
+            ))
+        })?;
+        notional = notional.checked_add(fill_notional).ok_or_else(|| {
+            HlError::InvalidResponse(format!(
+                "userFillsByTime notional overflow while aggregating oid {oid}"
+            ))
+        })?;
+    }
+    if sz > intent.sz {
+        return Err(HlError::InvalidResponse(format!(
+            "userFillsByTime total {sz} exceeds requested {} for oid {oid}",
+            intent.sz
+        )));
+    }
+    if sz < intent.sz {
+        return Err(HlError::InvalidResponse(format!(
+            "userFillsByTime returned only partial total {sz} of requested {} for oid {oid}; \
+             the bounded ledger response cannot prove that older fills were included, so \
+             refusing to undercount",
+            intent.sz
+        )));
+    }
+    if sz <= Decimal::ZERO {
+        return Err(HlError::InvalidResponse(format!(
+            "userFillsByTime has no unique positive fill for oid {oid}"
+        )));
+    }
+    Ok(SliceOutcome {
+        sz,
+        px: notional.checked_div(sz).ok_or_else(|| {
+            HlError::InvalidResponse(format!(
+                "userFillsByTime invalid aggregate price for oid {oid}"
+            ))
+        })?,
+    })
 }
 
 /// A passive (ALO) child order currently resting on the book (Issue #1).
@@ -975,7 +1232,6 @@ async fn settle_resting_child(
     resting: RestingChild,
     journal: Option<&mut ExecutionJournal>,
 ) -> Result<SliceOutcome, HlError> {
-    let st = recover_resting_fill(client, plan, resting.cloid, resting.oid).await?;
     let intent_for_validation = OrderIntent {
         cloid: resting.cloid,
         symbol: plan.symbol.clone(),
@@ -983,8 +1239,16 @@ async fn settle_resting_child(
         px: resting.px,
         sz: resting.requested_sz,
         tif: Tif::Alo,
-        reduce_only: false,
+        reduce_only: plan.reduce_only,
     };
+    let st = recover_resting_fill(
+        client,
+        plan,
+        resting.cloid,
+        resting.oid,
+        &intent_for_validation,
+    )
+    .await?;
     let vf = ValidatedFill::try_from_status(&st, &intent_for_validation)?;
     journal_terminal(
         journal,
@@ -1010,6 +1274,18 @@ enum AloPlaceOutcome {
     /// journaled as a zero-fill Terminal. Not an error; the caller decides
     /// whether/when to retry.
     RejectedSkip,
+    /// A transport-ambiguous ALO was found and settled in-process.  This is
+    /// deliberately distinct from `Resting`: its fill is already terminal
+    /// and must be credited before any subsequent sizing decision.
+    Settled(SliceOutcome),
+    /// The authoritative position reached/crossed the frozen phase target
+    /// after the caller's earlier checks but before this child was sent.
+    /// The Prepared intent is closed as a known zero-fill Terminal.
+    PositionTargetReached,
+    /// Shutdown was requested after the durable Prepared record but before
+    /// the send commit point. No order was sent and the intent was closed as
+    /// a known zero-fill Terminal.
+    ShutdownRequested,
 }
 
 /// Place one ALO (post-only) child order: journal `Prepared` (fsynced BEFORE
@@ -1036,6 +1312,8 @@ async fn place_alo_child(
     px: Decimal,
     order_sz: Decimal,
     mut journal: Option<&mut ExecutionJournal>,
+    position_guard: Option<&PositionTargetGuard>,
+    shutdown: Option<&ShutdownSignal>,
 ) -> Result<AloPlaceOutcome, String> {
     let intent = OrderIntent {
         cloid,
@@ -1044,7 +1322,7 @@ async fn place_alo_child(
         px,
         sz: order_sz,
         tif: Tif::Alo,
-        reduce_only: false,
+        reduce_only: plan.reduce_only,
     };
 
     // Issue #1 Finding 1 fix: durably record intent+cloid BEFORE the send
@@ -1069,6 +1347,83 @@ async fn place_alo_child(
     // A1 fix: re-check the ExecutionDeadline immediately before the send.
     if let Err(e) = exec_deadline.check_before_send(tokio::time::Instant::now()) {
         return Err(format!("slice {slice_idx}: {e}"));
+    }
+
+    // The caller checks before fetching the book, but that fetch can retry
+    // for seconds.  Re-read authoritative exchange state at the actual
+    // commit point so an external/manual fill during that gap cannot make
+    // this child overshoot a non-zero frozen target.
+    if let Some(guard) = position_guard {
+        match guard.check_before_place(client, &plan.symbol).await {
+            Ok(true) => {
+                journal_terminal(
+                    journal.as_deref_mut(),
+                    slice_idx,
+                    cloid,
+                    "positionTargetReached",
+                    Decimal::ZERO,
+                    None,
+                )
+                .map_err(|e| {
+                    format!(
+                        "slice {slice_idx}: journal write (Terminal, positionTargetReached) failed: {e}"
+                    )
+                })?;
+                tracing::warn!(
+                    slice = slice_idx,
+                    target = %human(guard.target_szi),
+                    "authoritative position reached/crossed phase target immediately before ALO send"
+                );
+                return Ok(AloPlaceOutcome::PositionTargetReached);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                // Prepared is already durable, but no send occurred.  Close
+                // the cloid as a known zero-fill terminal before failing
+                // closed so resume does not mistake it for an ambiguity.
+                journal_terminal(
+                    journal.as_deref_mut(),
+                    slice_idx,
+                    cloid,
+                    "neverReceived",
+                    Decimal::ZERO,
+                    None,
+                )
+                .map_err(|e| {
+                    format!(
+                        "slice {slice_idx}: journal write (Terminal, neverReceived) failed after position check: {e}"
+                    )
+                })?;
+                return Err(format!(
+                    "slice {slice_idx}: authoritative position check failed closed immediately before ALO send: {error}"
+                ));
+            }
+        }
+    }
+
+    // The position read above is an awaited network operation, so close the
+    // remaining timing gap with final deadline and shutdown checks adjacent
+    // to the send commit point. A signal after Prepared but before this point
+    // closes the known-unsent intent, keeping both the no-new-orders contract
+    // and journal replay deterministic.
+    if let Err(e) = exec_deadline.check_before_send(tokio::time::Instant::now()) {
+        return Err(format!("slice {slice_idx}: {e}"));
+    }
+    if shutdown.is_some_and(ShutdownSignal::is_triggered) {
+        journal_terminal(
+            journal.as_deref_mut(),
+            slice_idx,
+            cloid,
+            "neverReceived",
+            Decimal::ZERO,
+            None,
+        )
+        .map_err(|e| {
+            format!(
+                "slice {slice_idx}: journal write (Terminal, neverReceived) failed after shutdown: {e}"
+            )
+        })?;
+        return Ok(AloPlaceOutcome::ShutdownRequested);
     }
 
     match client
@@ -1152,10 +1507,81 @@ async fn place_alo_child(
             // being silently forgotten. No in-run resend for an ambiguous
             // ALO send (out of scope); the run aborts and `--resume` is the
             // recovery path.
-            if let Some(j) = journal {
-                let _ = j.record(&JournalRecord::SubmittedUnknown { slice_idx, cloid });
+            if let Some(j) = journal.as_deref_mut() {
+                j.record(&JournalRecord::SubmittedUnknown { slice_idx, cloid })
+                    .map_err(|write_err| {
+                        format!(
+                        "slice {slice_idx}: journal write (SubmittedUnknown) failed: {write_err}"
+                    )
+                    })?;
             }
-            Err(format!("slice {slice_idx} failed: {e}"))
+
+            // Unlike IOC ambiguity, ALO must never be resent in-process: a
+            // live maker order can still fill while we are deciding.  Make
+            // exactly one cloid probe.  If HL has it live, cancel and wait
+            // for a terminal status; if it is already terminal, adopt that
+            // terminal result.  Any absent/error response remains durable
+            // SubmittedUnknown for --resume rather than becoming a resend
+            // signal (Issue #15).
+            let user = plan.status_user().map_err(|status_err| {
+                format!(
+                    "slice {slice_idx} failed after ambiguous ALO send: {status_err}; \
+                 SubmittedUnknown remains; rerun with --resume"
+                )
+            })?;
+            match client.fetch_order_status_by_cloid(user, cloid).await {
+                Ok(Some(st)) if st.is_terminal() => {
+                    st.cross_check(plan.symbol.as_str(), &plan.side, Some(cloid))
+                        .map_err(|check_err| format!("slice {slice_idx}: ambiguous ALO status cross-check failed: {check_err}"))?;
+                    let vf = ValidatedFill::try_from_status(&st, &intent)
+                        .map_err(|validate_err| format!("slice {slice_idx}: ambiguous ALO terminal fill invalid: {validate_err}"))?;
+                    journal_terminal(
+                        journal.as_deref_mut(),
+                        slice_idx,
+                        cloid,
+                        &st.status,
+                        vf.filled_sz,
+                        vf.avg_px,
+                    )
+                    .map_err(|write_err| {
+                        format!("slice {slice_idx}: journal write (Terminal) failed: {write_err}")
+                    })?;
+                    Ok(AloPlaceOutcome::Settled(SliceOutcome {
+                        sz: vf.filled_sz,
+                        px: vf.avg_px.unwrap_or(px),
+                    }))
+                }
+                Ok(Some(st)) => {
+                    st.cross_check(plan.symbol.as_str(), &plan.side, Some(cloid))
+                        .map_err(|check_err| format!("slice {slice_idx}: ambiguous ALO status cross-check failed: {check_err}"))?;
+                    let settled = recover_resting_fill(client, plan, cloid, st.oid, &intent).await
+                        .map_err(|settle_err| format!(
+                            "slice {slice_idx}: ambiguous ALO was live but cancel/settle failed: {settle_err}; \
+                             SubmittedUnknown remains; rerun with --resume"
+                        ))?;
+                    let vf = ValidatedFill::try_from_status(&settled, &intent)
+                        .map_err(|validate_err| format!("slice {slice_idx}: ambiguous ALO settled fill invalid: {validate_err}"))?;
+                    journal_terminal(
+                        journal,
+                        slice_idx,
+                        cloid,
+                        &settled.status,
+                        vf.filled_sz,
+                        vf.avg_px,
+                    )
+                    .map_err(|write_err| {
+                        format!("slice {slice_idx}: journal write (Terminal) failed: {write_err}")
+                    })?;
+                    Ok(AloPlaceOutcome::Settled(SliceOutcome {
+                        sz: vf.filled_sz,
+                        px: vf.avg_px.unwrap_or(px),
+                    }))
+                }
+                Ok(None) | Err(_) => Err(format!(
+                    "slice {slice_idx} failed after ambiguous ALO send: {e}; no resend was attempted; \
+                     SubmittedUnknown remains — rerun with --resume"
+                )),
+            }
         }
     }
 }
@@ -1180,6 +1606,15 @@ const RECONCILE_DELAY: Duration = Duration::from_millis(500);
 struct SliceOutcome {
     sz: Decimal,
     px: Decimal,
+}
+
+/// Result of an IOC placement attempt.  Reaching the authoritative position
+/// target is a clean stop, distinct from an exchange or transport failure.
+#[derive(Debug)]
+enum PlaceSliceOutcome {
+    Settled(SliceOutcome),
+    PositionTargetReached,
+    ShutdownRequested,
 }
 
 /// Place one slice, resolving any transport ambiguity via cloid reconciliation
@@ -1208,6 +1643,7 @@ struct SliceOutcome {
 /// `reconcile_by_cloid` / `recover_resting_fill`) still runs to completion,
 /// since status queries and cancels remain allowed past the deadline (PM
 /// decision) — only a NEW place or resend is forbidden.
+#[allow(clippy::too_many_arguments)]
 async fn place_slice_reconciled(
     client: &dyn HlApi,
     plan: &TwapPlan,
@@ -1215,7 +1651,9 @@ async fn place_slice_reconciled(
     deadline: &ExecutionDeadline,
     slice_idx: u32,
     journal: Option<&mut ExecutionJournal>,
-) -> Result<SliceOutcome, HlError> {
+    position_guard: Option<&PositionTargetGuard>,
+    shutdown: Option<&ShutdownSignal>,
+) -> Result<PlaceSliceOutcome, HlError> {
     deadline.check_before_send(tokio::time::Instant::now())?;
 
     // Issue #4: durably record intent+cloid BEFORE the send that could have
@@ -1242,7 +1680,70 @@ async fn place_slice_reconciled(
     }
 
     let mut attempt = 0u32;
+    // One durable unresolved marker is sufficient for this cloid.  A safe
+    // resend reuses the same cloid only after orderStatus proved the prior
+    // attempt absent; writing SubmittedUnknown again would create the
+    // forbidden SubmittedUnknown -> SubmittedUnknown replay transition.
+    let mut submitted_unknown_recorded = false;
     loop {
+        deadline.check_before_send(tokio::time::Instant::now())?;
+        if let Some(guard) = position_guard {
+            match guard.check_before_place(client, &plan.symbol).await {
+                Ok(true) => {
+                    journal_terminal(
+                        journal.as_deref_mut(),
+                        slice_idx,
+                        intent.cloid,
+                        "positionTargetReached",
+                        Decimal::ZERO,
+                        None,
+                    )?;
+                    tracing::warn!(
+                        slice = slice_idx,
+                        target = %human(guard.target_szi),
+                        "authoritative position reached/crossed phase target immediately before IOC send"
+                    );
+                    return Ok(PlaceSliceOutcome::PositionTargetReached);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    // No send occurred after Prepared.  Close this known
+                    // zero-fill intent before surfacing the fail-closed read
+                    // error, keeping the journal replayable.
+                    journal_terminal(
+                        journal.as_deref_mut(),
+                        slice_idx,
+                        intent.cloid,
+                        "neverReceived",
+                        Decimal::ZERO,
+                        None,
+                    )?;
+                    return Err(HlError::InvalidResponse(format!(
+                        "authoritative position check failed closed immediately before IOC send for cloid {}: {error}",
+                        intent.cloid
+                    )));
+                }
+            }
+        }
+        deadline.check_before_send(tokio::time::Instant::now())?;
+        if shutdown.is_some_and(ShutdownSignal::is_triggered) {
+            // This check runs once per attempt, including every safe resend,
+            // after all awaited commit-point guards and immediately before
+            // place_order_once. If this is the first attempt, Prepared proves
+            // the intent existed but this Terminal proves it never left the
+            // process. If it follows an unknownOid reconciliation, that
+            // authoritative absent result likewise makes neverReceived safe.
+            journal_terminal(
+                journal.as_deref_mut(),
+                slice_idx,
+                intent.cloid,
+                "neverReceived",
+                Decimal::ZERO,
+                None,
+            )?;
+            return Ok(PlaceSliceOutcome::ShutdownRequested);
+        }
+
         let send_err = match client
             .place_order_once(intent, plan.asset_index, deadline.expires_after_ms())
             .await
@@ -1261,10 +1762,10 @@ async fn place_slice_reconciled(
                     vf.filled_sz,
                     Some(vf.avg_px.unwrap_or(intent.px)),
                 )?;
-                return Ok(SliceOutcome {
+                return Ok(PlaceSliceOutcome::Settled(SliceOutcome {
                     sz: vf.filled_sz,
                     px: vf.avg_px.unwrap_or(intent.px),
-                });
+                }));
             }
             Ok((_, PlaceOutcome::Resting { oid })) => {
                 if let Some(j) = journal.as_deref_mut() {
@@ -1280,7 +1781,7 @@ async fn place_slice_reconciled(
                         ))
                     })?;
                 }
-                let st = recover_resting_fill(client, plan, intent.cloid, oid).await?;
+                let st = recover_resting_fill(client, plan, intent.cloid, oid, intent).await?;
                 let vf = ValidatedFill::try_from_status(&st, intent)?;
                 // T5: credit at HL's realised average, not at our limit.
                 journal_terminal(
@@ -1291,13 +1792,27 @@ async fn place_slice_reconciled(
                     vf.filled_sz,
                     vf.avg_px,
                 )?;
-                return Ok(SliceOutcome {
+                return Ok(PlaceSliceOutcome::Settled(SliceOutcome {
                     sz: vf.filled_sz,
                     px: vf.avg_px.unwrap_or(intent.px),
-                });
+                }));
             }
-            // Exchange rejections are decisions, not ambiguity — propagate.
-            Err(e @ HlError::Exchange { .. }) => return Err(e),
+            // Exchange rejections are known no-fill outcomes, not ambiguity.
+            // Close the durable intent before propagating so an authoritative
+            // post-rejection position check can safely distinguish an
+            // already-flat reduce-only close from a genuinely unresolved
+            // order.
+            Err(e @ HlError::Exchange { .. }) => {
+                journal_terminal(
+                    journal.as_deref_mut(),
+                    slice_idx,
+                    intent.cloid,
+                    "rejected",
+                    Decimal::ZERO,
+                    None,
+                )?;
+                return Err(e);
+            }
             // Transport failure: the order may or may not have landed.
             Err(e @ HlError::Network(_)) => e,
             Err(e) => return Err(e),
@@ -1315,14 +1830,19 @@ async fn place_slice_reconciled(
         // Journal it as SubmittedUnknown BEFORE the reconciliation sleep/poll
         // below, so a process death here still leaves a durable record that
         // this cloid's outcome must be resolved via orderStatus on restart.
-        if let Some(j) = journal.as_deref_mut() {
-            j.record(&JournalRecord::SubmittedUnknown {
-                slice_idx,
-                cloid: intent.cloid,
-            })
-            .map_err(|e| {
-                HlError::InvalidResponse(format!("journal write (SubmittedUnknown) failed: {e}"))
-            })?;
+        if !submitted_unknown_recorded {
+            if let Some(j) = journal.as_deref_mut() {
+                j.record(&JournalRecord::SubmittedUnknown {
+                    slice_idx,
+                    cloid: intent.cloid,
+                })
+                .map_err(|e| {
+                    HlError::InvalidResponse(format!(
+                        "journal write (SubmittedUnknown) failed: {e}"
+                    ))
+                })?;
+            }
+            submitted_unknown_recorded = true;
         }
 
         // Give HL a moment to book an order it may already have accepted.
@@ -1347,19 +1867,42 @@ async fn place_slice_reconciled(
                     vf.filled_sz,
                     vf.avg_px,
                 )?;
-                return Ok(SliceOutcome {
+                return Ok(PlaceSliceOutcome::Settled(SliceOutcome {
                     sz: vf.filled_sz,
                     px: vf.avg_px.unwrap_or(intent.px),
-                });
+                }));
             }
-            // HL never received it — safe to re-sign with a fresh nonce,
-            // PROVIDED the execution deadline has not passed in the
-            // meantime (Issue #2): reconciliation itself can take seconds
-            // (RECONCILE_DELAY + the unknownOid streak window), so the
-            // deadline must be re-checked here, immediately before the
-            // resend, not just once at the top of this function.
+            // For an ordinary IOC, the complete unknownOid streak means HL
+            // never received it and a fresh-nonce resend can be safe. A
+            // reduce-only close remains deliberately stricter: exchange
+            // index lag can make this observation stale relative to a fill,
+            // so neither normal execution nor shutdown may convert its
+            // SubmittedUnknown state into a false known-zero terminal.
             Ok(None) => {
+                if plan.reduce_only {
+                    return Err(HlError::InvalidResponse(format!(
+                        "ambiguous reduce-only order for cloid {} was absent during reconciliation; refusing all in-process resends — rerun with --resume",
+                        intent.cloid
+                    )));
+                }
+                if shutdown.is_some_and(ShutdownSignal::is_triggered) {
+                    journal_terminal(
+                        journal.as_deref_mut(),
+                        slice_idx,
+                        intent.cloid,
+                        "neverReceived",
+                        Decimal::ZERO,
+                        None,
+                    )?;
+                    return Ok(PlaceSliceOutcome::ShutdownRequested);
+                }
+                // Reconciliation can take seconds (RECONCILE_DELAY plus the
+                // unknownOid streak window), so re-check the execution
+                // deadline before proceeding toward the next loop/send.
                 deadline.check_before_send(tokio::time::Instant::now())?;
+                // A cloid being absent only proves THIS ambiguous child did
+                // not land. It says nothing about external/manual fills. The
+                // loop's commit-point guard runs again before every resend.
                 attempt += 1;
                 if attempt > PLACE_RESEND_LIMIT {
                     return Err(HlError::Network(format!(
@@ -1643,6 +2186,12 @@ pub async fn reconcile_unresolved_cloid(
     // itself immediately), so this branch is passive-specific in practice,
     // but it is safe and correct for either child algo.
     if let Ok(Some(st)) = client.fetch_order_status_by_cloid(user, cloid).await {
+        // This first response can be LIVE, and its oid is about to control a
+        // cancel/poll sequence.  Verify the full cloid/symbol/side identity
+        // BEFORE using that oid; otherwise a mismatched response could make
+        // resume cancel an unrelated live order.  This is the same
+        // fail-closed boundary used for ambiguous ALO recovery.
+        st.cross_check(plan.symbol.as_str(), &plan.side, Some(cloid))?;
         if !st.is_terminal() {
             tracing::info!(
                 cloid = %cloid,
@@ -1650,7 +2199,7 @@ pub async fn reconcile_unresolved_cloid(
                 "resume: unresolved cloid is a LIVE resting order; \
                  cancelling and polling to a terminal status before continuing"
             );
-            let settled = recover_resting_fill(client, plan, cloid, st.oid).await?;
+            let settled = recover_resting_fill(client, plan, cloid, st.oid, &intent).await?;
             settled.cross_check(plan.symbol.as_str(), &plan.side, Some(cloid))?;
             // A2 fix: bounds-validate (0<=filled<=intent.sz, avg_px>0 when
             // filled>0) against the ORIGINAL Prepared intent before crediting
@@ -1705,7 +2254,8 @@ pub async fn reconcile_unresolved_cloid(
 /// production SIGINT/SIGTERM handler (`main.rs`) and tests can drive it
 /// identically — a test sets the watch value directly, no real signal
 /// delivery required. `true` means "a shutdown has been requested; stop
-/// scheduling new slices, reconcile/cancel in-flight work, and return."
+/// scheduling new slices or sends, reconcile/cancel committed in-flight
+/// work, and return."
 #[derive(Clone)]
 pub struct ShutdownSignal(tokio::sync::watch::Receiver<bool>);
 
@@ -1721,7 +2271,7 @@ impl ShutdownSignal {
     /// Wait until shutdown is requested. Used to race against `sleep_until`
     /// so an interrupt during the inter-slice pause is noticed immediately
     /// rather than only at the top of the next loop iteration.
-    async fn wait(&mut self) {
+    pub async fn wait(&mut self) {
         // `changed()` only returns Err if the sender was dropped without
         // ever sending — in that case there is nothing more to wait for, so
         // treat it the same as "never triggers" by parking forever; the
@@ -1750,6 +2300,9 @@ enum FollowLoopExit {
     /// when this returns has ALREADY run to completion (never cancelled
     /// mid-flight), matching the run-level shutdown contract.
     ShutdownRequested,
+    /// The authoritative position reached/crossed the frozen phase target at
+    /// an immediate pre-send re-check. No child was sent.
+    PositionTargetReached,
 }
 
 /// Outcome of a single [`place_follow_child`] attempt. Distinguishes the
@@ -1763,6 +2316,8 @@ enum FollowLoopExit {
 enum FollowPlace {
     /// Placed and resting.
     Placed(RestingChild),
+    /// A transport-ambiguous ALO was reconciled and terminally settled.
+    Settled(SliceOutcome),
     /// A normal ALO reject (post-only would have crossed); retry later.
     AloRejected,
     /// The slice's target is already met (was `SkipAhead`); stop
@@ -1772,6 +2327,12 @@ enum FollowPlace {
     /// stop re-quoting for the remainder of this slice, shortfall carried
     /// by catch-up sizing on a later slice.
     BelowMinNotional,
+    /// The position-aware phase target was reached immediately before the
+    /// ALO send. The whole phase should stop, not merely this slice.
+    PositionTargetReached,
+    /// Shutdown was requested at the ALO send commit point. No child was
+    /// sent; the whole phase should stop cleanly.
+    ShutdownRequested,
 }
 
 /// Shared bookkeeping for a plain ALO reject inside the follow loop: bump
@@ -1819,6 +2380,7 @@ async fn run_follow_loop(
     stats: &mut FillStats,
     mut journal: Option<&mut ExecutionJournal>,
     shutdown: Option<&mut ShutdownSignal>,
+    position_guard: Option<&PositionTargetGuard>,
 ) -> Result<FollowLoopExit, String> {
     let poll_interval = Duration::from_secs(plan.follow_poll_secs);
     // Throttle state, PER SLICE: the time of this slice's last place (initial
@@ -1926,6 +2488,8 @@ async fn run_follow_loop(
                 new_px,
                 stats,
                 journal.as_deref_mut(),
+                position_guard,
+                shutdown.as_deref(),
             )
             .await
             {
@@ -1933,6 +2497,10 @@ async fn run_follow_loop(
                     *resting = Some(child);
                     last_place_at = tokio::time::Instant::now();
                     consecutive_alo_rejects = 0;
+                }
+                Ok(FollowPlace::Settled(SliceOutcome { sz, px })) => {
+                    stats.add(sz, px);
+                    last_place_at = tokio::time::Instant::now();
                 }
                 Ok(FollowPlace::AloRejected) => {
                     // Nothing to carry forward from THIS tick; try again
@@ -1950,6 +2518,12 @@ async fn run_follow_loop(
                     // until `slice_end`, racing shutdown, same as the
                     // poll-cadence sleep above.
                     return sleep_until_slice_end_or_shutdown(slice_end, shutdown).await;
+                }
+                Ok(FollowPlace::PositionTargetReached) => {
+                    return Ok(FollowLoopExit::PositionTargetReached);
+                }
+                Ok(FollowPlace::ShutdownRequested) => {
+                    return Ok(FollowLoopExit::ShutdownRequested);
                 }
                 Err(reason) => return Err(reason),
             }
@@ -1981,9 +2555,9 @@ async fn run_follow_loop(
                 }
                 Err(e) => {
                     return Err(format!(
-                    "slice {slice_idx}: follow: failed to settle after the touch moved through \
+                        "slice {slice_idx}: follow: failed to settle after the touch moved through \
                      our resting price: {e}"
-                ))
+                    ));
                 }
             }
             if stats.filled >= plan.total_adjusted {
@@ -2028,9 +2602,9 @@ async fn run_follow_loop(
                     }
                     Err(e) => {
                         return Err(format!(
-                        "slice {slice_idx}: follow: failed to settle before reposting at a new \
+                            "slice {slice_idx}: follow: failed to settle before reposting at a new \
                          touch: {e}"
-                    ))
+                        ));
                     }
                 }
                 if stats.filled >= plan.total_adjusted {
@@ -2045,6 +2619,8 @@ async fn run_follow_loop(
                     new_px,
                     stats,
                     journal.as_deref_mut(),
+                    position_guard,
+                    shutdown.as_deref(),
                 )
                 .await
                 {
@@ -2052,6 +2628,10 @@ async fn run_follow_loop(
                         *resting = Some(child);
                         last_place_at = tokio::time::Instant::now();
                         consecutive_alo_rejects = 0;
+                    }
+                    Ok(FollowPlace::Settled(SliceOutcome { sz, px })) => {
+                        stats.add(sz, px);
+                        last_place_at = tokio::time::Instant::now();
                     }
                     Ok(FollowPlace::AloRejected) => {
                         // Does NOT touch `slices_skipped` — see `FollowPlace`.
@@ -2064,6 +2644,12 @@ async fn run_follow_loop(
                     }
                     Ok(FollowPlace::TargetMet | FollowPlace::BelowMinNotional) => {
                         return sleep_until_slice_end_or_shutdown(slice_end, shutdown).await;
+                    }
+                    Ok(FollowPlace::PositionTargetReached) => {
+                        return Ok(FollowLoopExit::PositionTargetReached);
+                    }
+                    Ok(FollowPlace::ShutdownRequested) => {
+                        return Ok(FollowLoopExit::ShutdownRequested);
                     }
                     Err(reason) => return Err(reason),
                 }
@@ -2120,6 +2706,7 @@ async fn sleep_until_slice_end_or_shutdown(
 /// retry later, subject to the caller's own throttle.
 /// `Err(reason)` — fatal: risk envelope breach, notional cap breach, or a
 /// non-ALO exchange rejection/transport failure from `place_alo_child`.
+#[allow(clippy::too_many_arguments)]
 async fn place_follow_child(
     client: &dyn HlApi,
     plan: &TwapPlan,
@@ -2128,6 +2715,8 @@ async fn place_follow_child(
     new_px: Decimal,
     stats: &FillStats,
     journal: Option<&mut ExecutionJournal>,
+    position_guard: Option<&PositionTargetGuard>,
+    shutdown: Option<&ShutdownSignal>,
 ) -> Result<FollowPlace, String> {
     // Item 4: recompute via decide_slice, exactly like the top of the slice
     // loop does, at the NEW touch price and the CURRENT cumulative fill.
@@ -2183,10 +2772,6 @@ async fn place_follow_child(
             human(slice_notional_estimate)
         ));
     }
-    if let Err(e) = exec_deadline.check_before_send(tokio::time::Instant::now()) {
-        return Err(format!("slice {slice_idx}: {e}"));
-    }
-
     let cloid = Cloid::new();
     match place_alo_child(
         client,
@@ -2197,11 +2782,16 @@ async fn place_follow_child(
         new_px,
         order_sz,
         journal,
+        position_guard,
+        shutdown,
     )
     .await?
     {
         AloPlaceOutcome::Resting(child) => Ok(FollowPlace::Placed(child)),
+        AloPlaceOutcome::Settled(outcome) => Ok(FollowPlace::Settled(outcome)),
         AloPlaceOutcome::RejectedSkip => Ok(FollowPlace::AloRejected),
+        AloPlaceOutcome::PositionTargetReached => Ok(FollowPlace::PositionTargetReached),
+        AloPlaceOutcome::ShutdownRequested => Ok(FollowPlace::ShutdownRequested),
     }
 }
 
@@ -2214,13 +2804,12 @@ async fn place_follow_child(
 /// behaviour exactly (used by `run_twap` and all pre-existing tests).
 ///
 /// `shutdown`: when `Some` and triggered (SIGINT/SIGTERM in production, or a
-/// test driving the underlying `watch` channel directly), the loop stops
-/// scheduling NEW slices at the next opportunity — the top of a slice
-/// iteration, or during the inter-slice sleep — lets any in-flight
-/// `place_slice_reconciled` call for the CURRENT slice run to completion
-/// (never abandoned mid-send, so no is-it-terminal ambiguity is created by
-/// the shutdown itself beyond what a normal ambiguous send already produces),
-/// then returns with `abort_reason` describing the interruption.
+/// test driving the underlying `watch` channel directly), the loop stops at
+/// the next scheduling or send commit point. A POST that already crossed its
+/// commit point is allowed to finish acknowledgement/reconciliation (never
+/// abandoned mid-send); any not-yet-sent initial order or safe resend is
+/// closed as known-unsent and refused. The report's `abort_reason` describes
+/// the interruption.
 pub async fn run_twap_journaled(
     client: &dyn HlApi,
     plan: &TwapPlan,
@@ -2243,8 +2832,76 @@ pub async fn run_twap_journaled_with_prior_notional(
     client: &dyn HlApi,
     plan: &TwapPlan,
     prior_filled_notional: Decimal,
+    journal: Option<&mut ExecutionJournal>,
+    shutdown: Option<ShutdownSignal>,
+) -> TwapReport {
+    run_twap_journaled_with_prior_notional_and_completion(
+        client,
+        plan,
+        prior_filled_notional,
+        journal,
+        shutdown,
+        false,
+        None,
+    )
+    .await
+}
+
+/// Position-aware callers use this variant to keep the journal incomplete
+/// until a fresh `clearinghouseState` snapshot confirms the frozen target.
+/// The trading loop is identical; only its terminal FinalReport is deferred.
+pub async fn run_twap_journaled_with_prior_notional_deferred(
+    client: &dyn HlApi,
+    plan: &TwapPlan,
+    prior_filled_notional: Decimal,
+    journal: Option<&mut ExecutionJournal>,
+    shutdown: Option<ShutdownSignal>,
+) -> TwapReport {
+    run_twap_journaled_with_prior_notional_and_completion(
+        client,
+        plan,
+        prior_filled_notional,
+        journal,
+        shutdown,
+        true,
+        None,
+    )
+    .await
+}
+
+/// Position-aware counterpart to
+/// [`run_twap_journaled_with_prior_notional_deferred`]. It fetches the
+/// authoritative signed position both before each new slice and again at
+/// every actual child-send commit point, refusing to place once the frozen
+/// phase endpoint has already been reached or crossed.
+pub async fn run_twap_journaled_with_prior_notional_deferred_position_guard(
+    client: &dyn HlApi,
+    plan: &TwapPlan,
+    prior_filled_notional: Decimal,
+    journal: Option<&mut ExecutionJournal>,
+    shutdown: Option<ShutdownSignal>,
+    position_guard: PositionTargetGuard,
+) -> TwapReport {
+    run_twap_journaled_with_prior_notional_and_completion(
+        client,
+        plan,
+        prior_filled_notional,
+        journal,
+        shutdown,
+        true,
+        Some(&position_guard),
+    )
+    .await
+}
+
+async fn run_twap_journaled_with_prior_notional_and_completion(
+    client: &dyn HlApi,
+    plan: &TwapPlan,
+    prior_filled_notional: Decimal,
     mut journal: Option<&mut ExecutionJournal>,
     mut shutdown: Option<ShutdownSignal>,
+    defer_completion: bool,
+    position_guard: Option<&PositionTargetGuard>,
 ) -> TwapReport {
     let start = tokio::time::Instant::now();
     // Issue #2: the run-level ExecutionDeadline, constructed ONCE at the
@@ -2253,7 +2910,14 @@ pub async fn run_twap_journaled_with_prior_notional(
     // instant. Every place/resend for the ENTIRE run — including the final
     // slice — checks against this same value; a resend does NOT get a fresh
     // expiry (PM decision).
-    let exec_deadline = ExecutionDeadline::new(start, plan.duration, wall_clock_now_ms());
+    let now_wall = wall_clock_now_ms();
+    let exec_deadline = match plan.absolute_deadline_unix_ms {
+        Some(expires_after_ms) => ExecutionDeadline::from_parts(
+            start + Duration::from_millis(expires_after_ms.saturating_sub(now_wall)),
+            expires_after_ms,
+        ),
+        None => ExecutionDeadline::new(start, plan.duration, now_wall),
+    };
     let mut stats = FillStats::with_prior_notional(prior_filled_notional);
     let mut slices_executed = 0u32;
     let mut slices_skipped = 0u32;
@@ -2329,6 +2993,32 @@ pub async fn run_twap_journaled_with_prior_notional(
                 Err(e) => {
                     abort_reason = Some(format!(
                         "slice {slice_idx}: failed to settle the resting passive child order: {e}"
+                    ));
+                    break;
+                }
+            }
+        }
+
+        // A position target is an exchange-state invariant, not merely this
+        // process's fill sum.  Fail closed if the authoritative read fails;
+        // if an external/manual fill has already reached (or crossed) the
+        // frozen endpoint, do not construct or send another child.  The
+        // caller's terminal verification still requires exact equality, so
+        // a crossed target is never reported as success.
+        if let Some(guard) = position_guard {
+            match guard.check_before_place(client, &plan.symbol).await {
+                Ok(true) => {
+                    tracing::warn!(
+                        slice = slice_idx,
+                        target = %human(guard.target_szi),
+                        "authoritative position reached/crossed phase target; no further child order will be placed"
+                    );
+                    break;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    abort_reason = Some(format!(
+                        "slice {slice_idx}: authoritative position check failed closed before placing: {error}"
                     ));
                     break;
                 }
@@ -2530,7 +3220,7 @@ pub async fn run_twap_journaled_with_prior_notional(
             px,
             sz: order_sz,
             tif,
-            reduce_only: false,
+            reduce_only: plan.reduce_only,
         };
 
         match plan.child_algo {
@@ -2544,15 +3234,13 @@ pub async fn run_twap_journaled_with_prior_notional(
                     "placing IOC slice"
                 );
 
-                // Issue #4: once a place is in flight it runs to completion —
-                // the journal's Prepared/SubmittedUnknown/Acknowledged/
-                // Terminal sequence inside `place_slice_reconciled` is what
-                // makes THIS call crash-safe; a shutdown signal arriving
-                // mid-call is handled by the NEXT iteration's top-of-loop
-                // check (or by the caller's own grace timeout racing this
-                // whole `run_twap_journaled` future), never by cancelling the
-                // call itself — an abandoned in-flight place is exactly the
-                // ambiguity this feature exists to prevent.
+                // Issue #4: once a place has crossed its send commit point it
+                // runs through acknowledgement/reconciliation to completion;
+                // cancelling that work would create the very ambiguity the
+                // journal exists to resolve. Conversely, a shutdown arriving
+                // before an initial send or a safe resend is checked inside
+                // `place_slice_reconciled` at that exact commit point, so no
+                // new POST begins after the signal.
                 match place_slice_reconciled(
                     client,
                     plan,
@@ -2560,6 +3248,8 @@ pub async fn run_twap_journaled_with_prior_notional(
                     &exec_deadline,
                     slice_idx,
                     journal.as_deref_mut(),
+                    position_guard,
+                    shutdown.as_ref(),
                 )
                 .await
                 {
@@ -2567,7 +3257,7 @@ pub async fn run_twap_journaled_with_prior_notional(
                     // reconciled after an ambiguous send — is credited here
                     // EXACTLY ONCE (T3/T5). There is no second accounting
                     // path.
-                    Ok(SliceOutcome { sz, px: fill_px }) => {
+                    Ok(PlaceSliceOutcome::Settled(SliceOutcome { sz, px: fill_px })) => {
                         stats.add(sz, fill_px);
                         slices_executed += 1;
                         tracing::info!(
@@ -2577,6 +3267,20 @@ pub async fn run_twap_journaled_with_prior_notional(
                             cumulative = %human(stats.filled),
                             "slice filled"
                         );
+                    }
+                    Ok(PlaceSliceOutcome::PositionTargetReached) => {
+                        tracing::warn!(
+                            slice = slice_idx,
+                            "position target reached at the IOC commit point; stopping the phase"
+                        );
+                        break;
+                    }
+                    Ok(PlaceSliceOutcome::ShutdownRequested) => {
+                        abort_reason = Some(format!(
+                            "shutdown requested at the IOC send boundary for slice {slice_idx}/{}",
+                            plan.slices
+                        ));
+                        break;
                     }
                     // Exchange rejection: NEVER retried, hard stop (§5).
                     Err(HlError::Exchange { code, message }) => {
@@ -2613,6 +3317,8 @@ pub async fn run_twap_journaled_with_prior_notional(
                     px,
                     order_sz,
                     journal.as_deref_mut(),
+                    position_guard,
+                    shutdown.as_ref(),
                 )
                 .await
                 {
@@ -2624,13 +3330,31 @@ pub async fn run_twap_journaled_with_prior_notional(
                             "ALO resting; will settle at the next slice boundary"
                         );
                     }
+                    Ok(AloPlaceOutcome::Settled(SliceOutcome { sz, px: fill_px })) => {
+                        stats.add(sz, fill_px);
+                        slices_executed += 1;
+                    }
                     Ok(AloPlaceOutcome::RejectedSkip) => {
                         slices_skipped += 1;
                         tracing::info!(
                             slice = slice_idx,
                             "ALO rejected (post-only would have crossed); \
-                             skipping this slice, catch-up will carry the shortfall"
+                            skipping this slice, catch-up will carry the shortfall"
                         );
+                    }
+                    Ok(AloPlaceOutcome::PositionTargetReached) => {
+                        tracing::warn!(
+                            slice = slice_idx,
+                            "position target reached at the ALO commit point; stopping the phase"
+                        );
+                        break;
+                    }
+                    Ok(AloPlaceOutcome::ShutdownRequested) => {
+                        abort_reason = Some(format!(
+                            "shutdown requested at the ALO send boundary for slice {slice_idx}/{}",
+                            plan.slices
+                        ));
+                        break;
                     }
                     Err(reason) => {
                         abort_reason = Some(reason);
@@ -2657,11 +3381,17 @@ pub async fn run_twap_journaled_with_prior_notional(
                     px,
                     order_sz,
                     journal.as_deref_mut(),
+                    position_guard,
+                    shutdown.as_ref(),
                 )
                 .await
                 {
                     Ok(AloPlaceOutcome::Resting(child)) => {
                         resting = Some(child);
+                        slices_executed += 1;
+                    }
+                    Ok(AloPlaceOutcome::Settled(SliceOutcome { sz, px: fill_px })) => {
+                        stats.add(sz, fill_px);
                         slices_executed += 1;
                     }
                     Ok(AloPlaceOutcome::RejectedSkip) => {
@@ -2673,6 +3403,20 @@ pub async fn run_twap_journaled_with_prior_notional(
                         // initial reject is exactly the "no resting order"
                         // case `run_follow_loop` already handles every tick.
                         slices_skipped += 1;
+                    }
+                    Ok(AloPlaceOutcome::PositionTargetReached) => {
+                        tracing::warn!(
+                            slice = slice_idx,
+                            "position target reached at the follow ALO commit point; stopping the phase"
+                        );
+                        break;
+                    }
+                    Ok(AloPlaceOutcome::ShutdownRequested) => {
+                        abort_reason = Some(format!(
+                            "shutdown requested at the follow ALO send boundary for slice {slice_idx}/{}",
+                            plan.slices
+                        ));
+                        break;
                     }
                     Err(reason) => {
                         abort_reason = Some(reason);
@@ -2699,6 +3443,7 @@ pub async fn run_twap_journaled_with_prior_notional(
                     &mut stats,
                     journal.as_deref_mut(),
                     shutdown.as_mut(),
+                    position_guard,
                 )
                 .await
                 {
@@ -2723,6 +3468,13 @@ pub async fn run_twap_journaled_with_prior_notional(
                             "shutdown requested during follow loop for slice {slice_idx}/{}",
                             plan.slices
                         ));
+                        break;
+                    }
+                    Ok(FollowLoopExit::PositionTargetReached) => {
+                        tracing::warn!(
+                            slice = slice_idx,
+                            "position target reached at a follow re-quote commit point; stopping the phase"
+                        );
                         break;
                     }
                     Err(reason) => {
@@ -2830,29 +3582,118 @@ pub async fn run_twap_journaled_with_prior_notional(
         // in-memory set alongside `stats`, since the journal itself is
         // already the single source of truth for per-cloid state and a
         // fresh replay can never drift from it.
-        let outcome_unknown_cloids = j
+        let finalization = j
             .dir()
             .parent()
             .and_then(|p| p.parent())
+            .ok_or_else(|| {
+                "FinalReport: malformed journal run directory (expected <state_dir>/runs/<run_id>)"
+                    .to_string()
+            })
             .and_then(|state_root| {
                 ExecutionJournal::read_all(state_root, j.run_id())
-                    .map(|records| summarize(&records).unresolved_cloids())
-                    .map_err(|e| {
-                        tracing::warn!(
-                            error = %e,
-                            "FinalReport: failed to replay this run's own journal to derive \
-                             outcome_unknown_cloids; falling back to empty"
-                        );
-                    })
-                    .ok()
+                    .map_err(|e| format!("FinalReport: failed to read this run's journal: {e}"))
             })
-            .unwrap_or_default();
-        let _ = j.record(&JournalRecord::FinalReport {
-            completed: abort_reason.is_none(),
-            filled_total: stats.filled.to_string(),
-            outcome_unknown_cloids,
-            note: abort_reason.clone().unwrap_or_else(|| "completed".into()),
+            .and_then(|records| {
+                crate::journal::ValidatedJournalReplay::replay(&records)
+                    .map_err(|e| format!("FinalReport: failed to validate this run's journal: {e}"))
+            });
+
+        let finalization = finalization.and_then(|replay| {
+            let outcome_unknown_cloids = replay.summary.unresolved_cloids();
+            let cap_remaining = replay
+                .summary
+                .header
+                .as_ref()
+                .and_then(|header| header.execution_fingerprint.as_ref())
+                .map(|fingerprint| {
+                    fingerprint
+                        .max_notional_usd
+                        .parse::<Decimal>()
+                        .map_err(|error| {
+                            format!(
+                                "FinalReport: validated fingerprint cap could not be restored: {error}"
+                            )
+                        })
+                        .and_then(|cap| {
+                            cap.checked_sub(replay.fill_totals.notional).ok_or_else(|| {
+                                "FinalReport: cap remaining calculation overflowed".to_string()
+                            })
+                        })
+                        .map(|remaining| remaining.max(Decimal::ZERO).to_string())
+                })
+                .transpose()?;
+            let whole_run = {
+                let started = replay
+                    .summary
+                    .header
+                    .as_ref()
+                    .map(|h| h.started_at_unix_ms)
+                    .unwrap_or_else(wall_clock_now_ms);
+                crate::journal::WholeRunSummary {
+                    requested_total: replay
+                        .summary
+                        .header
+                        .as_ref()
+                        .and_then(|header| header.execution_fingerprint.as_ref())
+                        .map(|fingerprint| {
+                            fingerprint
+                                .logical_position_total()
+                                .unwrap_or_else(|| fingerprint.total_requested.clone())
+                        }),
+                    adjusted_total: replay
+                        .summary
+                        .header
+                        .as_ref()
+                        .and_then(|header| header.execution_fingerprint.as_ref())
+                        .map(|fingerprint| {
+                            fingerprint
+                                .logical_position_total()
+                                .unwrap_or_else(|| fingerprint.total_adjusted.clone())
+                        }),
+                    accounted_notional: replay.fill_totals.notional.to_string(),
+                    // Only the immutable typed fingerprint can authenticate
+                    // the logical run's cap. Legacy headers deliberately omit
+                    // this projection rather than writing an unverifiable
+                    // runtime-plan value that replay would have to trust.
+                    cap_remaining,
+                    trusted_vwap: replay.execution_vwap.map(|v| v.to_string()),
+                    logical_elapsed_ms: wall_clock_now_ms().saturating_sub(started),
+                    unresolved_cloids: outcome_unknown_cloids.len(),
+                }
+            };
+            let completion_deferred =
+                abort_reason.is_none() && (plan.reduce_only || defer_completion);
+            j.record(&JournalRecord::FinalReport {
+                // A reduce-only position phase is not logically complete until
+                // its caller has re-read clearinghouseState. In particular this
+                // prevents a crash between close-to-flat and open-from-flat from
+                // making a zero-crossing journal look safely complete.
+                completed: abort_reason.is_none() && !plan.reduce_only && !defer_completion,
+                filled_total: replay.fill_totals.filled_sz.to_string(),
+                outcome_unknown_cloids,
+                note: abort_reason.clone().unwrap_or_else(|| {
+                    if completion_deferred {
+                        "phase completed; final position verification deferred".into()
+                    } else {
+                        "completed".into()
+                    }
+                }),
+                whole_run: Some(whole_run),
+            })
+            .map_err(|e| format!("FinalReport: failed to durably record final state: {e}"))
         });
+
+        if let Err(error) = finalization {
+            tracing::error!(error = %error, "run finalization was not durably recorded; failing closed");
+            match abort_reason.as_mut() {
+                Some(existing) => {
+                    existing.push_str("; additionally, ");
+                    existing.push_str(&error);
+                }
+                None => abort_reason = Some(error),
+            }
+        }
     }
 
     TwapReport {
@@ -2881,6 +3722,36 @@ async fn sleep_until(deadline: tokio::time::Instant) {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    #[test]
+    fn aggregate_user_fills_requires_exact_order_identity() {
+        let cloid = Cloid::new();
+        let intent = OrderIntent {
+            cloid,
+            symbol: Symbol::new("HYPE"),
+            side: Side::Long,
+            px: dec!(51),
+            sz: dec!(2),
+            tif: Tif::Alo,
+            reduce_only: false,
+        };
+        let fills = vec![UserFill {
+            coin: "HYPE".into(),
+            px: dec!(50),
+            sz: dec!(2),
+            side: "B".into(),
+            time_ms: 1,
+            oid: crate::types::OrderId(7),
+            tid: 1,
+            cloid: Some(cloid),
+        }];
+        let out =
+            aggregate_verified_user_fills(&fills, &intent, crate::types::OrderId(7), true).unwrap();
+        assert_eq!((out.sz, out.px), (dec!(2), dec!(50)));
+        let err = aggregate_verified_user_fills(&fills, &intent, crate::types::OrderId(8), true)
+            .unwrap_err();
+        assert!(err.to_string().contains("no fill"));
+    }
 
     // === orderStatus retry backoff (pure function, no I/O) ===
 
@@ -3450,10 +4321,13 @@ mod loop_tests {
             total_requested: dec!(50),
             slices: 10,
             duration: Duration::from_secs(1800),
+            absolute_deadline_unix_ms: None,
             slippage_bps: dec!(20),
             // Disabled: these tests pin sequencing, not freshness.
             max_book_age_ms: 0,
+            settle_retries: ORDER_STATUS_RETRIES_SETTLE,
             read_only,
+            reduce_only: false,
             // Generous default so pre-existing tests (small notionals, ~$5-500)
             // are unaffected; Issue #3 boundary tests override this explicitly.
             max_notional_usd: dec!(1_000_000),
@@ -3495,6 +4369,155 @@ mod loop_tests {
         })
     }
 
+    fn position(szi: Decimal) -> crate::types::SignedPerpPosition {
+        crate::types::SignedPerpPosition {
+            symbol: Symbol::new("HYPE"),
+            szi,
+        }
+    }
+
+    #[tokio::test]
+    async fn position_guard_stops_long_before_book_or_place_when_external_fill_reaches_target() {
+        let api = ScriptedApi::new().push_position(Ok(position(dec!(10))));
+        let mut p = plan(false);
+        p.total_adjusted = dec!(10);
+        p.total_requested = dec!(10);
+        p.per_slice = dec!(1);
+        let report = run_twap_journaled_with_prior_notional_deferred_position_guard(
+            &api,
+            &p,
+            Decimal::ZERO,
+            None,
+            None,
+            PositionTargetGuard::new(Address::new(MASTER), dec!(10), Side::Long),
+        )
+        .await;
+
+        assert!(report.abort_reason.is_none(), "{:?}", report.abort_reason);
+        assert_eq!(
+            api.place_count(),
+            0,
+            "target reached externally: no child may be sent"
+        );
+        assert!(
+            api.calls()
+                .iter()
+                .all(|call| !matches!(call, Call::Book { .. })),
+            "the position guard must run before fetching a book: {:?}",
+            api.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn position_guard_stops_short_before_place_when_external_fill_crosses_target() {
+        let api = ScriptedApi::new().push_position(Ok(position(dec!(-11))));
+        let mut p = plan(false);
+        p.side = Side::Short;
+        p.total_adjusted = dec!(10);
+        p.total_requested = dec!(10);
+        p.per_slice = dec!(1);
+        let report = run_twap_journaled_with_prior_notional_deferred_position_guard(
+            &api,
+            &p,
+            Decimal::ZERO,
+            None,
+            None,
+            PositionTargetGuard::new(Address::new(MASTER), dec!(-10), Side::Short),
+        )
+        .await;
+
+        assert!(report.abort_reason.is_none(), "{:?}", report.abort_reason);
+        assert_eq!(
+            api.place_count(),
+            0,
+            "crossed target: no corrective reversal is allowed"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn position_guard_rechecks_after_book_retry_at_every_initial_send_commit_point() {
+        for child_algo in [ChildAlgo::Market, ChildAlgo::Passive, ChildAlgo::Follow] {
+            let api = ScriptedApi::new()
+                // The slice-level guard initially sees room for one coin.
+                .push_position(Ok(position(dec!(9))))
+                // Force a retrying/awaited book path during which an external
+                // fill can satisfy the frozen target.
+                .push_book(Ok(empty_bid_book()))
+                .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+                // The commit-point guard must observe the new target before
+                // Market, Passive, or Follow can call place_order_once.
+                .push_position(Ok(position(dec!(10))));
+            let mut p = plan(false);
+            p.child_algo = child_algo;
+            p.slices = 1;
+            p.duration = Duration::from_secs(30);
+            p.per_slice = dec!(1);
+            p.total_adjusted = dec!(1);
+            p.total_requested = dec!(1);
+
+            let report = run_twap_journaled_with_prior_notional_deferred_position_guard(
+                &api,
+                &p,
+                Decimal::ZERO,
+                None,
+                None,
+                PositionTargetGuard::new(Address::new(MASTER), dec!(10), Side::Long),
+            )
+            .await;
+
+            assert!(
+                report.abort_reason.is_none(),
+                "{child_algo:?}: reaching the frozen target is a clean stop: {:?}",
+                report.abort_reason
+            );
+            assert_eq!(
+                api.place_count(),
+                0,
+                "{child_algo:?}: no child may be sent from a stale pre-book position snapshot"
+            );
+            assert_eq!(
+                api.calls()
+                    .iter()
+                    .filter(|call| matches!(call, Call::Book { .. }))
+                    .count(),
+                2,
+                "{child_algo:?}: the test must exercise the retried book gap"
+            );
+            assert_eq!(
+                api.calls()
+                    .iter()
+                    .filter(|call| matches!(call, Call::Position { .. }))
+                    .count(),
+                2,
+                "{child_algo:?}: one slice-level and one commit-point position read are required"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn position_guard_fails_closed_when_authoritative_read_is_unavailable() {
+        let api = ScriptedApi::new().push_position(Err(HlError::Network("offline".into())));
+        let report = run_twap_journaled_with_prior_notional_deferred_position_guard(
+            &api,
+            &plan(false),
+            Decimal::ZERO,
+            None,
+            None,
+            PositionTargetGuard::new(Address::new(MASTER), dec!(50), Side::Long),
+        )
+        .await;
+
+        assert!(
+            report
+                .abort_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("position check failed closed")),
+            "{:?}",
+            report.abort_reason
+        );
+        assert_eq!(api.place_count(), 0);
+    }
+
     /// Default oid/coin/side match `plan()`'s HYPE/Long order, so existing
     /// tests that don't care about the cross-check keep passing it for free.
     fn status(filled_sz: Decimal, avg_px: Option<Decimal>, st: &str) -> OrderStatusFill {
@@ -3520,6 +4543,422 @@ mod loop_tests {
             coin: coin.into(),
             side: side.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_status_poll_rejects_a_response_for_a_different_oid() {
+        let mut p = plan(false);
+        p.settle_retries = 1;
+        let cloid = Cloid::new();
+        let api = ScriptedApi::new().push_status(Ok(Some(status_full(
+            dec!(1),
+            Some(dec!(50)),
+            "filled",
+            OrderId(88),
+            Some(cloid),
+            "HYPE",
+            "B",
+        ))));
+
+        let error = poll_terminal_status(&api, &p, &Address::new(MASTER), OrderId(77), cloid)
+            .await
+            .expect_err("a terminal response for a foreign oid must never be credited");
+        assert!(error.to_string().contains("oid mismatch"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn terminal_status_poll_rejects_a_response_for_a_different_cloid() {
+        let mut p = plan(false);
+        p.settle_retries = 1;
+        let expected = Cloid::new();
+        let foreign = Cloid::new();
+        let api = ScriptedApi::new().push_status(Ok(Some(status_full(
+            dec!(1),
+            Some(dec!(50)),
+            "filled",
+            OrderId(77),
+            Some(foreign),
+            "HYPE",
+            "B",
+        ))));
+
+        let error = poll_terminal_status(&api, &p, &Address::new(MASTER), OrderId(77), expected)
+            .await
+            .expect_err("a terminal response for a foreign cloid must never be credited");
+        assert!(error.to_string().contains("cloid mismatch"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn settle_uses_verified_user_fills_only_after_cancel_ack_when_status_is_unknown() {
+        let mut p = plan(false);
+        p.settle_retries = 1;
+        let cloid = Cloid::new();
+        let intent = OrderIntent {
+            cloid,
+            symbol: Symbol::new("HYPE"),
+            side: Side::Long,
+            px: dec!(51),
+            sz: dec!(2),
+            tif: Tif::Alo,
+            reduce_only: false,
+        };
+        let api = ScriptedApi::new()
+            .push_cancel(Ok(()))
+            .push_status(Ok(None))
+            .push_fills(Ok(vec![UserFill {
+                coin: "HYPE".into(),
+                px: dec!(50),
+                sz: dec!(2),
+                side: "B".into(),
+                time_ms: 1,
+                oid: OrderId(77),
+                tid: 11,
+                cloid: Some(cloid),
+            }]));
+        let result = recover_resting_fill(&api, &p, cloid, OrderId(77), &intent)
+            .await
+            .unwrap();
+        assert_eq!((result.filled_sz, result.avg_px), (dec!(2), Some(dec!(50))));
+        assert!(api
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::UserFillsByTime { .. })));
+    }
+
+    #[tokio::test]
+    async fn settle_rejects_partial_ledger_even_after_cancel_ack_without_counting_duplicates() {
+        let mut p = plan(false);
+        p.settle_retries = 1;
+        let cloid = Cloid::new();
+        let intent = OrderIntent {
+            cloid,
+            symbol: Symbol::new("HYPE"),
+            side: Side::Long,
+            px: dec!(51),
+            sz: dec!(2),
+            tif: Tif::Alo,
+            reduce_only: false,
+        };
+        let api = ScriptedApi::new()
+            .push_cancel(Ok(()))
+            .push_status(Ok(None))
+            .push_fills(Ok(vec![
+                // An unrelated account fill is present in the bounded query
+                // window but must not affect this child.
+                UserFill {
+                    coin: "HYPE".into(),
+                    px: dec!(999),
+                    sz: dec!(99),
+                    side: "B".into(),
+                    time_ms: 1,
+                    oid: OrderId(88),
+                    tid: 10,
+                    cloid: None,
+                },
+                UserFill {
+                    coin: "HYPE".into(),
+                    px: dec!(50),
+                    sz: dec!(1),
+                    side: "B".into(),
+                    time_ms: 1,
+                    oid: OrderId(77),
+                    tid: 11,
+                    cloid: Some(cloid),
+                },
+                // An exact replay of the same tid must not double-credit.
+                UserFill {
+                    coin: "HYPE".into(),
+                    px: dec!(50),
+                    sz: dec!(1),
+                    side: "B".into(),
+                    time_ms: 1,
+                    oid: OrderId(77),
+                    tid: 11,
+                    cloid: Some(cloid),
+                },
+            ]));
+        let error = recover_resting_fill(&api, &p, cloid, OrderId(77), &intent)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("only partial total 1 of requested 2"),
+            "{error}"
+        );
+        let calls = api.calls();
+        assert!(matches!(calls.as_slice(), [
+            Call::Cancel { cloid: got },
+            Call::StatusByOid { oid: OrderId(77), .. },
+            Call::UserFillsByTime { start_time_ms, end_time_ms: Some(end_time_ms), .. },
+        ] if *got == cloid && *start_time_ms <= *end_time_ms));
+    }
+
+    #[tokio::test]
+    async fn settle_partial_ledger_rejects_conflicting_duplicate_tid_fail_closed() {
+        let mut p = plan(false);
+        p.settle_retries = 1;
+        let cloid = Cloid::new();
+        let intent = OrderIntent {
+            cloid,
+            symbol: Symbol::new("HYPE"),
+            side: Side::Long,
+            px: dec!(51),
+            sz: dec!(2),
+            tif: Tif::Alo,
+            reduce_only: false,
+        };
+        let api = ScriptedApi::new()
+            .push_cancel(Ok(()))
+            .push_status(Ok(None))
+            .push_fills(Ok(vec![
+                UserFill {
+                    coin: "HYPE".into(),
+                    px: dec!(50),
+                    sz: dec!(1),
+                    side: "B".into(),
+                    time_ms: 1,
+                    oid: OrderId(77),
+                    tid: 11,
+                    cloid: Some(cloid),
+                },
+                UserFill {
+                    coin: "HYPE".into(),
+                    px: dec!(49),
+                    sz: dec!(1),
+                    side: "B".into(),
+                    time_ms: 1,
+                    oid: OrderId(77),
+                    tid: 11,
+                    cloid: Some(cloid),
+                },
+            ]));
+        let err = recover_resting_fill(&api, &p, cloid, OrderId(77), &intent)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("conflicting duplicate tid"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_does_not_consult_partial_ledger_when_cancel_is_unacknowledged() {
+        let mut p = plan(false);
+        p.settle_retries = 1;
+        let cloid = Cloid::new();
+        let intent = OrderIntent {
+            cloid,
+            symbol: Symbol::new("HYPE"),
+            side: Side::Long,
+            px: dec!(51),
+            sz: dec!(2),
+            tif: Tif::Alo,
+            reduce_only: false,
+        };
+        let api = ScriptedApi::new()
+            .push_cancel(Err(HlError::Network("cancel response lost".into())))
+            .push_status(Ok(None));
+        let err = recover_resting_fill(&api, &p, cloid, OrderId(77), &intent)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("could not determine a terminal fill"),
+            "{err}"
+        );
+        assert!(
+            !api.calls()
+                .iter()
+                .any(|call| matches!(call, Call::UserFillsByTime { .. })),
+            "an unacknowledged cancel leaves the order ambiguous, so ledger fallback is forbidden"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_ledger_race_remains_unresolved_and_never_resends() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "hype-twap-partial-ledger-race-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let mut p = plan(false);
+        p.slices = 1;
+        p.per_slice = dec!(2);
+        p.total_adjusted = dec!(2);
+        p.total_requested = dec!(2);
+        p.settle_retries = 1;
+
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(Ok(PlaceOutcome::Resting { oid: OrderId(77) }))
+            .push_cancel(Ok(()))
+            .push_status(Ok(None))
+            .push_fills(Ok(vec![UserFill {
+                coin: "HYPE".into(),
+                px: dec!(50),
+                sz: dec!(1),
+                side: "B".into(),
+                time_ms: 1,
+                oid: OrderId(77),
+                tid: 11,
+                cloid: None,
+            }]));
+        let header = crate::journal::RunHeader {
+            run_id: "partial-ledger-race".into(),
+            network: "testnet".into(),
+            agent: Some(Address::new(AGENT)),
+            master: Some(Address::new(MASTER)),
+            symbol: Symbol::new("HYPE"),
+            side: Side::Long,
+            slices: 1,
+            plan_hash: "test-hash".into(),
+            execution_fingerprint: None,
+            started_at_unix_ms: 0,
+            execution_deadline_unix_ms: None,
+        };
+        let mut journal = crate::journal::ExecutionJournal::start(
+            &state_dir,
+            "partial-ledger-race".into(),
+            header,
+        )
+        .unwrap();
+        let report = run_twap_journaled(&api, &p, Some(&mut journal), None).await;
+        assert_eq!(report.filled, Decimal::ZERO);
+        assert!(
+            report
+                .abort_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("only partial total 1 of requested 2")),
+            "{:?}",
+            report.abort_reason
+        );
+        assert_eq!(
+            api.place_count(),
+            1,
+            "fallback settlement must never resend"
+        );
+
+        let records =
+            crate::journal::ExecutionJournal::read_all(&state_dir, "partial-ledger-race").unwrap();
+        let terminal: Vec<_> = records
+            .iter()
+            .filter_map(|record| match record {
+                crate::journal::JournalRecord::Terminal {
+                    status, filled_sz, ..
+                } => Some((status.as_str(), filled_sz.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            terminal.is_empty(),
+            "a bounded partial ledger must not become a Terminal accounting fact: {records:?}"
+        );
+        let kinds: Vec<_> = records
+            .iter()
+            .map(|record| match record {
+                crate::journal::JournalRecord::Header(_) => "Header",
+                crate::journal::JournalRecord::Prepared { .. } => "Prepared",
+                crate::journal::JournalRecord::Acknowledged { .. } => "Acknowledged",
+                crate::journal::JournalRecord::Terminal { .. } => "Terminal",
+                crate::journal::JournalRecord::FinalReport { .. } => "FinalReport",
+                crate::journal::JournalRecord::SubmittedUnknown { .. } => "SubmittedUnknown",
+                crate::journal::JournalRecord::Abandoned { .. } => "Abandoned",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["Header", "Prepared", "Acknowledged", "FinalReport"]
+        );
+        let summary = crate::journal::summarize(&records).unwrap();
+        assert_eq!(summary.unresolved_cloids().len(), 1);
+        std::fs::remove_dir_all(&state_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_alo_terminal_probe_settles_and_never_resends() {
+        let p = plan(false);
+        let cloid = Cloid::new();
+        let api = ScriptedApi::new()
+            .push_place(Err(HlError::Network("lost response".into())))
+            .push_status(Ok(Some(status_full(
+                dec!(2),
+                Some(dec!(50)),
+                "filled",
+                OrderId(77),
+                Some(cloid),
+                "HYPE",
+                "B",
+            ))));
+        let dl =
+            ExecutionDeadline::new(tokio::time::Instant::now(), p.duration, wall_clock_now_ms());
+        let outcome = place_alo_child(&api, &p, &dl, 1, cloid, dec!(51), dec!(2), None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, AloPlaceOutcome::Settled(SliceOutcome { sz, .. }) if sz == dec!(2))
+        );
+        assert_eq!(api.place_count(), 1, "ambiguous ALO is never resent");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_live_alo_cancels_settles_and_never_resends() {
+        let mut p = plan(false);
+        p.reduce_only = true;
+        let cloid = Cloid::new();
+        let api = ScriptedApi::new()
+            .push_place(Err(HlError::Network("lost response".into())))
+            .push_status(Ok(Some(status_full(
+                dec!(0),
+                None,
+                "open",
+                OrderId(77),
+                Some(cloid),
+                "HYPE",
+                "B",
+            ))))
+            .push_cancel(Ok(()))
+            .push_status(Ok(Some(status(dec!(0), None, "canceled"))));
+        let dl =
+            ExecutionDeadline::new(tokio::time::Instant::now(), p.duration, wall_clock_now_ms());
+        let outcome = place_alo_child(&api, &p, &dl, 1, cloid, dec!(51), dec!(2), None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, AloPlaceOutcome::Settled(SliceOutcome { sz, .. }) if sz.is_zero())
+        );
+        assert_eq!(api.place_count(), 1);
+        assert!(api.place_calls().iter().all(|call| matches!(
+            call,
+            Call::Place {
+                reduce_only: true,
+                ..
+            }
+        )));
+        assert!(api
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Cancel { cloid: got } if *got == cloid)));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_absent_alo_aborts_with_resume_warning_and_never_resends() {
+        let p = plan(false);
+        let cloid = Cloid::new();
+        let api = ScriptedApi::new()
+            .push_place(Err(HlError::Network("lost response".into())))
+            .push_status(Ok(None));
+        let dl =
+            ExecutionDeadline::new(tokio::time::Instant::now(), p.duration, wall_clock_now_ms());
+        let err =
+            match place_alo_child(&api, &p, &dl, 1, cloid, dec!(51), dec!(2), None, None, None)
+                .await
+            {
+                Err(err) => err,
+                Ok(_) => panic!("absent ambiguous ALO must abort"),
+            };
+        assert!(err.contains("--resume"));
+        assert_eq!(api.place_count(), 1);
     }
 
     // === (d) happy path ===
@@ -3555,6 +4994,29 @@ mod loop_tests {
             }
         }
         assert_eq!(cumulative, dec!(50));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reduce_only_plan_sets_the_wire_flag_for_every_child_algorithm() {
+        for child_algo in [ChildAlgo::Market, ChildAlgo::Passive, ChildAlgo::Follow] {
+            let api = ScriptedApi::new().with_default_book(book_at(dec!(49.9), dec!(50.1)));
+            let mut close = plan(false);
+            close.reduce_only = true;
+            close.child_algo = child_algo;
+            let _ = run_twap(&api, &close).await;
+            let places = api.place_calls();
+            assert!(!places.is_empty(), "{child_algo:?} must attempt a child");
+            assert!(
+                places.iter().all(|call| matches!(
+                    call,
+                    Call::Place {
+                        reduce_only: true,
+                        ..
+                    }
+                )),
+                "{child_algo:?} emitted a non-reduce-only close wire: {places:?}"
+            );
+        }
     }
 
     // === (a) T2: the duration cut-off exempts nothing ===
@@ -4093,7 +5555,7 @@ mod loop_tests {
         let dl =
             ExecutionDeadline::from_parts(start + Duration::from_millis(800), 1_700_000_000_000);
 
-        let err = place_slice_reconciled(&api, &plan_val, &intent, &dl, 1, None)
+        let err = place_slice_reconciled(&api, &plan_val, &intent, &dl, 1, None, None, None)
             .await
             .unwrap_err();
 
@@ -4142,15 +5604,75 @@ mod loop_tests {
         let start = tokio::time::Instant::now();
         let dl = ExecutionDeadline::from_parts(start + Duration::from_secs(60), 1_700_000_000_000);
 
-        let outcome = place_slice_reconciled(&api, &plan_val, &intent, &dl, 1, None)
+        let outcome = place_slice_reconciled(&api, &plan_val, &intent, &dl, 1, None, None, None)
             .await
             .unwrap();
-
+        let PlaceSliceOutcome::Settled(outcome) = outcome else {
+            panic!("position target was not configured")
+        };
         assert_eq!(outcome.sz, dec!(5));
         assert_eq!(
             api.place_count(),
             2,
             "the original send plus exactly one resend"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ambiguous_reduce_only_close_never_resends_even_when_position_is_unchanged() {
+        // Long 2 -> flat: the first reduce-only close's response is lost and
+        // reconciliation observes repeated unknownOid.  A lagging
+        // clearinghouse snapshot still says long 2; that cannot authorize a
+        // resend, because the original close may have filled but not yet be
+        // reflected in either endpoint.
+        let api = ScriptedApi::new()
+            .push_place(Err(HlError::Network("connection reset".into())))
+            .push_status(Ok(None))
+            .push_status(Ok(None))
+            .push_status(Ok(None))
+            .push_position(Ok(position(dec!(2))));
+        let mut plan_val = plan(false);
+        plan_val.side = Side::Short;
+        plan_val.reduce_only = true;
+        let intent = OrderIntent {
+            cloid: Cloid::new(),
+            symbol: plan_val.symbol.clone(),
+            side: Side::Short,
+            px: dec!(50),
+            sz: dec!(2),
+            tif: Tif::Ioc,
+            reduce_only: true,
+        };
+        let start = tokio::time::Instant::now();
+        let deadline =
+            ExecutionDeadline::from_parts(start + Duration::from_secs(60), 1_700_000_000_000);
+
+        let error = place_slice_reconciled(
+            &api,
+            &plan_val,
+            &intent,
+            &deadline,
+            1,
+            None,
+            Some(&PositionTargetGuard::new(
+                Address::new(MASTER),
+                Decimal::ZERO,
+                Side::Short,
+            )),
+            None,
+        )
+        .await
+        .expect_err("ambiguous reduce-only close must never resend");
+
+        assert_eq!(api.place_count(), 1, "the ambiguous close is never resent");
+        assert!(format!("{error}").contains("refusing all in-process resends"));
+        assert_eq!(
+            api.calls()
+                .iter()
+                .filter(|call| matches!(call, Call::Position { .. }))
+                .count(),
+            1,
+            "the initial send must use the commit-point position guard, while the unconditional reduce-only rule must refuse a resend without relying on a second snapshot"
         );
     }
 
@@ -4181,7 +5703,7 @@ mod loop_tests {
         let start = tokio::time::Instant::now();
         let dl = ExecutionDeadline::from_parts(start + Duration::from_secs(60), 1_700_123_456_789);
 
-        place_slice_reconciled(&api, &plan_val, &intent, &dl, 1, None)
+        place_slice_reconciled(&api, &plan_val, &intent, &dl, 1, None, None, None)
             .await
             .unwrap();
 
@@ -5497,6 +7019,7 @@ mod loop_tests {
         #[tokio::test(start_paused = true)]
         async fn cancel_then_late_fill_settles_true_filled_never_overcounts() {
             let mut p = plan_passive(false);
+            p.reduce_only = true;
             p.slices = 2;
             p.duration = Duration::from_secs(120);
             // 10 total / 2 slices = 5 per slice at szDecimals=2.
@@ -5548,6 +7071,13 @@ mod loop_tests {
             );
             assert_eq!(report.abort_reason, None);
             assert_eq!(report.exit_code(), 0);
+            assert!(api.place_calls().iter().all(|call| matches!(
+                call,
+                Call::Place {
+                    reduce_only: true,
+                    ..
+                }
+            )));
 
             // Exactly one place in flight at a time: a Place is never
             // followed by another Place without an intervening Cancel.
@@ -6801,7 +8331,7 @@ mod loop_tests {
             }
 
             let records = ExecutionJournal::read_all(tmp.path(), "run-follow-multi-cloid").unwrap();
-            let summary = summarize(&records);
+            let summary = summarize(&records).unwrap();
 
             // All three cloids are visible, in first-seen order, despite
             // sharing one slice_idx.
@@ -6868,7 +8398,7 @@ mod loop_tests {
 
             let final_records =
                 ExecutionJournal::read_all(tmp.path(), "run-follow-multi-cloid").unwrap();
-            let final_summary = summarize(&final_records);
+            let final_summary = summarize(&final_records).unwrap();
 
             assert!(
                 final_summary.unresolved_cloids().is_empty(),
@@ -6915,7 +8445,9 @@ mod loop_tests {
                 side: Side::Long,
                 slices: 1,
                 plan_hash: "test-hash".into(),
+                execution_fingerprint: None,
                 started_at_unix_ms: 0,
+                execution_deadline_unix_ms: None,
             }
         }
     }
@@ -6968,7 +8500,62 @@ mod loop_tests {
                 side: Side::Long,
                 slices: 10,
                 plan_hash: "test-hash".into(),
+                execution_fingerprint: None,
                 started_at_unix_ms: 0,
+                execution_deadline_unix_ms: None,
+            }
+        }
+
+        /// Test API that flips the cooperative shutdown signal while the
+        /// initial awaited book fetch is returning. This deterministically
+        /// models SIGINT/SIGTERM arriving after the slice-loop check but
+        /// before any child-order commit point.
+        struct ShutdownOnBookApi {
+            inner: ScriptedApi,
+            shutdown_tx: tokio::sync::watch::Sender<bool>,
+        }
+
+        #[async_trait::async_trait]
+        impl HlApi for ShutdownOnBookApi {
+            async fn fetch_l2_book(&self, symbol: &Symbol) -> Result<OrderBook, HlError> {
+                let result = self.inner.fetch_l2_book(symbol).await;
+                let _ = self.shutdown_tx.send(true);
+                result
+            }
+
+            async fn place_order_once(
+                &self,
+                intent: &OrderIntent,
+                asset: u32,
+                expires_after_ms: u64,
+            ) -> Result<(u64, PlaceOutcome), HlError> {
+                self.inner
+                    .place_order_once(intent, asset, expires_after_ms)
+                    .await
+            }
+
+            async fn cancel_by_cloid(
+                &self,
+                intent: &CancelIntent,
+                asset: u32,
+            ) -> Result<(), HlError> {
+                self.inner.cancel_by_cloid(intent, asset).await
+            }
+
+            async fn fetch_order_status(
+                &self,
+                user: &Address,
+                oid: OrderId,
+            ) -> Result<Option<OrderStatusFill>, HlError> {
+                self.inner.fetch_order_status(user, oid).await
+            }
+
+            async fn fetch_order_status_by_cloid(
+                &self,
+                user: &Address,
+                cloid: Cloid,
+            ) -> Result<Option<OrderStatusFill>, HlError> {
+                self.inner.fetch_order_status_by_cloid(user, cloid).await
             }
         }
 
@@ -7075,7 +8662,7 @@ mod loop_tests {
                     .any(|r| matches!(r, JournalRecord::SubmittedUnknown { slice_idx: 1, .. })),
                 "the ambiguous send must be journaled as SubmittedUnknown: {records:?}"
             );
-            let summary = summarize(&records);
+            let summary = summarize(&records).unwrap();
             // Resume-safety: the cloid's LATEST state is Terminal (filled),
             // not stuck at SubmittedUnknown — a resume replay would see this
             // as already resolved and would not attempt to reconcile or
@@ -7085,6 +8672,69 @@ mod loop_tests {
                 &summary.cloids[0].1,
                 CloidState::Terminal { filled_sz, .. } if filled_sz == "5"
             ));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn repeated_ambiguous_resends_write_one_unknown_marker_and_replay_cleanly() {
+            let tmp = TempDir::new();
+            let mut journal =
+                ExecutionJournal::start(tmp.path(), "run-repeated-ambiguity".into(), test_header())
+                    .unwrap();
+            let plan = plan(false);
+            let cloid = Cloid::new();
+            let intent = OrderIntent {
+                cloid,
+                symbol: plan.symbol.clone(),
+                side: plan.side,
+                px: dec!(50),
+                sz: dec!(5),
+                tif: Tif::Ioc,
+                reduce_only: false,
+            };
+            let api = ScriptedApi::new()
+                .push_place(Err(HlError::Network("first response lost".into())))
+                .push_status(Ok(None))
+                .push_status(Ok(None))
+                .push_status(Ok(None))
+                .push_place(Err(HlError::Network("second response lost".into())))
+                .push_status(Ok(None))
+                .push_status(Ok(None))
+                .push_status(Ok(None))
+                .push_place(filled(dec!(5), dec!(50)));
+            let deadline = ExecutionDeadline::from_parts(
+                tokio::time::Instant::now() + Duration::from_secs(60),
+                1_700_000_000_000,
+            );
+
+            let outcome = place_slice_reconciled(
+                &api,
+                &plan,
+                &intent,
+                &deadline,
+                1,
+                Some(&mut journal),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let PlaceSliceOutcome::Settled(outcome) = outcome else {
+                panic!("position target was not configured")
+            };
+            assert_eq!(outcome.sz, dec!(5));
+            assert_eq!(api.place_count(), 3);
+
+            let records = ExecutionJournal::read_all(tmp.path(), "run-repeated-ambiguity").unwrap();
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| matches!(record, JournalRecord::SubmittedUnknown { .. }))
+                    .count(),
+                1,
+                "one cloid must have only one durable unresolved marker: {records:?}"
+            );
+            crate::journal::ValidatedJournalReplay::replay(&records)
+                .expect("the journal produced by two safe resends must remain replayable");
         }
 
         // --- Crash injection 3: after resting order confirmed ---
@@ -7107,7 +8757,15 @@ mod loop_tests {
                 .with_default_book(book_at(dec!(49.9), dec!(50.1)))
                 .push_place(Ok(PlaceOutcome::Resting { oid: OrderId(99) }))
                 .push_cancel(Ok(()))
-                .push_status(Ok(Some(status(dec!(5), Some(dec!(50)), "filled"))));
+                .push_status(Ok(Some(status_full(
+                    dec!(5),
+                    Some(dec!(50)),
+                    "filled",
+                    OrderId(99),
+                    None,
+                    "HYPE",
+                    "B",
+                ))));
 
             let report = run_twap_journaled(&api, &plan(false), Some(&mut journal), None).await;
 
@@ -7133,10 +8791,11 @@ mod loop_tests {
             let mut journal =
                 ExecutionJournal::start(tmp.path(), "run-incomplete".into(), test_header())
                     .unwrap();
+            let cloid = Cloid::new();
             journal
                 .record(&JournalRecord::Prepared {
                     slice_idx: 1,
-                    cloid: Cloid::new(),
+                    cloid,
                     nonce: None,
                     symbol: Symbol::new("HYPE"),
                     side: Side::Long,
@@ -7148,7 +8807,7 @@ mod loop_tests {
             journal
                 .record(&JournalRecord::SubmittedUnknown {
                     slice_idx: 1,
-                    cloid: Cloid::new(),
+                    cloid,
                 })
                 .unwrap();
             drop(journal); // simulate the crash: no FinalReport was ever written
@@ -7199,9 +8858,232 @@ mod loop_tests {
                     .any(|r| matches!(r, JournalRecord::Prepared { .. })),
                 "no Prepared record should exist when shutdown fires before any slice: {records:?}"
             );
-            let summary = summarize(&records);
+            let summary = summarize(&records).unwrap();
             assert!(summary.final_report_seen);
             assert!(summary.cloids.is_empty());
+        }
+
+        /// A signal can arrive after the loop's top-of-slice check while an
+        /// awaited book read is in flight. Market, Passive, and Follow must
+        /// all re-check at their actual send boundary, close the durable
+        /// Prepared intent as known-unsent, and place nothing.
+        #[tokio::test(start_paused = true)]
+        async fn shutdown_during_book_fetch_blocks_every_child_algo_at_send_commit_point() {
+            for child_algo in [ChildAlgo::Market, ChildAlgo::Passive, ChildAlgo::Follow] {
+                let tmp = TempDir::new();
+                let run_id = format!("run-book-shutdown-{child_algo:?}").to_lowercase();
+                let mut journal =
+                    ExecutionJournal::start(tmp.path(), run_id.clone(), test_header()).unwrap();
+                let (tx, rx) = tokio::sync::watch::channel(false);
+                let api = ShutdownOnBookApi {
+                    inner: ScriptedApi::new()
+                        .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+                        // This response must remain untouched: reaching it
+                        // would prove the send-boundary check was missing.
+                        .push_place(filled(dec!(5), dec!(50))),
+                    shutdown_tx: tx,
+                };
+                let mut plan = plan(false);
+                plan.child_algo = child_algo;
+                plan.slices = 1;
+                plan.per_slice = dec!(5);
+                plan.total_adjusted = dec!(5);
+                plan.total_requested = dec!(5);
+
+                let report = run_twap_journaled(
+                    &api,
+                    &plan,
+                    Some(&mut journal),
+                    Some(ShutdownSignal::new(rx)),
+                )
+                .await;
+
+                assert_eq!(
+                    api.inner.place_count(),
+                    0,
+                    "{child_algo:?}: no order may be sent after shutdown arrives during book fetch"
+                );
+                assert!(
+                    report
+                        .abort_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("shutdown")),
+                    "{child_algo:?}: shutdown must be reported: {:?}",
+                    report.abort_reason
+                );
+
+                let records = ExecutionJournal::read_all(tmp.path(), &run_id).unwrap();
+                assert!(records.iter().any(|record| matches!(
+                    record,
+                    JournalRecord::Terminal {
+                        status,
+                        filled_sz,
+                        ..
+                    } if status == "neverReceived" && filled_sz == "0"
+                )));
+                let replay = crate::journal::ValidatedJournalReplay::replay(&records)
+                    .expect("shutdown-before-send journal must replay cleanly");
+                assert!(replay.summary.unresolved_cloids().is_empty());
+            }
+        }
+
+        /// Once an ambiguous IOC is authoritatively absent, a shutdown that
+        /// arrived during reconciliation must block the otherwise-safe
+        /// resend. The original send is still reconciled to completion and
+        /// the single SubmittedUnknown record is closed as neverReceived.
+        #[tokio::test(start_paused = true)]
+        async fn shutdown_during_ambiguous_reconciliation_blocks_safe_resend() {
+            let tmp = TempDir::new();
+            let mut journal = ExecutionJournal::start(
+                tmp.path(),
+                "run-shutdown-before-resend".into(),
+                test_header(),
+            )
+            .unwrap();
+            let plan = plan(false);
+            let cloid = Cloid::new();
+            let intent = OrderIntent {
+                cloid,
+                symbol: plan.symbol.clone(),
+                side: plan.side,
+                px: dec!(50),
+                sz: dec!(5),
+                tif: Tif::Ioc,
+                reduce_only: false,
+            };
+            let api = ScriptedApi::new()
+                .push_place(Err(HlError::Network("first response lost".into())))
+                .push_status(Ok(None))
+                .push_status(Ok(None))
+                .push_status(Ok(None))
+                // Must remain untouched: shutdown forbids this safe resend.
+                .push_place(filled(dec!(5), dec!(50)));
+            let deadline = ExecutionDeadline::from_parts(
+                tokio::time::Instant::now() + Duration::from_secs(60),
+                1_700_000_000_000,
+            );
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            let shutdown = ShutdownSignal::new(rx);
+            let place_fut = place_slice_reconciled(
+                &api,
+                &plan,
+                &intent,
+                &deadline,
+                1,
+                Some(&mut journal),
+                None,
+                Some(&shutdown),
+            );
+            tokio::pin!(place_fut);
+
+            tokio::select! {
+                biased;
+                _ = &mut place_fut => panic!("placement must still be reconciling"),
+                _ = tokio::task::yield_now() => {}
+            }
+            assert_eq!(
+                api.place_count(),
+                1,
+                "the initial ambiguous send must occur"
+            );
+            tx.send(true).unwrap();
+
+            let outcome = place_fut.await.unwrap();
+            assert!(matches!(outcome, PlaceSliceOutcome::ShutdownRequested));
+            assert_eq!(api.place_count(), 1, "shutdown must block the resend");
+
+            let records =
+                ExecutionJournal::read_all(tmp.path(), "run-shutdown-before-resend").unwrap();
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| matches!(record, JournalRecord::SubmittedUnknown { .. }))
+                    .count(),
+                1
+            );
+            assert!(records.iter().any(|record| matches!(
+                record,
+                JournalRecord::Terminal {
+                    status,
+                    filled_sz,
+                    ..
+                } if status == "neverReceived" && filled_sz == "0"
+            )));
+            crate::journal::ValidatedJournalReplay::replay(&records)
+                .expect("shutdown-before-resend journal must replay cleanly");
+        }
+
+        /// A reduce-only ambiguous send is intentionally stricter than an
+        /// ordinary IOC: even a complete unknownOid streak can lag a close
+        /// fill. Shutdown blocks all resends but must not upgrade that stale
+        /// observation into a false `neverReceived` terminal.
+        #[tokio::test(start_paused = true)]
+        async fn shutdown_preserves_reduce_only_ambiguity_after_unknown_oid_streak() {
+            let tmp = TempDir::new();
+            let run_id = "run-shutdown-reduce-only-ambiguous";
+            let mut journal =
+                ExecutionJournal::start(tmp.path(), run_id.into(), test_header()).unwrap();
+            let mut plan = plan(false);
+            plan.side = Side::Short;
+            plan.reduce_only = true;
+            let cloid = Cloid::new();
+            let intent = OrderIntent {
+                cloid,
+                symbol: plan.symbol.clone(),
+                side: plan.side,
+                px: dec!(50),
+                sz: dec!(5),
+                tif: Tif::Ioc,
+                reduce_only: true,
+            };
+            let api = ScriptedApi::new()
+                .push_place(Err(HlError::Network("close response lost".into())))
+                .push_status(Ok(None))
+                .push_status(Ok(None))
+                .push_status(Ok(None));
+            let deadline = ExecutionDeadline::from_parts(
+                tokio::time::Instant::now() + Duration::from_secs(60),
+                1_700_000_000_000,
+            );
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            let shutdown = ShutdownSignal::new(rx);
+            let place_fut = place_slice_reconciled(
+                &api,
+                &plan,
+                &intent,
+                &deadline,
+                1,
+                Some(&mut journal),
+                None,
+                Some(&shutdown),
+            );
+            tokio::pin!(place_fut);
+
+            tokio::select! {
+                biased;
+                _ = &mut place_fut => panic!("reduce-only placement must still be reconciling"),
+                _ = tokio::task::yield_now() => {}
+            }
+            assert_eq!(api.place_count(), 1);
+            tx.send(true).unwrap();
+
+            let error = place_fut
+                .await
+                .expect_err("reduce-only ambiguity must remain unresolved on shutdown");
+            assert!(format!("{error}").contains("refusing all in-process resends"));
+            assert_eq!(api.place_count(), 1, "reduce-only close is never resent");
+
+            let records = ExecutionJournal::read_all(tmp.path(), run_id).unwrap();
+            assert!(records.iter().all(|record| !matches!(
+                record,
+                JournalRecord::Terminal {
+                    cloid: terminal_cloid,
+                    ..
+                } if *terminal_cloid == cloid
+            )));
+            let replay = crate::journal::ValidatedJournalReplay::replay(&records)
+                .expect("durable unresolved reduce-only journal must remain valid");
+            assert_eq!(replay.summary.unresolved_cloids(), vec![cloid]);
         }
 
         /// Post-send (ambiguous): shutdown is signalled AFTER slice 1 has
@@ -7256,7 +9138,7 @@ mod loop_tests {
             assert!(report.abort_reason.unwrap().contains("shutdown"));
 
             let records = ExecutionJournal::read_all(tmp.path(), "run-postsend").unwrap();
-            let summary = summarize(&records);
+            let summary = summarize(&records).unwrap();
             assert_eq!(
                 summary.cloids.len(),
                 1,
@@ -7296,10 +9178,9 @@ mod loop_tests {
             // Drive the run past the initial ambiguous send (SubmittedUnknown
             // is journaled) and into the reconciliation delay/poll — i.e.
             // virtual time must advance past `RECONCILE_DELAY` — BEFORE
-            // signalling shutdown. `place_slice_reconciled` has no
-            // shutdown-awareness of its own (PM decision), so a signal
-            // arriving here must not truncate the reconciliation already in
-            // flight.
+            // signalling shutdown. The place helper is shutdown-aware only
+            // at a NEW send/resend commit point, so a signal arriving here
+            // must not truncate the reconciliation already in flight.
             tokio::time::advance(RECONCILE_DELAY + Duration::from_millis(50)).await;
             for _ in 0..8 {
                 tokio::select! {
@@ -7327,7 +9208,7 @@ mod loop_tests {
                 "the in-flight reconciliation must finish"
             );
             let records = ExecutionJournal::read_all(tmp.path(), "run-midreconcile").unwrap();
-            let summary = summarize(&records);
+            let summary = summarize(&records).unwrap();
             assert!(
                 summary.unresolved_cloids().is_empty(),
                 "no cloid should be left unresolved: {records:?}"
@@ -7361,8 +9242,14 @@ mod loop_tests {
                 one_slice_plan.per_slice = dec!(5);
                 one_slice_plan.total_adjusted = dec!(5);
 
-                let report =
-                    run_twap_journaled(&api, &one_slice_plan, Some(&mut journal), None).await;
+                let report = run_twap_journaled_with_prior_notional_deferred(
+                    &api,
+                    &one_slice_plan,
+                    Decimal::ZERO,
+                    Some(&mut journal),
+                    None,
+                )
+                .await;
                 report.filled
             };
             assert_eq!(filled_sz_slice1, dec!(5));
@@ -7375,7 +9262,7 @@ mod loop_tests {
             // executed ones, with slice 1's fill counted exactly once (not
             // replayed again as a "new" fill in this second session).
             let resumed_records = ExecutionJournal::read_all(tmp.path(), "run-resume").unwrap();
-            let resumed_summary = summarize(&resumed_records);
+            let resumed_summary = summarize(&resumed_records).unwrap();
             let already_filled = resumed_summary.total_filled();
             assert_eq!(already_filled, dec!(5));
 
@@ -7411,7 +9298,7 @@ mod loop_tests {
             // across the whole journal (1 from the first session + 9 from
             // the resumed session), each Terminal exactly once.
             let all_records = ExecutionJournal::read_all(tmp.path(), "run-resume").unwrap();
-            let final_summary = summarize(&all_records);
+            let final_summary = summarize(&all_records).unwrap();
             assert_eq!(final_summary.cloids.len(), 10);
             assert_eq!(final_summary.total_filled(), dec!(50));
         }
@@ -7486,7 +9373,7 @@ mod loop_tests {
 
             let pre_resume_records =
                 ExecutionJournal::read_all(tmp.path(), "run-passive-resume").unwrap();
-            let pre_resume_summary = summarize(&pre_resume_records);
+            let pre_resume_summary = summarize(&pre_resume_records).unwrap();
             assert_eq!(
                 pre_resume_summary.unresolved_cloids(),
                 vec![resting_cloid],
@@ -7579,7 +9466,7 @@ mod loop_tests {
             // value other than the true post-cancel terminal fill).
             let after_reconcile_records =
                 ExecutionJournal::read_all(tmp.path(), "run-passive-resume").unwrap();
-            let after_reconcile_summary = summarize(&after_reconcile_records);
+            let after_reconcile_summary = summarize(&after_reconcile_records).unwrap();
             assert!(
                 after_reconcile_summary.unresolved_cloids().is_empty(),
                 "the cloid must be fully resolved after reconciliation: {after_reconcile_records:?}"
@@ -7611,7 +9498,7 @@ mod loop_tests {
                     Some(dec!(49.9)),
                     "canceled",
                     OrderId(556),
-                    Some(Cloid::new()),
+                    None,
                     "HYPE",
                     "B",
                 ))));
@@ -7648,7 +9535,7 @@ mod loop_tests {
 
             let final_records =
                 ExecutionJournal::read_all(tmp.path(), "run-passive-resume").unwrap();
-            let final_summary = summarize(&final_records);
+            let final_summary = summarize(&final_records).unwrap();
             assert!(final_summary.unresolved_cloids().is_empty());
             assert_eq!(final_summary.total_filled(), dec!(6));
         }
@@ -7747,11 +9634,76 @@ mod loop_tests {
             // Must NOT have been credited into the journal.
             let records =
                 ExecutionJournal::read_all(tmp.path(), "run-a2-overfill-resting").unwrap();
-            let summary = summarize(&records);
+            let summary = summarize(&records).unwrap();
             assert_eq!(
                 summary.total_filled(),
                 Decimal::ZERO,
                 "the invalid overfill must never reach the journal's credited total"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn resume_live_probe_rejects_mismatched_cloid_before_cancel_or_terminal() {
+            let tmp = TempDir::new();
+            let cloid = Cloid::new();
+            let foreign_cloid = Cloid::new();
+            let mut journal = ExecutionJournal::start(
+                tmp.path(),
+                "run-live-probe-identity".into(),
+                test_header(),
+            )
+            .unwrap();
+            journal
+                .record(&JournalRecord::Prepared {
+                    slice_idx: 1,
+                    cloid,
+                    nonce: None,
+                    symbol: Symbol::new("HYPE"),
+                    side: Side::Long,
+                    px: "49.9".into(),
+                    sz: "3".into(),
+                    tif: Some(Tif::Alo),
+                })
+                .unwrap();
+
+            let p = plan_passive(false);
+            let api = ScriptedApi::new().push_status(Ok(Some(status_full(
+                dec!(0),
+                None,
+                "open",
+                OrderId(999),
+                Some(foreign_cloid),
+                "HYPE",
+                "B",
+            ))));
+            let prepared = PreparedIntent {
+                symbol: Symbol::new("HYPE"),
+                side: Side::Long,
+                px: dec!(49.9),
+                sz: dec!(3),
+                tif: Some(Tif::Alo),
+            };
+
+            let error = reconcile_unresolved_cloid(&api, &p, cloid, 1, &prepared, &mut journal)
+                .await
+                .expect_err("a foreign cloid response must fail before using its oid");
+            assert!(format!("{error}").contains("cloid"), "{error}");
+            assert!(
+                api.calls()
+                    .iter()
+                    .all(|call| !matches!(call, Call::Cancel { .. })),
+                "a mismatched live response must never trigger cancelByCloid"
+            );
+
+            drop(journal);
+            let records =
+                ExecutionJournal::read_all(tmp.path(), "run-live-probe-identity").unwrap();
+            assert!(
+                !records.iter().any(|record| matches!(
+                    record,
+                    JournalRecord::Terminal { cloid: terminal_cloid, .. } if *terminal_cloid == cloid
+                )),
+                "identity failure must not append a Terminal record"
             );
         }
 
@@ -7828,7 +9780,7 @@ mod loop_tests {
 
             let records =
                 ExecutionJournal::read_all(tmp.path(), "run-a2-overfill-fallthrough").unwrap();
-            let summary = summarize(&records);
+            let summary = summarize(&records).unwrap();
             assert_eq!(
                 summary.total_filled(),
                 Decimal::ZERO,
@@ -7929,7 +9881,7 @@ mod loop_tests {
             // find_incomplete_run must now flag this run as incomplete
             // (Issue #20's find_incomplete_run requirement), even though a
             // FinalReport exists.
-            let summary = summarize(&records);
+            let summary = summarize(&records).unwrap();
             assert!(
                 summary.is_incomplete(),
                 "a run whose last FinalReport carries a non-empty outcome_unknown_cloids must \
@@ -7981,12 +9933,13 @@ mod loop_tests {
                         filled_total: "0".into(),
                         outcome_unknown_cloids: vec![unresolved_cloid],
                         note: "settle failure abort".into(),
+                        whole_run: None,
                     })
                     .unwrap();
             }
 
             let records = ExecutionJournal::read_all(tmp.path(), "run-resume-unknown").unwrap();
-            let summary = summarize(&records);
+            let summary = summarize(&records).unwrap();
             assert!(
                 summary.is_incomplete(),
                 "seeded (a)-style journal must be detected as incomplete"
@@ -8056,7 +10009,7 @@ mod loop_tests {
                 "exactly one Terminal record must be written for the reconciled cloid \
                  (fill credited exactly once): {after_reconcile:?}"
             );
-            let reconciled_summary = summarize(&after_reconcile);
+            let reconciled_summary = summarize(&after_reconcile).unwrap();
             assert_eq!(
                 reconciled_summary.total_filled(),
                 dec!(2),
@@ -8103,7 +10056,7 @@ mod loop_tests {
                 "the continuation must append a FRESH (second) FinalReport, not rewrite the \
                  first one: {final_records:?}"
             );
-            let final_summary = summarize(&final_records);
+            let final_summary = summarize(&final_records).unwrap();
             assert!(
                 !final_summary.is_incomplete(),
                 "after the continuation's fresh FinalReport (empty outcome_unknown_cloids), \
@@ -8152,12 +10105,13 @@ mod loop_tests {
                         filled_total: "0".into(),
                         outcome_unknown_cloids: vec![unresolved_cloid],
                         note: "settle failure abort".into(),
+                        whole_run: None,
                     })
                     .unwrap();
             }
 
             let records = ExecutionJournal::read_all(tmp.path(), "run-abandon-unknown").unwrap();
-            assert!(summarize(&records).is_incomplete());
+            assert!(summarize(&records).unwrap().is_incomplete());
 
             let mut p = plan_passive(false);
             p.slices = 1;
@@ -8216,7 +10170,7 @@ mod loop_tests {
 
             let final_records =
                 ExecutionJournal::read_all(tmp.path(), "run-abandon-unknown").unwrap();
-            let final_summary = summarize(&final_records);
+            let final_summary = summarize(&final_records).unwrap();
             assert!(
                 final_summary.abandoned,
                 "the run must be marked Abandoned: {final_records:?}"
@@ -8264,9 +10218,10 @@ mod loop_tests {
                     filled_total: "5".into(),
                     outcome_unknown_cloids: vec![],
                     note: "completed".into(),
+                    whole_run: None,
                 },
             ];
-            let summary = summarize(&records);
+            let summary = summarize(&records).unwrap();
             assert!(
                 !summary.is_incomplete(),
                 "a completed run whose FinalReport carries an empty outcome_unknown_cloids \

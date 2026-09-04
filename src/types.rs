@@ -55,6 +55,35 @@ impl From<&str> for Symbol {
     }
 }
 
+/// A perpetual position expressed using Hyperliquid's signed size convention.
+///
+/// `szi` is positive for a long, negative for a short, and zero for a flat
+/// position. Keeping the sign on the quantity (rather than splitting it into
+/// a side plus an unsigned size) mirrors the authoritative
+/// `clearinghouseState.assetPositions[].position.szi` wire field and avoids a
+/// caller accidentally combining a side from one snapshot with a size from
+/// another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedPerpPosition {
+    pub symbol: Symbol,
+    pub szi: Decimal,
+}
+
+impl SignedPerpPosition {
+    /// A flat position for `symbol`. Used only when that symbol is absent from
+    /// an otherwise valid clearinghouse state response.
+    pub fn zero(symbol: Symbol) -> Self {
+        Self {
+            symbol,
+            szi: Decimal::ZERO,
+        }
+    }
+
+    pub fn is_flat(&self) -> bool {
+        self.szi.is_zero()
+    }
+}
+
 /// Trade direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

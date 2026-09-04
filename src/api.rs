@@ -5,21 +5,39 @@
 //! implements it for production and `ScriptedApi` (test-only) implements it by
 //! replaying a canned response list while recording the exact call sequence.
 //!
-//! The trait is deliberately narrow — only the four operations the loop needs —
+//! The trait is deliberately narrow — only the operations execution needs —
 //! so a fake stays cheap to write and impossible to under-specify.
 
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 
-use crate::client::{HlClient, OrderStatusFill, PlaceOutcome};
+use crate::client::{HlClient, OrderStatusFill, PlaceOutcome, UserFill};
 use crate::errors::HlError;
-use crate::types::{Address, CancelIntent, Cloid, OrderBook, OrderId, OrderIntent, Symbol};
+use crate::types::{
+    Address, CancelIntent, Cloid, OrderBook, OrderId, OrderIntent, SignedPerpPosition, Symbol,
+};
 
 /// Every Hyperliquid operation the slice loop performs.
 #[async_trait]
 pub trait HlApi: Send + Sync {
     /// `/info l2Book` — one top-of-book snapshot. Idempotent, retried inside.
     async fn fetch_l2_book(&self, symbol: &Symbol) -> Result<OrderBook, HlError>;
+
+    /// `/info clearinghouseState` — the current signed perp position held by
+    /// the master account. A valid state that omits `symbol` yields `szi = 0`.
+    ///
+    /// The default keeps existing narrow test wrappers source-compatible. It
+    /// is fail-closed, so a wrapper must opt in explicitly before a new
+    /// position-aware flow can use it.
+    async fn fetch_perp_position(
+        &self,
+        _user: &Address,
+        _symbol: &Symbol,
+    ) -> Result<SignedPerpPosition, HlError> {
+        Err(HlError::InvalidResponse(
+            "HlApi implementation does not support clearinghouseState".into(),
+        ))
+    }
 
     /// `/exchange order` — sent EXACTLY ONCE (W1).
     ///
@@ -55,12 +73,32 @@ pub trait HlApi: Send + Sync {
         user: &Address,
         cloid: Cloid,
     ) -> Result<Option<OrderStatusFill>, HlError>;
+
+    /// Official non-aggregated `userFillsByTime` ledger.
+    async fn fetch_user_fills_by_time(
+        &self,
+        _user: &Address,
+        _start_time_ms: u64,
+        _end_time_ms: Option<u64>,
+    ) -> Result<Vec<UserFill>, HlError> {
+        Err(HlError::InvalidResponse(
+            "HlApi implementation does not support userFillsByTime".into(),
+        ))
+    }
 }
 
 #[async_trait]
 impl HlApi for HlClient {
     async fn fetch_l2_book(&self, symbol: &Symbol) -> Result<OrderBook, HlError> {
         HlClient::fetch_l2_book(self, symbol).await
+    }
+
+    async fn fetch_perp_position(
+        &self,
+        user: &Address,
+        symbol: &Symbol,
+    ) -> Result<SignedPerpPosition, HlError> {
+        HlClient::fetch_perp_position(self, user, symbol).await
     }
 
     async fn place_order_once(
@@ -91,6 +129,15 @@ impl HlApi for HlClient {
     ) -> Result<Option<OrderStatusFill>, HlError> {
         HlClient::fetch_order_status_by_cloid(self, user, cloid).await
     }
+
+    async fn fetch_user_fills_by_time(
+        &self,
+        user: &Address,
+        start_time_ms: u64,
+        end_time_ms: Option<u64>,
+    ) -> Result<Vec<UserFill>, HlError> {
+        HlClient::fetch_user_fills_by_time(self, user, start_time_ms, end_time_ms).await
+    }
 }
 
 // === test double ===
@@ -101,9 +148,14 @@ pub enum Call {
     Book {
         symbol: String,
     },
+    Position {
+        user: String,
+        symbol: String,
+    },
     Place {
         sz: Decimal,
         px: Decimal,
+        reduce_only: bool,
         cloid: Cloid,
         nonce: u64,
         /// The `expiresAfter` value this place was signed and sent with
@@ -122,6 +174,11 @@ pub enum Call {
         user: String,
         cloid: Cloid,
     },
+    UserFillsByTime {
+        user: String,
+        start_time_ms: u64,
+        end_time_ms: Option<u64>,
+    },
 }
 
 impl Call {
@@ -139,10 +196,12 @@ impl Call {
 /// is asserting against behaviour it never described.
 pub struct ScriptedApi {
     books: std::sync::Mutex<std::collections::VecDeque<Result<OrderBook, HlError>>>,
+    positions: std::sync::Mutex<std::collections::VecDeque<Result<SignedPerpPosition, HlError>>>,
     places: std::sync::Mutex<std::collections::VecDeque<Result<PlaceOutcome, HlError>>>,
     cancels: std::sync::Mutex<std::collections::VecDeque<Result<(), HlError>>>,
     statuses:
         std::sync::Mutex<std::collections::VecDeque<Result<Option<OrderStatusFill>, HlError>>>,
+    fills: std::sync::Mutex<std::collections::VecDeque<Result<Vec<UserFill>, HlError>>>,
     calls: std::sync::Mutex<Vec<Call>>,
     nonce: std::sync::atomic::AtomicU64,
     /// Reused when the book queue is exhausted, so a test only has to script
@@ -160,9 +219,11 @@ impl ScriptedApi {
     pub fn new() -> Self {
         Self {
             books: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            positions: std::sync::Mutex::new(std::collections::VecDeque::new()),
             places: std::sync::Mutex::new(std::collections::VecDeque::new()),
             cancels: std::sync::Mutex::new(std::collections::VecDeque::new()),
             statuses: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            fills: std::sync::Mutex::new(std::collections::VecDeque::new()),
             calls: std::sync::Mutex::new(Vec::new()),
             nonce: std::sync::atomic::AtomicU64::new(1),
             default_book: std::sync::Mutex::new(None),
@@ -180,6 +241,13 @@ impl ScriptedApi {
         self
     }
 
+    /// Queue a clearinghouse position response. Unlike books there is no
+    /// default: an unscripted account-state read must fail closed in a test.
+    pub fn push_position(self, position: Result<SignedPerpPosition, HlError>) -> Self {
+        lock(&self.positions).push_back(position);
+        self
+    }
+
     pub fn push_place(self, outcome: Result<PlaceOutcome, HlError>) -> Self {
         lock(&self.places).push_back(outcome);
         self
@@ -192,6 +260,10 @@ impl ScriptedApi {
 
     pub fn push_status(self, s: Result<Option<OrderStatusFill>, HlError>) -> Self {
         lock(&self.statuses).push_back(s);
+        self
+    }
+    pub fn push_fills(self, fills: Result<Vec<UserFill>, HlError>) -> Self {
+        lock(&self.fills).push_back(fills);
         self
     }
 
@@ -241,6 +313,23 @@ impl HlApi for ScriptedApi {
         }
     }
 
+    async fn fetch_perp_position(
+        &self,
+        user: &Address,
+        symbol: &Symbol,
+    ) -> Result<SignedPerpPosition, HlError> {
+        self.record(Call::Position {
+            user: user.as_str().to_string(),
+            symbol: symbol.as_str().to_string(),
+        });
+        match lock(&self.positions).pop_front() {
+            Some(r) => r,
+            None => Err(HlError::InvalidResponse(
+                "ScriptedApi: position queue exhausted".into(),
+            )),
+        }
+    }
+
     async fn place_order_once(
         &self,
         intent: &OrderIntent,
@@ -251,6 +340,7 @@ impl HlApi for ScriptedApi {
         self.record(Call::Place {
             sz: intent.sz,
             px: intent.px,
+            reduce_only: intent.reduce_only,
             cloid: intent.cloid,
             nonce,
             expires_after_ms,
@@ -302,5 +392,64 @@ impl HlApi for ScriptedApi {
                 "ScriptedApi: status queue exhausted".into(),
             )),
         }
+    }
+
+    async fn fetch_user_fills_by_time(
+        &self,
+        user: &Address,
+        start_time_ms: u64,
+        end_time_ms: Option<u64>,
+    ) -> Result<Vec<UserFill>, HlError> {
+        self.record(Call::UserFillsByTime {
+            user: user.as_str().to_string(),
+            start_time_ms,
+            end_time_ms,
+        });
+        lock(&self.fills).pop_front().unwrap_or_else(|| {
+            Err(HlError::InvalidResponse(
+                "ScriptedApi: fills queue exhausted".into(),
+            ))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[tokio::test]
+    async fn scripted_position_returns_queued_value_and_records_master_and_symbol() {
+        let master = Address::new("0x00000000000000000000000000000000000000aa");
+        let symbol = Symbol::new("HYPE");
+        let api = ScriptedApi::new().push_position(Ok(SignedPerpPosition {
+            symbol: symbol.clone(),
+            szi: dec!(-1.25),
+        }));
+
+        let position = api.fetch_perp_position(&master, &symbol).await.unwrap();
+        assert_eq!(position.szi, dec!(-1.25));
+        assert_eq!(
+            api.calls(),
+            vec![Call::Position {
+                user: master.as_str().to_string(),
+                symbol: "HYPE".into(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn scripted_unscripted_position_fails_closed_after_recording_call() {
+        let api = ScriptedApi::new();
+        let err = api
+            .fetch_perp_position(&Address::new("master"), &Symbol::new("HYPE"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HlError::InvalidResponse(message) if message.contains("queue exhausted"))
+        );
+        assert!(matches!(api.calls().as_slice(), [Call::Position { .. }]));
     }
 }

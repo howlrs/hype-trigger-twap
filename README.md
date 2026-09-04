@@ -1,7 +1,8 @@
 # hype-trigger-twap
 
-Trigger-gated TWAP execution for Hyperliquid perpetuals. A single Rust binary
-(`hype-twap`) — no server, no WebSocket, no Python, no database.
+Trigger-gated TWAP execution for Hyperliquid perpetuals. The Rust executor
+(`hype-twap`) and read-only journal inspector (`hype-twap-runs`) need no server,
+WebSocket, Python, or database.
 
 It waits for a price and/or time trigger, then works a target quantity into the
 market as evenly-spaced IOC (taker) slices, catching up whenever a slice
@@ -9,6 +10,12 @@ under-fills.
 
 **Read-only is the default.** You must pass `--read-only false` before a single
 order can be sent.
+
+> **Mainnet live is currently blocked by Issue #16.** Public testnet response
+> conformance has passed, but funded market/passive, ALO-rejection, and cancel
+> `expiresAfter: null` checks are still outstanding. Every live example below
+> therefore selects `--network testnet`; do not remove it until that checklist
+> is completed and documented.
 
 > 日本語のドキュメントは [`docs/`](docs/README.md) にあります
 > ([使い方](docs/USAGE.md) / [仕組み](docs/DESIGN.md) /
@@ -19,6 +26,7 @@ order can be sent.
 ```bash
 cargo build --release
 ./target/release/hype-twap --help
+./target/release/hype-twap-runs --help
 ```
 
 ## Usage
@@ -29,12 +37,12 @@ Dry run (the default) — prints the orders it *would* place, from the live book
 hype-twap --symbol HYPE --side long --usd 1500 --duration 30m
 ```
 
-Go live, starting immediately:
+Place a funded-testnet smoke order, starting immediately:
 
 ```bash
 export HL_AGENT_PK=0x<64 hex>
 hype-twap --symbol HYPE --side long --usd 1500 --duration 30m \
-  --max-notional-usd 2000 --read-only false
+  --network testnet --max-notional-usd 2000 --read-only false
 ```
 
 Wait for HYPE to reach $40 before starting, but give up waiting after 2 hours
@@ -43,7 +51,7 @@ and start anyway:
 ```bash
 hype-twap --symbol HYPE --side long --size 50 --duration 1h \
   --trigger-price 40 --trigger-when above --start-after 2h \
-  --max-notional-usd 3000 --read-only false
+  --network testnet --max-notional-usd 3000 --read-only false
 ```
 
 Sell into a falling market, in 20 slices over 2 hours, on testnet:
@@ -102,9 +110,11 @@ append-only record of everything that was sent.
 | `--trigger-when` | `above` \| `below` | none | `above`: fire when `mid >= price`. `below`: fire when `mid <= price`. Never inferred — omitting it with `--trigger-price` is an error. |
 | `--start-after` | humantime | none | Also fire after this much time. OR'd with the price trigger. |
 | `--read-only` | `true` \| `false` | **`true`** | `true` signs nothing and sends nothing. |
+| `--event-jsonl` | path | none | Optional schema-versioned lifecycle event stream for a read-only simulation. It writes only the explicit path and does not create or use the live state directory. Live runs always use their run-directory `events.jsonl` sidecar. |
 | `--network` | `mainnet` \| `testnet` | `mainnet` | Sets the API URLs *and* the EIP-712 `Agent.source` domain together. |
 | `--slippage-bps` | decimal | `20` | Cushion on the IOC limit price. |
 | `--max-book-age-ms` | u64 | `3000` | Reject a book snapshot older than this. `0` disables ONLY the max-age check — every book (trigger polls, pre-flight, each slice) still has to pass semantic validation (matching symbol, positive prices/sizes, uncrossed and correctly-ordered levels) and a fixed 2s future-timestamp tolerance, unconditionally. |
+| `--settle-retries` | u32 | `25` | Maximum `orderStatus` polls after cancelling a known resting child. Can also be set with `HL_SETTLE_RETRIES`; this changes only the cancel/settle patience budget, never ambiguous-place resend policy. After the budget, an acknowledged cancel may use strictly identity-checked `userFillsByTime` rows; uncertainty still hard-stops. |
 | `--trigger-poll-secs` | u64 | `2` | Poll interval while waiting for the trigger. |
 | `--expire-after` | humantime | none | Terminate the wait, placing **nothing**, if no trigger condition fires within this duration. See "Trigger semantics" below. |
 | `--child-algo` | `market` \| `passive` \| `follow` | `market` | Per-slice order algorithm. `market` (default, unchanged behaviour) sends an IOC taker limit. `passive` sends a post-only (ALO) limit resting at the best bid/ask instead. `follow` is `passive` plus mid-slice re-quoting. See "Child-order algorithms" below. |
@@ -116,9 +126,31 @@ append-only record of everything that was sent.
 | `--allow-custom-endpoints` | bool | `false` | Unsafe override: allow `HL_INFO_URL` / `HL_EXCHANGE_URL` to be overridden in **live** mode. The override URL must be `https://` unless it is loopback (`127.0.0.1`/`localhost`, no userinfo) — used only by the test seam. Has no effect in read-only mode. |
 | `--wait-network-grace` | humantime | `30m` | How long a consecutive trigger-poll failure streak (network error or empty book) may run before the wait hard-stops. Timed from the first failure in the streak, resets on any successful poll. |
 | `--state-dir` | path | `$XDG_STATE_HOME/hype-twap` or `~/.local/state/hype-twap` | Root directory for run-state persistence (journal/lock/nonce-HWM). A read-only run never touches this. |
-| `--resume` | string (run id) | none | Resume a specific incomplete run by its run id. Every submitted/unknown cloid in that run's journal is reconciled via `orderStatus` before continuing. Mutually exclusive with `--abandon-incomplete-run`. |
-| `--abandon-incomplete-run` | bool | `false` | Force-reconcile the incomplete run detected for this network+agent and mark it abandoned, WITHOUT continuing it. |
-| `--shutdown-grace` | humantime | `60s` | How long a SIGINT/SIGTERM shutdown may spend reconciling in-flight orders and cancelling confirmed resting ones before giving up. |
+| `--resume` | string (run id) | none | Resume a specific incomplete run by its run id. Live use requires `--master-address` or `HL_MASTER_ADDRESS`, allowing network/agent/master/symbol/side identity validation before any external API call. Every submitted/unknown cloid is then reconciled via `orderStatus`. Mutually exclusive with `--abandon-incomplete-run`. |
+| `--abandon-incomplete-run` | bool | `false` | Force-reconcile the incomplete run detected for this network+agent and mark it abandoned, WITHOUT continuing it. Also requires an explicit master address for the pre-network identity check. |
+| `--shutdown-grace` | humantime | `60s` | How long a SIGINT/SIGTERM shutdown may spend reconciling in-flight orders, cancelling confirmed resting ones, and completing position-phase/final verification before giving up. |
+
+### Journal inspection
+
+The read-only `hype-twap-runs` binary emits schema-versioned JSON over the
+durable `<state-dir>/runs` journals:
+
+```bash
+hype-twap-runs list
+hype-twap-runs --state-dir /srv/hype-state inspect <run-id>
+hype-twap-runs --state-dir /srv/hype-state verify <run-id>
+```
+
+`verify` exits non-zero with a JSON typed validation error for corrupt,
+invalid-transition, or unsafe-accounting journals. Its output contains public
+run identity and accounting metadata only; it never includes secrets,
+signatures, or raw HTTP payloads.
+
+For a final live-run report in exactly the same schema, pass
+`--report-json /path/to/final.json`. The file is atomically published after a
+fresh validated journal replay. `--report-json -` reserves stdout for the
+single JSON document; regular operator output is suppressed and tracing stays
+on stderr.
 
 ## Environment variables
 
@@ -126,9 +158,10 @@ append-only record of everything that was sent.
 |---|---|---|
 | `HL_AGENT_PK` | only when `--read-only false` | `0x` + 64 hex. **Never accepted as a flag** so it cannot land in shell history or `ps` output. Held in a `secrecy::SecretString` and never logged — not even in error messages or `Debug` output. |
 | `HL_AGENT_ADDRESS` | optional | The **Agent** (API wallet) address — *not* your master account. If set, it is checked against the address derived from `HL_AGENT_PK` and the process refuses to start on a mismatch. |
-| `HL_MASTER_ADDRESS` | optional | The **master** account your agent belongs to. Live mode discovers this automatically (see below), so you never *have* to set it; if you do, it is cross-checked against what Hyperliquid reports and a mismatch aborts startup. |
+| `HL_MASTER_ADDRESS` | required for live resume/abandon | The **master** account your agent belongs to. A new live run discovers this automatically, but `--resume` / `--abandon-incomplete-run` require it (or `--master-address`) so the journal identity can be rejected before any external API call. It is always cross-checked against Hyperliquid's `userRole` response. |
 | `HL_INFO_URL` | optional | Override the `/info` endpoint. |
 | `HL_EXCHANGE_URL` | optional | Override the `/exchange` endpoint. |
+| `HL_SETTLE_RETRIES` | optional | Override `--settle-retries` (default `25`) for known-order cancel/settle polling. Must be positive. It does not authorize an ambiguous place resend. |
 | `RUST_LOG` | optional | Log filter; defaults to `info`. |
 
 `--help` lists all of these too.
@@ -434,17 +467,19 @@ the shortfall; a normal run reaches its last slice inside the window anyway.
 - **Wall-clock dependent.** Nonces and book-freshness checks assume a
   reasonably accurate system clock; run NTP. (A book timestamp *ahead* of local
   time is treated as fresh, so mild skew is tolerated.)
-- **Timing flags use a monotonic clock, not wall-clock.** `--start-after`,
-  `--duration`, and `--expire-after` are all timed off `tokio::time::Instant`
-  (`CLOCK_MONOTONIC` on Linux), which does **not** advance while the system is
-  suspended. On a laptop that sleeps, a run started with `--start-after 2h`
-  will begin 2 hours of *awake* time after launch — if the machine suspends
-  for an hour in between, the actual wall-clock start is delayed by that hour.
+- **Trigger waits use a monotonic clock; execution has a durable wall-clock
+  deadline.** `--start-after` and `--expire-after` are local monotonic waits.
+  Once execution begins, `--duration` is also fixed as an absolute Unix-ms
+  deadline in the journal and on every exchange request. A suspend or
+  `--resume` therefore cannot extend the original logical execution window.
 - **HL error strings are matched by substring.** Hyperliquid can reword its
   rejection messages at any time; a reworded message still stops the run, it
   just falls back to the generic "exchange rejected" wording.
-- **One symbol per process.** No portfolio logic, no existing-position
-  awareness (`reduce_only` is never set), no HIP-3 `dex:SYMBOL` prefixes.
+- **One symbol per process.** `--flatten`, `--target-sz`, and `--target-usd`
+  are position-aware for that one standard perpetual: reductions are
+  `reduce_only`, and a reversal must verify exact flatness before opening the
+  other side. Portfolio optimisation and HIP-3 `dex:SYMBOL` position modes
+  remain out of scope.
   This principle is unchanged, but running **multiple processes in
   parallel, each with its own dedicated agent (API) wallet**, is a
   supported operational pattern — e.g. a delta-neutral pair (long one
@@ -453,8 +488,17 @@ the shortfall; a normal run reaches its last slice inside the window anyway.
   `network + agent address`, so each leg MUST use a separate agent wallet;
   sharing one agent wallet across two concurrent processes causes the
   second process to be refused at startup. `scripts/dn-pair.sh` launches
-  and supervises such a pair; see "Delta-Neutral Two-Leg Operation" in
-  docs/OPERATIONS.md for the runbook. Single-process multi-leg execution
+  and supervises such a pair. It holds both legs behind an atomic ready/start
+  barrier, and its manifest-backed `status`, `stop`, and diagnostic-only
+  `recover` commands verify PID + Linux starttime + executable before any
+  signal; see "Delta-Neutral Two-Leg Operation" in docs/OPERATIONS.md for
+  the runbook. Its leg environments are reduced to `PATH`, `HOME`, `TMPDIR`,
+  the selected leg credential in live mode, and a fixed non-secret runtime
+  allowlist (`SSL_CERT_FILE`, `SSL_CERT_DIR`, upper/lower-case HTTP proxy
+  variables, `RUST_LOG`, and `RUST_BACKTRACE`), when non-empty. If configured,
+  `HL_ALERT_HOOK_URL` is also restored privately to each leg and the watchdog;
+  remote hook URLs require HTTPS (literal `http://127.0.0.1` / `http://[::1]`
+  is a test-only exception); it is never placed in argv, manifests, or launcher logs. Single-process multi-leg execution
   (one process trading several symbols internally) remains out of scope —
   see the Roadmap section below.
 - **Taker by default; passive/follow are opt-in.** `--child-algo market`
@@ -488,9 +532,9 @@ Also out of scope for now: WebSocket fills, single-process multi-symbol
 execution (one process trading several symbols internally — a single
 process still trades exactly one symbol; running several *processes* in
 parallel, one per symbol/leg with dedicated agent wallets, is supported —
-see "One symbol per process" above and `scripts/dn-pair.sh`), and
-existing-position awareness. (Run resume/persistence — previously listed
-here — shipped: see "Known limitations" above and docs/OPERATIONS.md.)
+see "One symbol per process" above and `scripts/dn-pair.sh`). Position-aware
+single-symbol execution and run resume/persistence have shipped; see
+"Known limitations" above and docs/OPERATIONS.md.
 
 ## Development
 
@@ -500,8 +544,16 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
+CI verifies Rust 1.91 and stable, including locked tests and release builds.
+It also runs `shellcheck scripts/*.sh` and `bash tests/scripts_integration.sh`.
+For two-leg operation, `scripts/dn-pair.sh` is dry-run by default; live mode
+requires the explicit `--live` switch and separate per-leg caps and agent keys.
+The former `--read-only false` spelling remains a warning-emitting compatibility
+alias for `--live` during the 0.1.x transition and is scheduled for removal in
+the next breaking release (0.2.0); new automation must use `--live`.
+
 `tests/signing_cross_check.rs` verifies the EIP-712 / msgpack signing path
-against 10 vectors generated by the Hyperliquid Python SDK. If those fail, the
+against fixtures generated by the Hyperliquid Python SDK. If those fail, the
 signing code is wrong and **no order it produces should be trusted** — the
 msgpack field order in `src/eip712.rs` is load-bearing and must not be reordered
 without regenerating the fixture.
@@ -513,7 +565,9 @@ tests live in `twap::loop_tests` and pin the sequencing behaviour: the window
 cut-off, fill accounting, min-notional carry, and the `/exchange` reconciliation
 described above.
 
-No test touches the network; `/info` and `/exchange` are mocked with `mockito`.
+The default test suite does not touch the network; `/info` and `/exchange` are
+mocked with `mockito`. The explicitly ignored testnet conformance probes are
+manual exceptions described in `tests/status_vocabulary_conformance.rs`.
 
 ## License
 
