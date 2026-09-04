@@ -47,9 +47,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Address, Cloid, Side, Symbol};
+use crate::types::{Address, Cloid, Side, Symbol, Tif};
 
 /// Resolve the state root directory (Issue #4 PM decision).
 ///
@@ -105,6 +106,13 @@ pub enum JournalRecord {
         nonce: Option<u64>,
         symbol: Symbol,
         side: Side,
+        /// Persisted so resume accounting can distinguish an ALO maker,
+        /// whose own limit is its exact fill price, from a short IOC/GTC,
+        /// whose sell limit is only a lower bound when `avg_px` is absent.
+        /// Legacy journals deserialize this as `None` and fail closed for
+        /// that ambiguous short-fill case.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tif: Option<Tif>,
         px: String,
         sz: String,
     },
@@ -402,6 +410,291 @@ pub enum CloidState {
         filled_sz: String,
         avg_px: Option<String>,
     },
+}
+
+/// Fill quantities and executed notional reconstructed from durable terminal
+/// journal records during `--resume`.
+///
+/// Both values are non-negative. `notional` is credited at a terminal
+/// `avg_px` when available. A missing price falls back to durable
+/// `Prepared.px` only when it is a safe upper bound (Long, or an explicitly
+/// persisted ALO); ambiguous Short IOC/GTC and legacy records fail closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalFillTotals {
+    pub filled_sz: Decimal,
+    pub notional: Decimal,
+}
+
+/// Fail-closed errors while reconstructing resume accounting from a journal.
+///
+/// A malformed amount or price must never be silently skipped: doing so could
+/// make a resumed run place more than its remaining requested quantity or
+/// notional cap permits.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum JournalAccountingError {
+    #[error("invalid decimal in {field} for cloid {cloid}: {value:?}")]
+    InvalidDecimal {
+        cloid: Cloid,
+        field: &'static str,
+        value: String,
+    },
+    #[error("negative size in {field} for cloid {cloid}: {value}")]
+    NegativeSize {
+        cloid: Cloid,
+        field: &'static str,
+        value: Decimal,
+    },
+    #[error("non-positive price in {field} for cloid {cloid}: {value}")]
+    NonPositivePrice {
+        cloid: Cloid,
+        field: &'static str,
+        value: Decimal,
+    },
+    #[error("filled terminal for cloid {cloid} has no preceding Prepared record")]
+    MissingPrepared { cloid: Cloid },
+    #[error(
+        "terminal filled size {filled_sz} exceeds Prepared.sz {prepared_sz} for cloid {cloid}"
+    )]
+    FilledSizeExceedsPrepared {
+        cloid: Cloid,
+        filled_sz: Decimal,
+        prepared_sz: Decimal,
+    },
+    #[error(
+        "terminal avg price {avg_px} violates the {side:?} Prepared limit {prepared_px} for cloid {cloid}"
+    )]
+    AveragePriceViolatesLimit {
+        cloid: Cloid,
+        side: Side,
+        avg_px: Decimal,
+        prepared_px: Decimal,
+    },
+    #[error(
+        "short terminal fill for cloid {cloid} has no avg price and Prepared.tif is {tif:?}; only an explicit ALO limit is a safe notional fallback"
+    )]
+    MissingAveragePriceForShort { cloid: Cloid, tif: Option<Tif> },
+    #[error(
+        "terminal accounting regressed for cloid {cloid}: filled size {previous_filled_sz} -> {next_filled_sz}, notional {previous_notional} -> {next_notional}"
+    )]
+    TerminalAccountingRegressed {
+        cloid: Cloid,
+        previous_filled_sz: Decimal,
+        next_filled_sz: Decimal,
+        previous_notional: Decimal,
+        next_notional: Decimal,
+    },
+    #[error("decimal overflow while {operation} for cloid {cloid}")]
+    Overflow {
+        cloid: Cloid,
+        operation: &'static str,
+    },
+}
+
+/// Reconstruct already-filled size and notional from append-only journal
+/// records for safe `--resume` accounting.
+///
+/// The final [`JournalRecord::Terminal`] for each cloid is selected exactly
+/// once. Successive terminal snapshots must never reduce either the credited
+/// size or notional; such a regression would weaken both resume accounting
+/// and the run-level risk cap, so it is rejected as journal corruption.
+/// A positive fill requires a preceding `Prepared` record and cannot exceed
+/// its size. It uses `Terminal.avg_px` when present, provided that price is
+/// within the prepared side-aware limit. When the exchange omitted `avg_px`,
+/// the preceding `Prepared.px` is used only for a Long (conservative upper
+/// bound) or an explicitly recorded ALO (exact resting price). A positive
+/// Short IOC/GTC or legacy fill with no price has no safe upper bound and is
+/// rejected. Zero fills need no prepared record or price. Every decimal used
+/// by this accounting is validated and arithmetic is checked, so corrupt or
+/// ambiguous journals fail closed rather than under-crediting a prior fill.
+pub fn restore_fill_totals(
+    records: &[JournalRecord],
+) -> Result<JournalFillTotals, JournalAccountingError> {
+    #[derive(Clone)]
+    struct PreparedOrder {
+        px: Decimal,
+        sz: Decimal,
+        side: Side,
+        tif: Option<Tif>,
+    }
+
+    #[derive(Clone)]
+    struct TerminalFill {
+        filled_sz: Decimal,
+        notional: Decimal,
+    }
+
+    fn parse_decimal(
+        cloid: Cloid,
+        field: &'static str,
+        value: &str,
+    ) -> Result<Decimal, JournalAccountingError> {
+        value
+            .parse::<Decimal>()
+            .map_err(|_| JournalAccountingError::InvalidDecimal {
+                cloid,
+                field,
+                value: value.to_owned(),
+            })
+    }
+
+    let mut prepared_orders = std::collections::HashMap::<Cloid, PreparedOrder>::new();
+    let mut terminals = std::collections::HashMap::<Cloid, TerminalFill>::new();
+
+    for record in records {
+        match record {
+            JournalRecord::Prepared {
+                cloid,
+                px,
+                sz,
+                side,
+                tif,
+                ..
+            } => {
+                let prepared_sz = parse_decimal(*cloid, "Prepared.sz", sz)?;
+                if prepared_sz < Decimal::ZERO {
+                    return Err(JournalAccountingError::NegativeSize {
+                        cloid: *cloid,
+                        field: "Prepared.sz",
+                        value: prepared_sz,
+                    });
+                }
+                let prepared_px = parse_decimal(*cloid, "Prepared.px", px)?;
+                if prepared_px <= Decimal::ZERO {
+                    return Err(JournalAccountingError::NonPositivePrice {
+                        cloid: *cloid,
+                        field: "Prepared.px",
+                        value: prepared_px,
+                    });
+                }
+                prepared_orders.insert(
+                    *cloid,
+                    PreparedOrder {
+                        px: prepared_px,
+                        sz: prepared_sz,
+                        side: *side,
+                        tif: *tif,
+                    },
+                );
+            }
+            JournalRecord::Terminal {
+                cloid,
+                filled_sz,
+                avg_px,
+                ..
+            } => {
+                let filled_sz = parse_decimal(*cloid, "Terminal.filled_sz", filled_sz)?;
+                if filled_sz < Decimal::ZERO {
+                    return Err(JournalAccountingError::NegativeSize {
+                        cloid: *cloid,
+                        field: "Terminal.filled_sz",
+                        value: filled_sz,
+                    });
+                }
+                let notional = if filled_sz > Decimal::ZERO {
+                    let prepared = prepared_orders
+                        .get(cloid)
+                        .ok_or(JournalAccountingError::MissingPrepared { cloid: *cloid })?;
+                    if filled_sz > prepared.sz {
+                        return Err(JournalAccountingError::FilledSizeExceedsPrepared {
+                            cloid: *cloid,
+                            filled_sz,
+                            prepared_sz: prepared.sz,
+                        });
+                    }
+                    let px = match avg_px {
+                        Some(avg_px) => {
+                            let avg_px = parse_decimal(*cloid, "Terminal.avg_px", avg_px)?;
+                            if avg_px <= Decimal::ZERO {
+                                return Err(JournalAccountingError::NonPositivePrice {
+                                    cloid: *cloid,
+                                    field: "Terminal.avg_px",
+                                    value: avg_px,
+                                });
+                            }
+                            let violates_limit = match prepared.side {
+                                Side::Long => avg_px > prepared.px,
+                                Side::Short => avg_px < prepared.px,
+                            };
+                            if violates_limit {
+                                return Err(JournalAccountingError::AveragePriceViolatesLimit {
+                                    cloid: *cloid,
+                                    side: prepared.side,
+                                    avg_px,
+                                    prepared_px: prepared.px,
+                                });
+                            }
+                            avg_px
+                        }
+                        None if prepared.side == Side::Short && prepared.tif != Some(Tif::Alo) => {
+                            return Err(JournalAccountingError::MissingAveragePriceForShort {
+                                cloid: *cloid,
+                                tif: prepared.tif,
+                            });
+                        }
+                        None => {
+                            tracing::warn!(
+                                cloid = %cloid,
+                                filled_sz = %filled_sz,
+                                fallback_px = %prepared.px,
+                                tif = ?prepared.tif,
+                                "terminal fill omitted avg_px; using the safe durable prepared-price bound"
+                            );
+                            prepared.px
+                        }
+                    };
+                    filled_sz
+                        .checked_mul(px)
+                        .ok_or(JournalAccountingError::Overflow {
+                            cloid: *cloid,
+                            operation: "multiplying fill size by price",
+                        })?
+                } else {
+                    Decimal::ZERO
+                };
+                if let Some(previous) = terminals.get(cloid) {
+                    if filled_sz < previous.filled_sz || notional < previous.notional {
+                        return Err(JournalAccountingError::TerminalAccountingRegressed {
+                            cloid: *cloid,
+                            previous_filled_sz: previous.filled_sz,
+                            next_filled_sz: filled_sz,
+                            previous_notional: previous.notional,
+                            next_notional: notional,
+                        });
+                    }
+                }
+                terminals.insert(
+                    *cloid,
+                    TerminalFill {
+                        filled_sz,
+                        notional,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let mut totals = JournalFillTotals {
+        filled_sz: Decimal::ZERO,
+        notional: Decimal::ZERO,
+    };
+    for (cloid, terminal) in terminals {
+        totals.filled_sz = totals.filled_sz.checked_add(terminal.filled_sz).ok_or(
+            JournalAccountingError::Overflow {
+                cloid,
+                operation: "summing filled sizes",
+            },
+        )?;
+        if terminal.notional > Decimal::ZERO {
+            totals.notional = totals.notional.checked_add(terminal.notional).ok_or(
+                JournalAccountingError::Overflow {
+                    cloid,
+                    operation: "summing notional",
+                },
+            )?;
+        }
+    }
+    Ok(totals)
 }
 
 /// A summary of one journal's replay: is the run complete, and what does
@@ -788,6 +1081,7 @@ mod tests {
                 side: Side::Long,
                 px: "50".into(),
                 sz: "5".into(),
+                tif: None,
             })
             .unwrap();
         }
@@ -865,6 +1159,7 @@ mod tests {
                 side: Side::Long,
                 px: "50.5".into(),
                 sz: "5".into(),
+                tif: None,
             },
             JournalRecord::SubmittedUnknown {
                 slice_idx: 1,
@@ -911,7 +1206,380 @@ mod tests {
         }
     }
 
+    #[test]
+    fn prepared_tif_round_trips_and_legacy_records_default_to_unknown() {
+        let record = JournalRecord::Prepared {
+            slice_idx: 1,
+            cloid: Cloid::new(),
+            nonce: Some(1),
+            symbol: Symbol::new("HYPE"),
+            side: Side::Short,
+            tif: Some(Tif::Ioc),
+            px: "50".into(),
+            sz: "1".into(),
+        };
+        let mut value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value.get("tif"), Some(&serde_json::json!("Ioc")));
+        assert!(matches!(
+            serde_json::from_value::<JournalRecord>(value.clone()).unwrap(),
+            JournalRecord::Prepared {
+                tif: Some(Tif::Ioc),
+                ..
+            }
+        ));
+
+        value.as_object_mut().unwrap().remove("tif");
+        assert!(matches!(
+            serde_json::from_value::<JournalRecord>(value).unwrap(),
+            JournalRecord::Prepared { tif: None, .. }
+        ));
+    }
+
     // === summarize / RunSummary ===
+
+    // === restore_fill_totals ===
+
+    #[test]
+    fn restore_fill_totals_uses_terminal_average_price() {
+        let cloid = Cloid::new();
+        let records = vec![
+            JournalRecord::Prepared {
+                slice_idx: 1,
+                cloid,
+                nonce: Some(1),
+                symbol: Symbol::new("HYPE"),
+                side: Side::Long,
+                px: "50".into(),
+                sz: "3".into(),
+                tif: None,
+            },
+            JournalRecord::Terminal {
+                slice_idx: 1,
+                cloid,
+                status: "filled".into(),
+                filled_sz: "2.5".into(),
+                avg_px: Some("49.2".into()),
+            },
+        ];
+
+        assert_eq!(
+            restore_fill_totals(&records).unwrap(),
+            JournalFillTotals {
+                filled_sz: Decimal::new(25, 1),
+                notional: Decimal::new(123, 0),
+            }
+        );
+    }
+
+    #[test]
+    fn restore_fill_totals_falls_back_to_prepared_price() {
+        let cloid = Cloid::new();
+        let records = vec![
+            JournalRecord::Prepared {
+                slice_idx: 1,
+                cloid,
+                nonce: Some(1),
+                symbol: Symbol::new("HYPE"),
+                side: Side::Long,
+                px: "50.4".into(),
+                sz: "2".into(),
+                tif: None,
+            },
+            JournalRecord::Terminal {
+                slice_idx: 1,
+                cloid,
+                status: "filled".into(),
+                filled_sz: "1.5".into(),
+                avg_px: None,
+            },
+        ];
+
+        assert_eq!(
+            restore_fill_totals(&records).unwrap(),
+            JournalFillTotals {
+                filled_sz: Decimal::new(15, 1),
+                notional: Decimal::new(756, 1),
+            }
+        );
+    }
+
+    #[test]
+    fn restore_fill_totals_allows_unpriced_short_only_for_explicit_alo() {
+        let alo_cloid = Cloid::new();
+        let alo_records = vec![
+            JournalRecord::Prepared {
+                slice_idx: 1,
+                cloid: alo_cloid,
+                nonce: Some(1),
+                symbol: Symbol::new("HYPE"),
+                side: Side::Short,
+                tif: Some(Tif::Alo),
+                px: "50".into(),
+                sz: "2".into(),
+            },
+            JournalRecord::Terminal {
+                slice_idx: 1,
+                cloid: alo_cloid,
+                status: "filled".into(),
+                filled_sz: "1.5".into(),
+                avg_px: None,
+            },
+        ];
+        assert_eq!(
+            restore_fill_totals(&alo_records).unwrap(),
+            JournalFillTotals {
+                filled_sz: Decimal::new(15, 1),
+                notional: Decimal::from(75),
+            }
+        );
+
+        for tif in [Some(Tif::Ioc), Some(Tif::Gtc), None] {
+            let cloid = Cloid::new();
+            let records = vec![
+                JournalRecord::Prepared {
+                    slice_idx: 1,
+                    cloid,
+                    nonce: Some(1),
+                    symbol: Symbol::new("HYPE"),
+                    side: Side::Short,
+                    tif,
+                    px: "50".into(),
+                    sz: "2".into(),
+                },
+                JournalRecord::Terminal {
+                    slice_idx: 1,
+                    cloid,
+                    status: "filled".into(),
+                    filled_sz: "1.5".into(),
+                    avg_px: None,
+                },
+            ];
+            assert_eq!(
+                restore_fill_totals(&records),
+                Err(JournalAccountingError::MissingAveragePriceForShort { cloid, tif })
+            );
+        }
+    }
+
+    #[test]
+    fn restore_fill_totals_handles_interleaved_cloids_and_last_terminal() {
+        let c1 = Cloid::new();
+        let c2 = Cloid::new();
+        let records = vec![
+            JournalRecord::Prepared {
+                slice_idx: 1,
+                cloid: c1,
+                nonce: Some(1),
+                symbol: Symbol::new("HYPE"),
+                side: Side::Long,
+                px: "12".into(),
+                sz: "5".into(),
+                tif: None,
+            },
+            JournalRecord::Prepared {
+                slice_idx: 2,
+                cloid: c2,
+                nonce: Some(2),
+                symbol: Symbol::new("HYPE"),
+                side: Side::Long,
+                px: "20".into(),
+                sz: "1".into(),
+                tif: None,
+            },
+            JournalRecord::Terminal {
+                slice_idx: 1,
+                cloid: c1,
+                status: "canceled".into(),
+                filled_sz: "1".into(),
+                avg_px: Some("10".into()),
+            },
+            JournalRecord::Terminal {
+                slice_idx: 2,
+                cloid: c2,
+                status: "filled".into(),
+                filled_sz: "1".into(),
+                avg_px: None,
+            },
+            JournalRecord::Terminal {
+                slice_idx: 1,
+                cloid: c1,
+                status: "filled".into(),
+                filled_sz: "2".into(),
+                avg_px: Some("11".into()),
+            },
+        ];
+
+        assert_eq!(
+            restore_fill_totals(&records).unwrap(),
+            JournalFillTotals {
+                filled_sz: Decimal::from(3),
+                notional: Decimal::from(42),
+            }
+        );
+    }
+
+    #[test]
+    fn restore_fill_totals_rejects_regressing_terminal_accounting() {
+        for (next_filled_sz, next_avg_px) in [("0.5", "10"), ("1", "9")] {
+            let cloid = Cloid::new();
+            let records = vec![
+                JournalRecord::Prepared {
+                    slice_idx: 1,
+                    cloid,
+                    nonce: Some(1),
+                    symbol: Symbol::new("HYPE"),
+                    side: Side::Long,
+                    px: "12".into(),
+                    sz: "2".into(),
+                    tif: None,
+                },
+                JournalRecord::Terminal {
+                    slice_idx: 1,
+                    cloid,
+                    status: "canceled".into(),
+                    filled_sz: "1".into(),
+                    avg_px: Some("10".into()),
+                },
+                JournalRecord::Terminal {
+                    slice_idx: 1,
+                    cloid,
+                    status: "canceled".into(),
+                    filled_sz: next_filled_sz.into(),
+                    avg_px: Some(next_avg_px.into()),
+                },
+            ];
+
+            assert!(matches!(
+                restore_fill_totals(&records),
+                Err(JournalAccountingError::TerminalAccountingRegressed { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn restore_fill_totals_fails_closed_for_malformed_or_missing_values() {
+        let invalid_cloid = Cloid::new();
+        let invalid = vec![JournalRecord::Terminal {
+            slice_idx: 1,
+            cloid: invalid_cloid,
+            status: "filled".into(),
+            filled_sz: "not-a-decimal".into(),
+            avg_px: Some("10".into()),
+        }];
+        assert!(matches!(
+            restore_fill_totals(&invalid),
+            Err(JournalAccountingError::InvalidDecimal {
+                field: "Terminal.filled_sz",
+                ..
+            })
+        ));
+
+        let missing_cloid = Cloid::new();
+        let missing = vec![JournalRecord::Terminal {
+            slice_idx: 2,
+            cloid: missing_cloid,
+            status: "filled".into(),
+            filled_sz: "1".into(),
+            avg_px: None,
+        }];
+        assert_eq!(
+            restore_fill_totals(&missing),
+            Err(JournalAccountingError::MissingPrepared {
+                cloid: missing_cloid
+            })
+        );
+
+        let negative_cloid = Cloid::new();
+        let negative = vec![JournalRecord::Terminal {
+            slice_idx: 3,
+            cloid: negative_cloid,
+            status: "filled".into(),
+            filled_sz: "-1".into(),
+            avg_px: Some("10".into()),
+        }];
+        assert!(matches!(
+            restore_fill_totals(&negative),
+            Err(JournalAccountingError::NegativeSize {
+                field: "Terminal.filled_sz",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn restore_fill_totals_rejects_untrusted_positive_fill_values() {
+        let overfill_cloid = Cloid::new();
+        let overfill = vec![
+            JournalRecord::Prepared {
+                slice_idx: 1,
+                cloid: overfill_cloid,
+                nonce: Some(1),
+                symbol: Symbol::new("HYPE"),
+                side: Side::Long,
+                px: "10".into(),
+                sz: "1".into(),
+                tif: None,
+            },
+            JournalRecord::Terminal {
+                slice_idx: 1,
+                cloid: overfill_cloid,
+                status: "filled".into(),
+                filled_sz: "2".into(),
+                avg_px: Some("10".into()),
+            },
+        ];
+        assert!(matches!(
+            restore_fill_totals(&overfill),
+            Err(JournalAccountingError::FilledSizeExceedsPrepared { .. })
+        ));
+
+        for (side, average_price) in [(Side::Long, "11"), (Side::Short, "9")] {
+            let cloid = Cloid::new();
+            let records = vec![
+                JournalRecord::Prepared {
+                    slice_idx: 2,
+                    cloid,
+                    nonce: Some(2),
+                    symbol: Symbol::new("HYPE"),
+                    side,
+                    px: "10".into(),
+                    sz: "1".into(),
+                    tif: None,
+                },
+                JournalRecord::Terminal {
+                    slice_idx: 2,
+                    cloid,
+                    status: "filled".into(),
+                    filled_sz: "1".into(),
+                    avg_px: Some(average_price.into()),
+                },
+            ];
+            assert!(matches!(
+                restore_fill_totals(&records),
+                Err(JournalAccountingError::AveragePriceViolatesLimit { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn restore_fill_totals_accepts_zero_fill_without_prepared_or_price() {
+        let records = vec![JournalRecord::Terminal {
+            slice_idx: 1,
+            cloid: Cloid::new(),
+            status: "canceled".into(),
+            filled_sz: "0".into(),
+            // A zero-fill terminal has no price-bearing accounting effect,
+            // so even an exchange's malformed/placeholder value is ignored.
+            avg_px: Some("not-a-price".into()),
+        }];
+        assert_eq!(
+            restore_fill_totals(&records).unwrap(),
+            JournalFillTotals {
+                filled_sz: Decimal::ZERO,
+                notional: Decimal::ZERO,
+            }
+        );
+    }
 
     #[test]
     fn summarize_counts_each_terminal_fill_exactly_once() {
@@ -927,6 +1595,7 @@ mod tests {
                 side: Side::Long,
                 px: "50".into(),
                 sz: "5".into(),
+                tif: None,
             },
             JournalRecord::SubmittedUnknown {
                 slice_idx: 1,
@@ -947,6 +1616,7 @@ mod tests {
                 side: Side::Long,
                 px: "51".into(),
                 sz: "5".into(),
+                tif: None,
             },
             JournalRecord::Terminal {
                 slice_idx: 2,
@@ -976,6 +1646,7 @@ mod tests {
                 side: Side::Long,
                 px: "50".into(),
                 sz: "5".into(),
+                tif: None,
             },
             JournalRecord::SubmittedUnknown {
                 slice_idx: 1,
@@ -1016,6 +1687,7 @@ mod tests {
                 side: Side::Long,
                 px: "50".into(),
                 sz: "5".into(),
+                tif: None,
             },
             // Forced reconciliation would append Acknowledged/Terminal
             // records here in the real flow; this test only pins that the

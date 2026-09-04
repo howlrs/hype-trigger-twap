@@ -43,9 +43,18 @@ export HL_AGENT_PK=$(pass show hyperliquid/agent-pk)
 ### 3. 名目額上限の決定 (`--max-notional-usd`, Issue #3)
 
 `--read-only false` (本番実行) では `--max-notional-usd` の指定が**必須**です
-(0.1.0 からの破壊的変更)。1 スライスが超えてはならない最大 USD 名目額を、
-想定する `--usd` / `--size` と `--slices` から逆算して設定してください。
-上限は各スライス送信の直前に、そのスライスの実際の指値で再検証されます。
+(0.1.0 からの破壊的変更)。これは1スライスではなく、**同じ論理run全体の
+累積 USD 名目額**の上限です。`--resume` 前の約定も累積に含まれます。
+各注文の送信直前に、既約定額 + catch-up を反映した実注文数量 × 現在の指値を
+再検証し、上限を超える注文は `/exchange` へ送る前に停止します。残余上限に
+収まるよう注文数量を自動縮小はせず、runをhard-stopします。
+
+`--resume` 時に取引所の terminal 応答へ `avg_px` が記録されていない場合、
+Long は指値 (`Prepared.px`) を安全側の上限として使います。ALO maker は sideを
+問わずresting指値が正確な約定価格なので、journalへ永続化した `Prepared.tif`
+が `Alo` の場合だけ同じfallbackを使えます。Short IOC/GTCの売り指値は約定価格の
+下限にしかならないため、価格不明の正数約定は推測せずfail-closedで再開を
+停止します。旧journalはTIF不明として同じ安全側の扱いです。
 
 同様に `--slippage-bps` が 1000 bps を超える場合は `--allow-high-slippage` の
 明示が必要です (10000 bps 以上は override 不可で無条件拒否)。詳細は
@@ -194,6 +203,10 @@ continue it, or --abandon-incomplete-run to force-reconcile and abandon it
   だった旧 run と並行して二重発注してしまう事故を防ぐためです。
 
 破損エラーが出た場合の対応手順:
+
+> **重要:** 約定済み `Terminal` の削除・減額や、古いバックアップへの
+> 巻き戻しは、再開時の累積名目額を過少評価させます。必ず Hyperliquid 側の
+> 約定履歴と照合し、元ファイルを退避してから作業してください。
 
 1. エラーメッセージに示された `<state-dir>/runs/<run-id>/journal.jsonl` を
    手で確認する (`cat` / `head`)。復旧可能な内容 (例えば単なる末尾破損に

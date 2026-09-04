@@ -30,7 +30,8 @@ cargo build --release
 
 # 本番実行
 export HL_AGENT_PK=0x<64桁の16進数>
-./target/release/hype-twap --symbol HYPE --side long --usd 1500 --duration 30m --read-only false
+./target/release/hype-twap --symbol HYPE --side long --usd 1500 --duration 30m \
+  --max-notional-usd 2000 --read-only false
 ```
 
 ## 安全設計の要点
