@@ -172,7 +172,8 @@ impl RiskEnvelope {
     /// §2 cont'd: check a requested/estimated notional against the cap.
     /// Used both at CLI-validation time (against `--usd`, or a freshly
     /// computed conservative limit price × `--size`) and again before EACH
-    /// slice in the TWAP loop (against the actual order px for that slice).
+    /// order in the TWAP loop (against prior/current filled notional plus the
+    /// exact catch-up-aware order size at that order's actual limit price).
     pub fn check_notional_cap(requested: Decimal, cap: Decimal) -> Result<(), RiskError> {
         if requested > cap {
             return Err(RiskError::NotionalCapExceeded { requested, cap });
@@ -460,12 +461,10 @@ mod tests {
 
     #[test]
     fn short_size_just_under_cap_is_accepted() {
-        // Short's conservative limit sits BELOW mid, but for a notional cap
-        // check the conservative direction is the same as long: use the
-        // WORST-CASE (highest) price the size could execute at, which for a
-        // short taker limit computed with slippage below the bid is still
-        // its OWN limit price (there is no upside beyond it for a taker
-        // IOC), so px here is short's own limit.
+        // The primitive is intentionally side-agnostic: its caller supplies
+        // the price bound it can prove. This test pins only the decimal
+        // boundary arithmetic for a Short-sized request; missing-price
+        // Short IOC recovery is rejected at the trusted response boundary.
         let sz = dec!(99.9);
         let conservative_px = dec!(100.01);
         let requested = sz * conservative_px;

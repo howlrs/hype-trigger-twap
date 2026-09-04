@@ -367,10 +367,11 @@ pub struct TwapPlan {
     pub read_only: bool,
     /// Issue #3: the notional cap resolved before the run started —
     /// required in live mode, `Decimal::MAX` (effectively unbounded) in
-    /// read-only. Re-checked before EVERY slice against that slice's actual
-    /// order price, via [`RiskEnvelope::check_notional_cap`] — the SAME
-    /// function (and constants module) the CLI pre-flight check uses, so the
-    /// policy cannot drift between the two call sites.
+    /// read-only. Re-checked before EVERY order against all prior fills
+    /// (including journal-restored fills after `--resume`) plus the exact,
+    /// catch-up-aware order size at that order's actual limit price, via
+    /// [`RiskEnvelope::check_notional_cap`] — the SAME function (and constants
+    /// module) the CLI pre-flight check uses, so policy cannot drift.
     pub max_notional_usd: Decimal,
     /// Agent (API wallet) address — the key that signs. `None` in read-only.
     pub agent: Option<Address>,
@@ -676,12 +677,30 @@ struct FillStats {
     filled: Decimal,
     /// Σ(px * sz), for the size-weighted average.
     notional: Decimal,
+    /// Notional already credited by a prior process for this same logical
+    /// run. This participates in the run-level cap, but not in this process's
+    /// average-price report (the CLI folds the full journal back into its
+    /// final report separately).
+    prior_notional: Decimal,
 }
 
 impl FillStats {
+    fn with_prior_notional(prior_notional: Decimal) -> Self {
+        Self {
+            prior_notional,
+            ..Self::default()
+        }
+    }
+
     fn add(&mut self, sz: Decimal, px: Decimal) {
         self.filled += sz;
         self.notional += sz * px;
+    }
+
+    /// Notional consumed from the run-level risk envelope across every
+    /// process that has executed this logical run.
+    fn cumulative_notional(&self) -> Decimal {
+        self.prior_notional + self.notional
     }
 
     fn avg_px(&self) -> Option<Decimal> {
@@ -1037,6 +1056,7 @@ async fn place_alo_child(
             nonce: None,
             symbol: intent.symbol.clone(),
             side: intent.side,
+            tif: Some(intent.tif),
             px: intent.px.to_string(),
             sz: intent.sz.to_string(),
         }) {
@@ -1214,6 +1234,7 @@ async fn place_slice_reconciled(
             nonce: None,
             symbol: intent.symbol.clone(),
             side: intent.side,
+            tif: Some(intent.tif),
             px: intent.px.to_string(),
             sz: intent.sz.to_string(),
         })
@@ -1582,6 +1603,7 @@ pub async fn run_twap(client: &dyn HlApi, plan: &TwapPlan) -> TwapReport {
 pub struct PreparedIntent {
     pub symbol: Symbol,
     pub side: Side,
+    pub tif: Option<Tif>,
     pub px: Decimal,
     pub sz: Decimal,
 }
@@ -1594,10 +1616,11 @@ impl PreparedIntent {
             side: self.side,
             px: self.px,
             sz: self.sz,
-            // Unused by ValidatedFill::validate (only cloid/symbol/side/px/sz
-            // are read); Tif::Alo is broadest-compatible for either child
-            // algo's original Prepared record.
-            tif: Tif::Alo,
+            // Legacy journals did not persist TIF. Treat an unknown value as
+            // IOC, the stricter choice: this still permits Long's safe upper-
+            // bound fallback but rejects an unpriced Short rather than
+            // misclassifying it as an exact-price ALO maker fill.
+            tif: self.tif.unwrap_or(Tif::Ioc),
             reduce_only: false,
         }
     }
@@ -2148,14 +2171,15 @@ async fn place_follow_child(
         ));
     }
     let slice_notional_estimate = order_sz * new_px;
-    let cumulative_notional_estimate = stats.notional + slice_notional_estimate;
+    let filled_notional = stats.cumulative_notional();
+    let cumulative_notional_estimate = filled_notional + slice_notional_estimate;
     if let Err(e) =
         RiskEnvelope::check_notional_cap(cumulative_notional_estimate, plan.max_notional_usd)
     {
         return Err(format!(
             "slice {slice_idx}: follow: risk envelope rejected the re-quoted notional \
              (cumulative {} + this order {} would exceed the cap): {e}",
-            human(stats.notional),
+            human(filled_notional),
             human(slice_notional_estimate)
         ));
     }
@@ -2200,6 +2224,25 @@ async fn place_follow_child(
 pub async fn run_twap_journaled(
     client: &dyn HlApi,
     plan: &TwapPlan,
+    journal: Option<&mut ExecutionJournal>,
+    shutdown: Option<ShutdownSignal>,
+) -> TwapReport {
+    run_twap_journaled_with_prior_notional(client, plan, Decimal::ZERO, journal, shutdown).await
+}
+
+/// Run the TWAP loop while carrying forward notional already filled by a
+/// prior process for the same logical run.
+///
+/// `prior_filled_notional` is restored from the durable journal by
+/// `--resume`. It is deliberately separate from `plan.total_adjusted` and
+/// the loop-local filled size: a resumed plan targets only its remaining
+/// size, while the notional cap remains an envelope over the entire original
+/// run. Fresh runs and the compatibility wrapper [`run_twap_journaled`] pass
+/// zero.
+pub async fn run_twap_journaled_with_prior_notional(
+    client: &dyn HlApi,
+    plan: &TwapPlan,
+    prior_filled_notional: Decimal,
     mut journal: Option<&mut ExecutionJournal>,
     mut shutdown: Option<ShutdownSignal>,
 ) -> TwapReport {
@@ -2211,7 +2254,7 @@ pub async fn run_twap_journaled(
     // slice — checks against this same value; a resend does NOT get a fresh
     // expiry (PM decision).
     let exec_deadline = ExecutionDeadline::new(start, plan.duration, wall_clock_now_ms());
-    let mut stats = FillStats::default();
+    let mut stats = FillStats::with_prior_notional(prior_filled_notional);
     let mut slices_executed = 0u32;
     let mut slices_skipped = 0u32;
     let mut abort_reason: Option<String> = None;
@@ -2224,6 +2267,21 @@ pub async fn run_twap_journaled(
     let mut resting: Option<RestingChild> = None;
 
     for slice_idx in 1..=plan.slices {
+        // A resumed process may inherit a logical run whose prior fills have
+        // already consumed the entire cap (including journals produced by an
+        // older binary). Stop before even fetching a book: every placeable
+        // order has positive notional, so no continuation can be admitted
+        // when prior notional is already at or above the ceiling.
+        if slice_idx == 1 && !plan.read_only && prior_filled_notional >= plan.max_notional_usd {
+            abort_reason = Some(format!(
+                "risk envelope rejected the resumed run before execution: prior fills already \
+                 consumed {} against the {} notional cap; no headroom remains",
+                human(prior_filled_notional),
+                human(plan.max_notional_usd)
+            ));
+            break;
+        }
+
         // Issue #4: stop scheduling NEW slices once shutdown has been
         // requested. Checked at the top of every iteration so an interrupt
         // noticed during the previous slice's inter-slice sleep (via the
@@ -2362,32 +2420,6 @@ pub async fn run_twap_journaled(
             break;
         }
 
-        // Issue #3 / B2: re-check the notional cap before EACH slice using
-        // the ACTUAL order px for that slice (book prices move between
-        // slices), not the estimate used at CLI pre-flight time.
-        //
-        // B2 PM decision: `max_notional_usd` is a RUN-LEVEL envelope, not a
-        // per-slice-only limit — the check must assert
-        // cumulative-executed-notional (`stats.notional`, Σ px*sz of every
-        // fill already credited this run) + this slice's own notional
-        // estimate against the cap, aborting BEFORE the slice that would
-        // exceed it. A per-slice-only comparison lets a rising price pass
-        // each individual slice while the RUN's total notional silently
-        // breaches the operator's cap.
-        let slice_notional_estimate = plan.per_slice * px;
-        let cumulative_notional_estimate = stats.notional + slice_notional_estimate;
-        if let Err(e) =
-            RiskEnvelope::check_notional_cap(cumulative_notional_estimate, plan.max_notional_usd)
-        {
-            abort_reason = Some(format!(
-                "slice {slice_idx}: risk envelope rejected the notional \
-                 (cumulative {} + this slice {} would exceed the cap): {e}",
-                human(stats.notional),
-                human(slice_notional_estimate)
-            ));
-            break;
-        }
-
         let decision = decide_slice(
             slice_idx,
             plan.slices,
@@ -2431,6 +2463,27 @@ pub async fn run_twap_journaled(
                 continue;
             }
         };
+
+        // Issue #3 / #12: `max_notional_usd` is a RUN-LEVEL envelope. Check
+        // the exact size this iteration is about to sign, only AFTER
+        // `decide_slice` has expanded it for any accumulated shortfall.
+        // Using `plan.per_slice` here lets a catch-up order containing several
+        // slices pass a check for only one slice. The filled side of the sum
+        // includes journal-restored fills from a prior process on `--resume`.
+        let order_notional = order_sz * px;
+        let filled_notional = stats.cumulative_notional();
+        let cumulative_notional_estimate = filled_notional + order_notional;
+        if let Err(e) =
+            RiskEnvelope::check_notional_cap(cumulative_notional_estimate, plan.max_notional_usd)
+        {
+            abort_reason = Some(format!(
+                "slice {slice_idx}: risk envelope rejected the notional \
+                 (cumulative {} + this order {} would exceed the cap): {e}",
+                human(filled_notional),
+                human(order_notional)
+            ));
+            break;
+        }
 
         let cloid = Cloid::new();
         let tif = match plan.child_algo {
@@ -3327,6 +3380,19 @@ mod tests {
     #[test]
     fn avg_px_is_none_with_no_fills() {
         assert_eq!(FillStats::default().avg_px(), None);
+    }
+
+    #[test]
+    fn prior_notional_counts_toward_the_cap_without_polluting_process_average() {
+        let mut s = FillStats::with_prior_notional(dec!(80));
+        s.add(dec!(2), dec!(10));
+
+        assert_eq!(s.cumulative_notional(), dec!(100));
+        assert_eq!(
+            s.avg_px(),
+            Some(dec!(10)),
+            "the continuation report covers this process's fills only"
+        );
     }
 
     #[test]
@@ -4583,6 +4649,40 @@ mod loop_tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn short_ambiguous_fill_without_average_price_stops_before_another_order() {
+        let api = ScriptedApi::new()
+            .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+            .push_place(Err(HlError::Network("operation timed out".into())))
+            .push_status(Ok(Some(status_full(
+                dec!(5),
+                None,
+                "filled",
+                OrderId(77),
+                None,
+                "HYPE",
+                "A",
+            ))));
+
+        let mut p = plan(false);
+        p.side = Side::Short;
+        p.slices = 2;
+        p.per_slice = dec!(5);
+        p.total_adjusted = dec!(10);
+        p.total_requested = dec!(10);
+
+        let report = run_twap(&api, &p).await;
+
+        assert_eq!(
+            api.place_count(),
+            1,
+            "an unbounded short fill must stop the run before another order"
+        );
+        let reason = report.abort_reason.expect("missing short avgPx must abort");
+        assert!(reason.contains("sell limit"), "{reason}");
+        assert!(reason.contains("USD cap"), "{reason}");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn w1_unknown_oid_means_hl_never_got_it_so_a_fresh_nonce_resend_is_safe() {
         // The POST failed BEFORE HL saw it. Issue #7's tightened policy
         // requires >= 3 CONSECUTIVE unknownOid observations spanning >= 2s
@@ -5291,6 +5391,48 @@ mod loop_tests {
         assert_eq!(report.filled, dec!(200));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn resumed_run_counts_prior_process_notional_toward_the_cap() {
+        // This continuation only has one 1-coin order left. Taken alone its
+        // ~$100.2 notional is below the $150 cap, but the prior process
+        // already consumed $60 of the same logical run's envelope. The new
+        // order must therefore be rejected before /exchange (60 + 100.2 >
+        // 150), rather than treating resume as a fresh cap.
+        let mut resumed_plan = plan_with_cap(Side::Long, dec!(1), dec!(150));
+        resumed_plan.total_adjusted = dec!(1);
+        resumed_plan.total_requested = dec!(2);
+        let api = ScriptedApi::new().with_default_book(book_at(dec!(99.8), dec!(100)));
+
+        let report =
+            run_twap_journaled_with_prior_notional(&api, &resumed_plan, dec!(60), None, None).await;
+
+        assert_eq!(api.place_count(), 0, "must reject before /exchange");
+        let reason = report.abort_reason.expect("must abort on cumulative cap");
+        assert!(reason.contains("cumulative 60"), "{reason}");
+        assert!(reason.contains("this order 100.2"), "{reason}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resumed_run_with_an_exhausted_cap_stops_before_any_api_call() {
+        let resumed_plan = plan_with_cap(Side::Long, dec!(1), dec!(150));
+        let api = ScriptedApi::new();
+
+        let report =
+            run_twap_journaled_with_prior_notional(&api, &resumed_plan, dec!(150), None, None)
+                .await;
+
+        assert!(
+            api.calls().is_empty(),
+            "must stop before even fetching a book"
+        );
+        let reason = report.abort_reason.expect("must reject an exhausted cap");
+        assert!(
+            reason.contains("prior fills already consumed 150"),
+            "{reason}"
+        );
+        assert!(reason.contains("no headroom remains"), "{reason}");
+    }
+
     // === Issue #3: non-positive limit price rejected unconditionally ===
     //
     // slippage_bps at/above SLIPPAGE_HARD_CAP_BPS would already be rejected
@@ -5479,6 +5621,38 @@ mod loop_tests {
                 })
                 .collect();
             assert_eq!(places, vec![dec!(5), dec!(10)]);
+        }
+
+        /// Issue #12: the cap gate must use the catch-up size returned by
+        /// `decide_slice`, not the nominal `per_slice`. After slice 1's ALO
+        /// reject, slice 2 wants the full 10-coin shortfall: ~$499 at the
+        /// touch. A $300 cap admits one nominal 5-coin slice (~$249.50) but
+        /// must reject the expanded catch-up order before it is sent.
+        #[tokio::test(start_paused = true)]
+        async fn catch_up_order_uses_its_expanded_size_for_the_notional_cap() {
+            let mut p = plan_passive(false);
+            p.slices = 2;
+            p.duration = Duration::from_secs(120);
+            p.per_slice = dec!(5);
+            p.total_adjusted = dec!(10);
+            p.total_requested = dec!(10);
+            p.max_notional_usd = dec!(300);
+
+            let api = ScriptedApi::new()
+                .with_default_book(book_at(dec!(49.9), dec!(50.1)))
+                .push_place(alo_rejected());
+
+            let report = run_twap(&api, &p).await;
+
+            assert_eq!(
+                api.place_count(),
+                1,
+                "only the rejected slice-1 attempt may reach /exchange; the \
+                 10-coin catch-up must be blocked before a second send"
+            );
+            let reason = report.abort_reason.expect("catch-up must breach the cap");
+            assert!(reason.contains("this order 499"), "{reason}");
+            assert!(reason.contains("notional"), "{reason}");
         }
 
         /// **Finding 2 (Important) regression test.** The old classifier
@@ -6207,6 +6381,51 @@ mod loop_tests {
             );
         }
 
+        /// A resumed follow run must carry its prior process's notional into
+        /// the mid-slice re-quote gate too. Without that offset, the new
+        /// $599 order would fit under this $650 cap in isolation even though
+        /// the logical run has already consumed $100.
+        #[tokio::test(start_paused = true)]
+        async fn resumed_notional_counts_toward_follow_requote_cap() {
+            let mut p = base_follow_plan();
+            p.duration = Duration::from_secs(20);
+            p.follow_poll_secs = 2;
+            p.follow_repost_secs = 2;
+            p.follow_threshold_bps = dec!(1.0);
+            p.max_notional_usd = dec!(650);
+
+            let api = ScriptedApi::new()
+                // Initial 10 @ 49.9 = 499; with the prior $100 this fits.
+                .push_book(Ok(book_at(dec!(49.9), dec!(50.1))))
+                .push_place(resting(1))
+                // Re-quote 10 @ 59.9 = 599; prior + order = 699, so it must
+                // be stopped before a second /exchange call.
+                .push_book(Ok(book_at(dec!(59.9), dec!(60.1))))
+                .push_cancel(Ok(()))
+                .push_status(Ok(Some(status_full(
+                    dec!(0),
+                    None,
+                    "canceled",
+                    OrderId(1),
+                    None,
+                    "HYPE",
+                    "B",
+                ))));
+
+            let report =
+                run_twap_journaled_with_prior_notional(&api, &p, dec!(100), None, None).await;
+
+            let reason = report
+                .abort_reason
+                .expect("must abort on logical-run notional cap breach");
+            assert!(reason.contains("cumulative 100"), "{reason}");
+            assert_eq!(
+                api.place_count(),
+                1,
+                "the resumed run's capped repost must never be sent"
+            );
+        }
+
         /// 8) A partial fill from a touch-through settle leaves a remainder
         /// below min notional -> follow pauses re-quoting for the rest of
         /// THIS slice; the shortfall is carried forward and the NEXT
@@ -6506,6 +6725,7 @@ mod loop_tests {
                         side: Side::Long,
                         px: "49.9".into(),
                         sz: "10".into(),
+                        tif: None,
                     })
                     .unwrap();
                 journal
@@ -6536,6 +6756,7 @@ mod loop_tests {
                         side: Side::Long,
                         px: "50.4".into(),
                         sz: "7".into(),
+                        tif: None,
                     })
                     .unwrap();
                 journal
@@ -6566,6 +6787,7 @@ mod loop_tests {
                         side: Side::Long,
                         px: "50.4".into(),
                         sz: "3".into(),
+                        tif: None,
                     })
                     .unwrap();
                 journal
@@ -6631,6 +6853,7 @@ mod loop_tests {
                 side: Side::Long,
                 px: dec!(50.4),
                 sz: dec!(3),
+                tif: None,
             };
             reconcile_unresolved_cloid(
                 &reconcile_api,
@@ -6919,6 +7142,7 @@ mod loop_tests {
                     side: Side::Long,
                     px: "50".into(),
                     sz: "5".into(),
+                    tif: None,
                 })
                 .unwrap();
             journal
@@ -7247,6 +7471,7 @@ mod loop_tests {
                         side: Side::Long,
                         px: "49.9".into(),
                         sz: "3".into(),
+                        tif: None,
                     })
                     .unwrap();
                 journal
@@ -7316,6 +7541,7 @@ mod loop_tests {
                 side: Side::Long,
                 px: dec!(49.9),
                 sz: dec!(3),
+                tif: None,
             };
             reconcile_unresolved_cloid(
                 &reconcile_api,
@@ -7462,6 +7688,7 @@ mod loop_tests {
                         side: Side::Long,
                         px: "49.9".into(),
                         sz: "3".into(),
+                        tif: None,
                     })
                     .unwrap();
                 journal
@@ -7506,6 +7733,7 @@ mod loop_tests {
                 side: Side::Long,
                 px: dec!(49.9),
                 sz: dec!(3),
+                tif: None,
             };
             let err = reconcile_unresolved_cloid(&api, &p, cloid, 1, &prepared, &mut journal)
                 .await
@@ -7552,6 +7780,7 @@ mod loop_tests {
                         side: Side::Long,
                         px: "49.9".into(),
                         sz: "3".into(),
+                        tif: None,
                     })
                     .unwrap();
                 journal
@@ -7586,6 +7815,7 @@ mod loop_tests {
                 side: Side::Long,
                 px: dec!(49.9),
                 sz: dec!(3),
+                tif: None,
             };
             let err = reconcile_unresolved_cloid(&api, &p, cloid, 1, &prepared, &mut journal)
                 .await
@@ -7734,6 +7964,7 @@ mod loop_tests {
                         side: Side::Long,
                         px: "49.9".into(),
                         sz: "3".into(),
+                        tif: None,
                     })
                     .unwrap();
                 journal
@@ -7800,6 +8031,7 @@ mod loop_tests {
                 side: Side::Long,
                 px: dec!(49.9),
                 sz: dec!(3),
+                tif: None,
             };
             reconcile_unresolved_cloid(
                 &reconcile_api,
@@ -7903,6 +8135,7 @@ mod loop_tests {
                         side: Side::Long,
                         px: "49.9".into(),
                         sz: "3".into(),
+                        tif: None,
                     })
                     .unwrap();
                 journal
@@ -7960,6 +8193,7 @@ mod loop_tests {
                 side: Side::Long,
                 px: dec!(49.9),
                 sz: dec!(3),
+                tif: None,
             };
             reconcile_unresolved_cloid(
                 &reconcile_api,
@@ -8016,6 +8250,7 @@ mod loop_tests {
                     side: Side::Long,
                     px: "50".into(),
                     sz: "5".into(),
+                    tif: None,
                 },
                 JournalRecord::Terminal {
                     slice_idx: 1,

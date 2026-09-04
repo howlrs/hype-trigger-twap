@@ -208,12 +208,13 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     allow_high_slippage: bool,
 
-    /// REQUIRED in live mode (`--read-only false`): the maximum USD notional
-    /// any single slice may target. `--usd` is checked as the requested
-    /// notional; `--size` is checked via a freshly computed conservative
-    /// limit price. Re-checked before EVERY slice against that slice's
-    /// actual order price. Not required in read-only mode (Issue #3,
-    /// breaking change for live users — see docs/USAGE.md).
+    /// REQUIRED in live mode (`--read-only false`): the maximum cumulative
+    /// USD notional for the entire logical run, including prior fills after
+    /// `--resume`. `--usd` is checked as the requested notional; `--size` via
+    /// a freshly computed conservative limit price. Before every order, the
+    /// already-filled notional plus the exact (catch-up-aware) order size at
+    /// its actual limit price is re-checked. Not required in read-only mode
+    /// (Issue #3, breaking change for live users — see docs/USAGE.md).
     #[arg(long)]
     max_notional_usd: Option<Decimal>,
 
@@ -1041,6 +1042,10 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     // never re-executes the full original plan on top of fills the prior
     // process already made.
     let mut already_filled: Option<Decimal> = None;
+    // The notional counterpart to `already_filled`. Unlike the continuation
+    // plan's size target, the risk envelope is scoped to the entire logical
+    // run, so this offset must survive a process boundary on `--resume`.
+    let mut prior_filled_notional = Decimal::ZERO;
 
     let mut journal = if cli.read_only {
         None
@@ -1070,7 +1075,14 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         // every record it writes) — so this replay already includes every
         // cloid's resolved Terminal outcome, not just what the prior
         // (crashed) process itself observed.
-        already_filled = Some(hype_trigger_twap::journal::summarize(&records).total_filled());
+        let restored = hype_trigger_twap::journal::restore_fill_totals(&records).map_err(|e| {
+            format!(
+                "--resume {resume_id}: failed to restore prior fill accounting from the journal: \
+                 {e}; refusing to continue because the notional cap cannot be enforced safely"
+            )
+        })?;
+        already_filled = Some(restored.filled_sz);
+        prior_filled_notional = restored.notional;
         Some(
             hype_trigger_twap::journal::ExecutionJournal::open_existing(
                 &resolved_state_dir,
@@ -1180,6 +1192,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
             };
             tracing::info!(
                 already_filled = %human(filled),
+                prior_filled_notional = %human(prior_filled_notional),
                 original_total = %human(original_plan.total_adjusted),
                 remaining = %human(remaining),
                 continuation_slices,
@@ -1242,9 +1255,10 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         }))
     };
 
-    let run_fut = hype_trigger_twap::twap::run_twap_journaled(
+    let run_fut = hype_trigger_twap::twap::run_twap_journaled_with_prior_notional(
         &client,
         &plan,
+        prior_filled_notional,
         journal.as_mut(),
         Some(shutdown_signal),
     );
@@ -1418,6 +1432,7 @@ async fn reconcile_incomplete_run(
                 cloid,
                 symbol,
                 side,
+                tif,
                 px,
                 sz,
                 ..
@@ -1429,6 +1444,7 @@ async fn reconcile_incomplete_run(
                     hype_trigger_twap::twap::PreparedIntent {
                         symbol: symbol.clone(),
                         side: *side,
+                        tif: *tif,
                         px,
                         sz,
                     },
@@ -2422,6 +2438,7 @@ mod tests {
             side: hype_trigger_twap::types::Side::Long,
             px: "50".into(),
             sz: "3".into(),
+            tif: None,
         })
         .unwrap();
         j.record(&hype_trigger_twap::journal::JournalRecord::Terminal {
@@ -2440,6 +2457,7 @@ mod tests {
             side: hype_trigger_twap::types::Side::Long,
             px: "50".into(),
             sz: "2".into(),
+            tif: None,
         })
         .unwrap();
         j.record(
@@ -2984,6 +3002,7 @@ mod tests {
                 side: hype_trigger_twap::types::Side::Long,
                 px: "50".into(),
                 sz: "1".into(),
+                tif: None,
             })
             .unwrap();
             j.record(
@@ -3161,6 +3180,7 @@ mod tests {
                 side: hype_trigger_twap::types::Side::Long,
                 px: "50".into(),
                 sz: "1".into(),
+                tif: None,
             })
             .unwrap();
             j.record(
@@ -3346,6 +3366,7 @@ mod tests {
                 side: hype_trigger_twap::types::Side::Long,
                 px: "50".into(),
                 sz: "1".into(),
+                tif: None,
             })
             .unwrap();
             j.record(&hype_trigger_twap::journal::JournalRecord::Terminal {
@@ -3364,6 +3385,7 @@ mod tests {
                 side: hype_trigger_twap::types::Side::Long,
                 px: "50".into(),
                 sz: "1".into(),
+                tif: None,
             })
             .unwrap();
             j.record(
@@ -3535,6 +3557,7 @@ mod tests {
                 side: hype_trigger_twap::types::Side::Long,
                 px: "50".into(),
                 sz: "1".into(),
+                tif: None,
             })
             .unwrap();
             j.record(
@@ -3624,6 +3647,7 @@ mod tests {
                 side: hype_trigger_twap::types::Side::Long,
                 px: "50".into(),
                 sz: "1".into(),
+                tif: None,
             })
             .unwrap();
             j.record(

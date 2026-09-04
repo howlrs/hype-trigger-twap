@@ -33,7 +33,8 @@ Go live, starting immediately:
 
 ```bash
 export HL_AGENT_PK=0x<64 hex>
-hype-twap --symbol HYPE --side long --usd 1500 --duration 30m --read-only false
+hype-twap --symbol HYPE --side long --usd 1500 --duration 30m \
+  --max-notional-usd 2000 --read-only false
 ```
 
 Wait for HYPE to reach $40 before starting, but give up waiting after 2 hours
@@ -41,14 +42,16 @@ and start anyway:
 
 ```bash
 hype-twap --symbol HYPE --side long --size 50 --duration 1h \
-  --trigger-price 40 --trigger-when above --start-after 2h --read-only false
+  --trigger-price 40 --trigger-when above --start-after 2h \
+  --max-notional-usd 3000 --read-only false
 ```
 
 Sell into a falling market, in 20 slices over 2 hours, on testnet:
 
 ```bash
 hype-twap --symbol ETH --side short --usd 5000 --duration 2h --slices 20 \
-  --trigger-price 3000 --trigger-when below --network testnet --read-only false
+  --trigger-price 3000 --trigger-when below --network testnet \
+  --max-notional-usd 6000 --read-only false
 ```
 
 ## How this compares to Hyperliquid's built-in TWAP
@@ -108,7 +111,7 @@ append-only record of everything that was sent.
 | `--follow-poll-secs` | u64 | `2` | `--child-algo follow` only: seconds between book polls inside a slice's follow loop. Ignored (with a warning) by other child algos. |
 | `--follow-repost-secs` | u64 | `10` | `--child-algo follow` only: minimum seconds between reposts of the resting order within one slice, counted from that slice's last place. Ignored (with a warning) by other child algos. |
 | `--follow-threshold-bps` | decimal | `1.0` | `--child-algo follow` only: minimum relative distance (bps) the touch must move away from the resting price before a repost is worth burning queue priority for. Ignored (with a warning) by other child algos. |
-| `--max-notional-usd` | decimal (USD) | none | **MANDATORY when `--read-only false`** (breaking change from 0.1.0). The maximum USD notional any single slice may target; re-checked before every slice as a cumulative run-level envelope (already-filled notional + this slice's notional), never per-slice in isolation. Not required in read-only mode. |
+| `--max-notional-usd` | decimal (USD) | none | **MANDATORY when `--read-only false`** (breaking change from 0.1.0). Maximum cumulative USD notional for the entire logical run. Before every order, all prior fills (including fills restored by `--resume`) plus the exact, catch-up-aware order size at its current limit price are checked against the cap. An order that would exceed the cap is not resized: the run hard-stops before sending it. Not required in read-only mode. |
 | `--allow-high-slippage` | bool | `false` | Unsafe override: allow `--slippage-bps` above the 1000 bps warn threshold. Does **not** lift the unconditional ≥10000 bps hard cap or the non-positive-limit-price rejection. |
 | `--allow-custom-endpoints` | bool | `false` | Unsafe override: allow `HL_INFO_URL` / `HL_EXCHANGE_URL` to be overridden in **live** mode. The override URL must be `https://` unless it is loopback (`127.0.0.1`/`localhost`, no userinfo) — used only by the test seam. Has no effect in read-only mode. |
 | `--wait-network-grace` | humantime | `30m` | How long a consecutive trigger-poll failure streak (network error or empty book) may run before the wait hard-stops. Timed from the first failure in the streak, resets on any successful poll. |

@@ -601,12 +601,12 @@ fn normalise_status(s: &str) -> String {
 ///   0.2 HYPE @ 62.008 that filled, whose `orderStatus` response was
 ///   `{"status":"order","order":{"order":{...,"origSz":"0.2","sz":"0.0",
 ///   ...no "avgPx" key anywhere...},"status":"filled",...}}`. Every caller
-///   of `try_from_status` credits a `None` `avg_px` at the RESTING/INTENT
-///   order's own signed limit price (`vf.avg_px.unwrap_or(intent.px)` /
-///   `.unwrap_or(resting.px)`), and that fallback is exact, not an estimate:
-///   HL always fills a resting maker (ALO/post-only) order at that order's
-///   own limit price — a maker fill cannot execute at any other price, so
-///   the limit price IS the fill price whenever HL declines to echo it back.
+///   A missing price is usable only when its signed limit is a safe upper
+///   bound: for LONG orders it conservatively overstates (or equals) the
+///   fill notional, while a resting ALO maker fills at its own price on
+///   either side. A SHORT IOC/GTC limit is only a lower bound on its fill
+///   price, so accepting it would understate the run-level USD cap; that
+///   combination is rejected rather than guessed.
 ///
 /// Checks applied by both paths (all must hold):
 /// - `0 <= filled <= intent.sz` — an overfill is a hard error, NEVER clamped.
@@ -627,8 +627,8 @@ pub struct ValidatedFill {
     /// `try_from_status` only — when `filled_sz > 0` but the real
     /// `orderStatus` response simply omitted `avgPx` (normal; see the
     /// type-level doc comment). Every caller must fall back to the
-    /// resting/intent limit price in that case; `try_from_place` never
-    /// produces `avg_px: None` for a nonzero fill.
+    /// resting/intent limit price when that is a safe upper bound;
+    /// `try_from_place` never produces `avg_px: None` for a nonzero fill.
     pub avg_px: Option<Decimal>,
 }
 
@@ -679,17 +679,26 @@ impl ValidatedFill {
                     )));
                 }
                 (None, AvgPxRequirement::Optional) => {
-                    // Normal for a real orderStatus response (HL never sends
-                    // avgPx on this shape) — the caller is responsible for
-                    // crediting at the resting/intent limit price. See
-                    // ValidatedFill's doc comment for why that fallback is
-                    // exact, not an estimate.
+                    if intent.side == crate::types::Side::Short
+                        && intent.tif != crate::types::Tif::Alo
+                    {
+                        return Err(HlError::InvalidResponse(format!(
+                            "fill validation: short {:?} orderStatus reports filled_sz \
+                             {filled_sz} but no avgPx (cloid {}); its sell limit {} is only a \
+                             lower bound on fill notional, so the USD cap cannot be accounted \
+                             safely",
+                            intent.tif, intent.cloid, intent.px
+                        )));
+                    }
+                    // Normal for a real orderStatus response. A Long limit
+                    // is a conservative upper bound; an ALO maker's own
+                    // resting price is exact on either side.
                     tracing::info!(
                         cloid = %intent.cloid,
                         filled_sz = %filled_sz,
                         limit_px = %intent.px,
-                        "orderStatus carried no avgPx (normal for HL); crediting at the \
-                         resting limit price"
+                        "orderStatus carried no avgPx (normal for HL); using the safe \
+                         intent-price bound"
                     );
                     return Ok(ValidatedFill {
                         filled_sz,
@@ -749,8 +758,10 @@ impl ValidatedFill {
     /// Validate an `/info orderStatus` snapshot against the intent that
     /// produced the order it describes. A real orderStatus response never
     /// carries `avgPx` (see [`ValidatedFill`]'s doc comment), so
-    /// `filled_sz > 0` with no `avgPx` is accepted here as a normal
-    /// outcome — the caller must credit at the resting/intent limit price.
+    /// `filled_sz > 0` with no `avgPx` is accepted only when the intent price
+    /// is a safe upper bound (Long, or a resting ALO maker). Short IOC/GTC
+    /// fills without a price are rejected because their limit is a lower
+    /// bound and could weaken cumulative USD-cap accounting.
     pub fn try_from_status(fill: &OrderStatusFill, intent: &OrderIntent) -> Result<Self, HlError> {
         Self::validate(
             fill.filled_sz,
@@ -1747,6 +1758,31 @@ mod tests {
         // limit price.
         let i = intent(crate::types::Side::Long, dec!(50), dec!(10));
         let vf = ValidatedFill::validate(dec!(5), None, &i, AvgPxRequirement::Optional).unwrap();
+        assert_eq!(vf.filled_sz, dec!(5));
+        assert_eq!(vf.avg_px, None);
+    }
+
+    #[test]
+    fn validated_fill_rejects_short_ioc_without_average_price() {
+        let i = intent(crate::types::Side::Short, dec!(50), dec!(10));
+        let err =
+            ValidatedFill::validate(dec!(5), None, &i, AvgPxRequirement::Optional).unwrap_err();
+        match err {
+            HlError::InvalidResponse(msg) => {
+                assert!(msg.contains("sell limit"), "{msg}");
+                assert!(msg.contains("USD cap"), "{msg}");
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validated_fill_accepts_short_alo_without_average_price() {
+        let mut i = intent(crate::types::Side::Short, dec!(50), dec!(10));
+        i.tif = crate::types::Tif::Alo;
+
+        let vf = ValidatedFill::validate(dec!(5), None, &i, AvgPxRequirement::Optional).unwrap();
+
         assert_eq!(vf.filled_sz, dec!(5));
         assert_eq!(vf.avg_px, None);
     }
