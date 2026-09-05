@@ -8,14 +8,20 @@ It waits for a price and/or time trigger, then works a target quantity into the
 market as evenly-spaced IOC (taker) slices, catching up whenever a slice
 under-fills.
 
-**Read-only is the default.** You must pass `--read-only false` before a single
-order can be sent.
+**Read-only is the default.** Pass `--live` to enable order submission. The
+legacy `--read-only false` spelling remains a warning-emitting compatibility
+alias in 0.1.x. New or resumed mainnet order execution is rejected at runtime
+until Issue #16 is complete; mainnet read-only remains available. The
+reconciliation-only `--abandon-incomplete-run` path remains available for
+closing an older incomplete mainnet journal without placing a new order.
 
 > **Mainnet live is currently blocked by Issue #16.** Public testnet response
 > conformance has passed, but funded market/passive, ALO-rejection, and cancel
 > `expiresAfter: null` checks are still outstanding. Every live example below
 > therefore selects `--network testnet`; do not remove it until that checklist
 > is completed and documented.
+> Existing incomplete mainnet journals are the sole exception: use
+> `--abandon-incomplete-run` to reconcile/cancel outstanding children and stop.
 
 > 日本語のドキュメントは [`docs/`](docs/README.md) にあります
 > ([使い方](docs/USAGE.md) / [仕組み](docs/DESIGN.md) /
@@ -42,7 +48,7 @@ Place a funded-testnet smoke order, starting immediately:
 ```bash
 export HL_AGENT_PK=0x<64 hex>
 hype-twap --symbol HYPE --side long --usd 1500 --duration 30m \
-  --network testnet --max-notional-usd 2000 --read-only false
+  --network testnet --max-notional-usd 2000 --live
 ```
 
 Wait for HYPE to reach $40 before starting, but give up waiting after 2 hours
@@ -51,7 +57,7 @@ and start anyway:
 ```bash
 hype-twap --symbol HYPE --side long --size 50 --duration 1h \
   --trigger-price 40 --trigger-when above --start-after 2h \
-  --network testnet --max-notional-usd 3000 --read-only false
+  --network testnet --max-notional-usd 3000 --live
 ```
 
 Sell into a falling market, in 20 slices over 2 hours, on testnet:
@@ -59,7 +65,7 @@ Sell into a falling market, in 20 slices over 2 hours, on testnet:
 ```bash
 hype-twap --symbol ETH --side short --usd 5000 --duration 2h --slices 20 \
   --trigger-price 3000 --trigger-when below --network testnet \
-  --max-notional-usd 6000 --read-only false
+  --max-notional-usd 6000 --live
 ```
 
 ## How this compares to Hyperliquid's built-in TWAP
@@ -109,9 +115,10 @@ append-only record of everything that was sent.
 | `--trigger-price` | decimal | none | Price threshold. Requires `--trigger-when`. |
 | `--trigger-when` | `above` \| `below` | none | `above`: fire when `mid >= price`. `below`: fire when `mid <= price`. Never inferred — omitting it with `--trigger-price` is an error. |
 | `--start-after` | humantime | none | Also fire after this much time. OR'd with the price trigger. |
-| `--read-only` | `true` \| `false` | **`true`** | `true` signs nothing and sends nothing. |
+| `--read-only` | `true` \| `false` | **`true`** | `true` signs nothing and sends nothing. `false` remains a deprecated 0.1.x compatibility alias for `--live`. |
+| `--live` | flag | `false` | Enable live order submission. Testnet live is permitted; new/resumed mainnet execution is rejected until Issue #16 is complete. Mainnet `--abandon-incomplete-run` remains recovery-only and never places a new order. |
 | `--event-jsonl` | path | none | Optional schema-versioned lifecycle event stream for a read-only simulation. It writes only the explicit path and does not create or use the live state directory. Live runs always use their run-directory `events.jsonl` sidecar. |
-| `--network` | `mainnet` \| `testnet` | `mainnet` | Sets the API URLs *and* the EIP-712 `Agent.source` domain together. |
+| `--network` | `mainnet` \| `testnet` | `mainnet` | Sets the default API URLs and the EIP-712 `Agent.source` domain together. An override naming the known official origin for the opposite network is rejected. |
 | `--slippage-bps` | decimal | `20` | Cushion on the IOC limit price. |
 | `--max-book-age-ms` | u64 | `3000` | Reject a book snapshot older than this. `0` disables ONLY the max-age check — every book (trigger polls, pre-flight, each slice) still has to pass semantic validation (matching symbol, positive prices/sizes, uncrossed and correctly-ordered levels) and a fixed 2s future-timestamp tolerance, unconditionally. |
 | `--settle-retries` | u32 | `25` | Maximum `orderStatus` polls after cancelling a known resting child. Can also be set with `HL_SETTLE_RETRIES`; this changes only the cancel/settle patience budget, never ambiguous-place resend policy. After the budget, an acknowledged cancel may use strictly identity-checked `userFillsByTime` rows; uncertainty still hard-stops. |
@@ -121,13 +128,13 @@ append-only record of everything that was sent.
 | `--follow-poll-secs` | u64 | `2` | `--child-algo follow` only: seconds between book polls inside a slice's follow loop. Ignored (with a warning) by other child algos. |
 | `--follow-repost-secs` | u64 | `10` | `--child-algo follow` only: minimum seconds between reposts of the resting order within one slice, counted from that slice's last place. Ignored (with a warning) by other child algos. |
 | `--follow-threshold-bps` | decimal | `1.0` | `--child-algo follow` only: minimum relative distance (bps) the touch must move away from the resting price before a repost is worth burning queue priority for. Ignored (with a warning) by other child algos. |
-| `--max-notional-usd` | decimal (USD) | none | **MANDATORY when `--read-only false`** (breaking change from 0.1.0). Maximum cumulative USD notional for the entire logical run. Before every order, all prior fills (including fills restored by `--resume`) plus the exact, catch-up-aware order size at its current limit price are checked against the cap. An order that would exceed the cap is not resized: the run hard-stops before sending it. Not required in read-only mode. |
+| `--max-notional-usd` | decimal (USD) | none | **MANDATORY in live mode** (`--live`; legacy `--read-only false`). Maximum cumulative USD notional for the entire logical run. Before every order, all prior fills (including fills restored by `--resume`) plus the exact, catch-up-aware order size at its current limit price are checked against the cap. An order that would exceed the cap is not resized: the run hard-stops before sending it. Not required in read-only mode. |
 | `--allow-high-slippage` | bool | `false` | Unsafe override: allow `--slippage-bps` above the 1000 bps warn threshold. Does **not** lift the unconditional ≥10000 bps hard cap or the non-positive-limit-price rejection. |
-| `--allow-custom-endpoints` | bool | `false` | Unsafe override: allow `HL_INFO_URL` / `HL_EXCHANGE_URL` to be overridden in **live** mode. The override URL must be `https://` unless it is loopback (`127.0.0.1`/`localhost`, no userinfo) — used only by the test seam. Has no effect in read-only mode. |
+| `--allow-custom-endpoints` | bool | `false` | Unsafe override: allow `HL_INFO_URL` / `HL_EXCHANGE_URL` to be overridden in **live** mode. The override URL must be `https://` unless it is loopback (`127.0.0.1`/`localhost`, no userinfo) — used only by the test seam. A known official mainnet/testnet origin must match `--network`. Has no effect in read-only mode. |
 | `--wait-network-grace` | humantime | `30m` | How long a consecutive trigger-poll failure streak (network error or empty book) may run before the wait hard-stops. Timed from the first failure in the streak, resets on any successful poll. |
 | `--state-dir` | path | `$XDG_STATE_HOME/hype-twap` or `~/.local/state/hype-twap` | Root directory for run-state persistence (journal/lock/nonce-HWM). A read-only run never touches this. |
-| `--resume` | string (run id) | none | Resume a specific incomplete run by its run id. Live use requires `--master-address` or `HL_MASTER_ADDRESS`, allowing network/agent/master/symbol/side identity validation before any external API call. Every submitted/unknown cloid is then reconciled via `orderStatus`. Mutually exclusive with `--abandon-incomplete-run`. |
-| `--abandon-incomplete-run` | bool | `false` | Force-reconcile the incomplete run detected for this network+agent and mark it abandoned, WITHOUT continuing it. Also requires an explicit master address for the pre-network identity check. |
+| `--resume` | string (run id) | none | Resume a specific incomplete run by its run id. Live use requires `--master-address` or `HL_MASTER_ADDRESS`, allowing network/agent/master/symbol/side identity validation before any external API call. Every submitted/unknown cloid is then reconciled via `orderStatus`. Mainnet resume is blocked while Issue #16 is open; use the recovery-only abandon path instead. Mutually exclusive with `--abandon-incomplete-run`. |
+| `--abandon-incomplete-run` | bool | `false` | Force-reconcile the incomplete run detected for this network+agent and mark it abandoned, WITHOUT continuing it or placing a new order. Also requires an explicit master address for the pre-network identity check. This recovery-only path remains available for pre-gate mainnet journals. |
 | `--shutdown-grace` | humantime | `60s` | How long a SIGINT/SIGTERM shutdown may spend reconciling in-flight orders, cancelling confirmed resting ones, and completing position-phase/final verification before giving up. |
 
 ### Journal inspection
@@ -156,7 +163,7 @@ on stderr.
 
 | Variable | Required | Meaning |
 |---|---|---|
-| `HL_AGENT_PK` | only when `--read-only false` | `0x` + 64 hex. **Never accepted as a flag** so it cannot land in shell history or `ps` output. Held in a `secrecy::SecretString` and never logged — not even in error messages or `Debug` output. |
+| `HL_AGENT_PK` | only when `--live` (or legacy `--read-only false`) | `0x` + 64 hex. **Never accepted as a flag** so it cannot land in shell history or `ps` output. Held in a `secrecy::SecretString` and never logged — not even in error messages or `Debug` output. |
 | `HL_AGENT_ADDRESS` | optional | The **Agent** (API wallet) address — *not* your master account. If set, it is checked against the address derived from `HL_AGENT_PK` and the process refuses to start on a mismatch. |
 | `HL_MASTER_ADDRESS` | required for live resume/abandon | The **master** account your agent belongs to. A new live run discovers this automatically, but `--resume` / `--abandon-incomplete-run` require it (or `--master-address`) so the journal identity can be rejected before any external API call. It is always cross-checked against Hyperliquid's `userRole` response. |
 | `HL_INFO_URL` | optional | Override the `/info` endpoint. |

@@ -29,7 +29,7 @@ CI の必須チェック名は `rust (1.91)`, `rust (stable)`, `shellcheck` で�
 | ファイル | 役割 |
 |---|---|---|
 | `src/twap.rs` | スライスループ、サイジング、キャッチアップ、約定照合 (`ValidatedFill` 経由)、W1 unknownOid 安全再送ポリシー、`ExecutionDeadline` / `expiresAfter` / クロックずれ検証 (Issue #2)、板取得を残り期限でタイムアウトするラッパー (Issue #2 Finding 2)、市場/passive 両アルゴリズムのスライス送信・累積 notional cap 再検証・ジャーナル連携、レポート |
-| `src/main.rs` | CLI 定義 (clap)、起動シーケンス、トリガー発火直後のクロックずれ検証、ロック/ジャーナル取得、`--resume` / `--abandon-incomplete-run` の再照合、position-aware phase、最終 report、終了コード |
+| `src/main.rs` | CLI 定義 (clap)、`--live` / mainnet release gate、起動シーケンス、トリガー発火直後のクロックずれ検証、ロック/ジャーナル取得、`--resume` / `--abandon-incomplete-run` の再照合、position-aware phase、最終 report、終了コード |
 | `src/client.rs` | Hyperliquid REST クライアント (`/info`, `/exchange`)、応答解析、再試行方針、板/position/userFills/orderStatus の検証境界、redirect拒否、`expiresAfter` の署名・送信 |
 | `src/journal.rs` | クラッシュセーフな実行ジャーナル — durable JSONL追記、version付きtyped fingerprint、検証済み状態機械、未完了run検出、resume/reconciliation/accountingの共通 replay |
 | `src/trigger.rs` | 価格・時間トリガーの待機ループ (`&dyn HlApi` シーム、`ValidatedMarketSnapshot` 検証込み) |
@@ -58,6 +58,7 @@ CI の必須チェック名は `rust (1.91)`, `rust (stable)`, `shellcheck` で�
 | `tests/signing_cross_check.rs` | Hyperliquid Python SDK 由来の署名フィクスチャに対する署名検証 |
 | `tests/status_vocabulary_conformance.rs` | **すべて `#[ignore]`** — 実 Hyperliquid API に対する orderStatus / meta の疎通・形状スモークテスト |
 | `tests/runs_cli_integration.rs` | `hype-twap-runs` のpure JSON stdout、typed error、list/inspect/verify |
+| `tests/live_mode_cli.rs` | `hype-twap` の `--live` / 旧alias、mainnet fail-closed、stdout/stderr分離の黒箱契約 |
 | `tests/scripts_integration.sh` | pair launcher/watchdog の環境分離、barrier、manifest、PID identity、signal、lifecycle契約 |
 
 ## 署名コアの扱い (重要)

@@ -42,9 +42,10 @@ const RETRY_BACKOFF: [Duration; 3] = [
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Which HL network to talk to. Drives both the base URLs and the EIP-712
-/// `Agent.source` field ("a" mainnet / "b" testnet) — these MUST stay in sync,
-/// so they are derived from the same value.
+/// Which HL network to talk to. Drives both the default base URLs and the
+/// EIP-712 `Agent.source` field ("a" mainnet / "b" testnet). The CLI risk
+/// boundary rejects a known official override for the opposite network before
+/// constructing a client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Network {
     Mainnet,

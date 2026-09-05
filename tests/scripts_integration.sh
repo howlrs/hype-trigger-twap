@@ -46,7 +46,7 @@ mkdir "$HOME"
 fake="$tmp/hype-twap"
 log="$tmp/calls"
 fake_runs="$tmp/hype-twap-runs"
-printf '%s\n' '#!/usr/bin/env bash' 'env | sort >>"$TMPDIR/calls"' 'tr "\0" "\n" <"/proc/$$/cmdline" | sed "s/^/CMDLINE:/" >>"$TMPDIR/calls"' "printf '%s\\n' -- >>\"\$TMPDIR/calls\"" 'printf "%s\n" "$@" >>"$TMPDIR/calls"' 'ready=' 'rid=' 'sd=' 'symbol=' 'side=' 'ro=true' 'for arg in "$@"; do [ "$arg" = FAIL ] && exit 1; done' 'while (($#)); do case "$1" in --pair-ready-file) ready="$2"; shift 2 ;; --pair-run-id) rid="$2"; shift 2 ;; --state-dir) sd="$2"; shift 2 ;; --symbol) symbol="$2"; shift 2 ;; --side) side="$2"; shift 2 ;; --read-only) ro="$2"; shift 2 ;; *) shift ;; esac; done' 'journal_id=' 'if [[ "$ro" == false ]]; then [[ -n "$sd" ]] || sd="${XDG_STATE_HOME:-$HOME/.local/state/hype-twap}"; journal_id="journal-$rid-$symbol-$side"; mkdir -p "$sd/runs/$journal_id"; printf "{\"kind\":\"Header\",\"run_id\":\"%s\",\"symbol\":\"%s\",\"side\":\"%s\",\"started_at_unix_ms\":%s}\n" "$journal_id" "$symbol" "$side" "$(date +%s%3N)" >"$sd/runs/$journal_id/journal.jsonl"; fi' 'if [[ -n "$journal_id" ]]; then journal_json="\"$journal_id\""; else journal_json=null; fi' 'printf "{\"run_id\":\"%s\",\"ready_at_unix_ms\":1,\"pid\":%s,\"journal_run_id\":%s}\n" "$rid" "$$" "$journal_json" >"$ready"' "trap 'printf \"%s\\n\" TERM >>\"\$TMPDIR/calls\"; exit 0' TERM" 'while :; do sleep 0.05; done' >"$fake"
+printf '%s\n' '#!/usr/bin/env bash' 'env | sort >>"$TMPDIR/calls"' 'tr "\0" "\n" <"/proc/$$/cmdline" | sed "s/^/CMDLINE:/" >>"$TMPDIR/calls"' "printf '%s\\n' -- >>\"\$TMPDIR/calls\"" 'printf "%s\n" "$@" >>"$TMPDIR/calls"' 'ready=' 'rid=' 'sd=' 'symbol=' 'side=' 'ro=true' 'for arg in "$@"; do [ "$arg" = FAIL ] && exit 1; done' 'while (($#)); do case "$1" in --pair-ready-file) ready="$2"; shift 2 ;; --pair-run-id) rid="$2"; shift 2 ;; --state-dir) sd="$2"; shift 2 ;; --symbol) symbol="$2"; shift 2 ;; --side) side="$2"; shift 2 ;; --live) ro=false; shift ;; --read-only) ro="$2"; shift 2 ;; *) shift ;; esac; done' 'journal_id=' 'if [[ "$ro" == false ]]; then [[ -n "$sd" ]] || sd="${XDG_STATE_HOME:-$HOME/.local/state/hype-twap}"; journal_id="journal-$rid-$symbol-$side"; mkdir -p "$sd/runs/$journal_id"; printf "{\"kind\":\"Header\",\"run_id\":\"%s\",\"symbol\":\"%s\",\"side\":\"%s\",\"started_at_unix_ms\":%s}\n" "$journal_id" "$symbol" "$side" "$(date +%s%3N)" >"$sd/runs/$journal_id/journal.jsonl"; fi' 'if [[ -n "$journal_id" ]]; then journal_json="\"$journal_id\""; else journal_json=null; fi' 'printf "{\"run_id\":\"%s\",\"ready_at_unix_ms\":1,\"pid\":%s,\"journal_run_id\":%s}\n" "$rid" "$$" "$journal_json" >"$ready"' "trap 'printf \"%s\\n\" TERM >>\"\$TMPDIR/calls\"; exit 0' TERM" 'while :; do sleep 0.05; done' >"$fake"
 chmod +x "$fake"
 # Deterministic stand-in for the read-only replay CLI.  It lets this shell
 # contract test exercise `dn-pair recover`'s interpretation of completed,
@@ -61,6 +61,8 @@ TMPDIR="$tmp" HYPE_TWAP_BIN="$fake" HL_AGENT_PK=generic-key-must-not-leak HL_AGE
 grep -q '^HL_AGENT_PK=' "$log" && exit 1 || true
 grep -q '^HL_AGENT_ADDRESS=' "$log" && exit 1 || true
 TMPDIR="$tmp" PATH="$tmp/bin:$PATH" HYPE_TWAP_BIN="$fake" HL_AGENT_PK=generic-live-key-must-not-leak HL_AGENT_ADDRESS=generic-live-address-must-not-leak HL_AGENT_PK_LEG1=one HL_AGENT_PK_LEG2=two "$repo/scripts/dn-pair.sh" --live --leg1-symbol ETH --leg1-side long --leg1-usd 100 --leg1-max-notional-usd 120 --leg2-symbol BTC --leg2-side short --leg2-usd 100 --leg2-max-notional-usd 120 --duration 1m --slices 1 --log-dir "$tmp/runs" >/dev/null
+[[ "$(grep -cx -- '--live' "$log")" -eq 2 ]]
+[[ "$(grep -cx -- '--read-only' "$log")" -eq 2 ]]
 grep -q '^HL_AGENT_PK=one$' "$log"
 grep -q '^HL_AGENT_PK=two$' "$log"
 ! grep -q 'HL_AGENT_PK_LEG' "$log"
@@ -149,8 +151,8 @@ alias_tmp="$tmp/alias-tmp"
 mkdir "$alias_tmp"
 TMPDIR="$alias_tmp" HYPE_TWAP_BIN="$fake" HL_AGENT_PK_LEG1=alias-one HL_AGENT_PK_LEG2=alias-two "$repo/scripts/dn-pair.sh" --read-only false --leg1-symbol ETH --leg1-side long --leg1-usd 100 --leg1-max-notional-usd 120 --leg2-symbol BTC --leg2-side short --leg2-usd 100 --leg2-max-notional-usd 120 --duration 1m --slices 1 --log-dir "$tmp/alias-runs" >"$tmp/alias.out" 2>"$tmp/alias.err"
 grep -q -- '--read-only false is deprecated; use --live' "$tmp/alias.err"
-grep -qx -- '--read-only' "$alias_tmp/calls"
-grep -qx -- 'false' "$alias_tmp/calls"
+[[ "$(grep -cx -- '--live' "$alias_tmp/calls")" -eq 2 ]]
+if grep -qx -- '--read-only' "$alias_tmp/calls"; then exit 1; fi
 ! HYPE_TWAP_BIN="$fake" "$repo/scripts/dn-pair.sh" --live --read-only true --leg1-symbol ETH --leg1-side long --leg1-usd 100 --leg2-symbol BTC --leg2-side short --leg2-usd 100 --duration 1m --slices 1 --log-dir "$tmp/runs" >"$tmp/live-readonly-conflict.out" 2>&1
 grep -q -- '--live conflicts with --read-only true' "$tmp/live-readonly-conflict.out"
 ! HYPE_TWAP_BIN="$fake" "$repo/scripts/dn-pair.sh" --read-only false --read-only true --leg1-symbol ETH --leg1-side long --leg1-usd 100 --leg2-symbol BTC --leg2-side short --leg2-usd 100 --duration 1m --slices 1 --log-dir "$tmp/runs" >"$tmp/alias-readonly-conflict.out" 2>&1

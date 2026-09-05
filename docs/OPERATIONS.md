@@ -42,7 +42,7 @@ export HL_AGENT_PK=$(pass show hyperliquid/agent-pk)
 
 ### 3. 名目額上限の決定 (`--max-notional-usd`, Issue #3)
 
-`--read-only false` (本番実行) では `--max-notional-usd` の指定が**必須**です
+`--live` (旧 `--read-only false`) では `--max-notional-usd` の指定が**必須**です
 (0.1.0 からの破壊的変更)。これは1スライスではなく、**同じ論理run全体の
 累積 USD 名目額**の上限です。`--resume` 前の約定も累積に含まれます。
 各注文の送信直前に、既約定額 + catch-up を反映した実注文数量 × 現在の指値を
@@ -62,7 +62,8 @@ Long は指値 (`Prepared.px`) を安全側の上限として使います。ALO 
 
 `HL_INFO_URL` / `HL_EXCHANGE_URL` を設定した状態で本番実行すると、既定では
 起動を拒否します。テスト目的で意図的に上書きする場合のみ
-`--allow-custom-endpoints` を指定してください (https:// のみ許可)。
+`--allow-custom-endpoints` を指定してください (https:// のみ許可)。既知の公式
+mainnet/testnet origin が `--network` と一致しない場合は常に拒否されます。
 
 ### 4. 証拠金の確認
 
@@ -100,7 +101,7 @@ hype-twap --symbol HYPE --side long --usd 1500 --duration 30m --slices 10
 ```bash
 export HL_AGENT_PK=$(pass show hyperliquid/agent-pk)
 hype-twap --symbol HYPE --side long --usd 50 --duration 5m --slices 2 \
-  --network testnet --max-notional-usd 60 --read-only false
+  --network testnet --max-notional-usd 60 --live
 ```
 
 続いて Issue #16 の checklist に従い、passive の境界 cancel → settle → requote、
@@ -111,9 +112,14 @@ account で確認し、結果をこの文書へ記録してください。失敗
 ### ステップ 3: mainnet 移行判定
 
 Issue #16 の **全 checklist が実 API で完了し、その結果が文書化されるまで、
-mainnet で `--read-only false` を実行しないでください。** 現在はこの gate が未完了のため、
+mainnet で `--live` を実行しないでください。** 現在は runtime gate でも拒否されるため、
 mainnet live 用の実行コマンドは掲載しません。read-only で計画確認を続けるか、
 明示的な `--network testnet` でのみ検証してください。
+
+gate 導入前の mainnet 未完了 journal がある場合、放置してはいけません。
+`--resume` は新規注文へ進み得るため拒否されますが、`--abandon-incomplete-run` は
+例外的に利用でき、既存 cloid の照合、必要な resting cancel、journal の終了だけを
+行って追加注文せずに戻ります。通常どおり明示 master address と認証情報が必要です。
 
 ```bash
 hype-twap --symbol HYPE --side long --usd 1500 --duration 30m --network testnet
@@ -129,7 +135,7 @@ hype-twap --symbol HYPE --side long --usd 1500 --duration 30m --network testnet
 長時間の実行ではログをファイルに残しておくと、中断時の突き合わせが楽になります。
 
 ```bash
-hype-twap ... --network testnet --read-only false 2>&1 | tee twap-$(date +%Y%m%d-%H%M%S).log
+hype-twap ... --network testnet --live 2>&1 | tee twap-$(date +%Y%m%d-%H%M%S).log
 ```
 
 ### 中断したい場合
@@ -163,7 +169,7 @@ position-aware / zero-crossing 実行では、close 後の exact-zero 確認、o
 
 ## クラッシュ・再起動時の手順 (Issue #4)
 
-**この節は本番実行 (`--read-only false`) にのみ関係します。** `--read-only`
+**この節は本番実行 (`--live`、旧 `--read-only false`) にのみ関係します。** `--read-only`
 (既定) はジャーナルを一切書き込まないため、再開の概念自体がありません。
 
 ### 何が起きているか
@@ -233,7 +239,7 @@ continue it, or --abandon-incomplete-run to force-reconcile and abandon it
 
 ```bash
 hype-twap --symbol HYPE --side long --usd 1500 --duration 30m \
-  --network testnet --max-notional-usd 5000 --read-only false --master-address 0x... \
+  --network testnet --max-notional-usd 5000 --live --master-address 0x... \
   --resume <run-id>
 ```
 
@@ -250,7 +256,7 @@ cloid をすべて `orderStatus` で照合してから、通常の実行フロ�
 
 ```bash
 hype-twap --symbol HYPE --side long --usd 1500 --duration 30m \
-  --network testnet --max-notional-usd 5000 --read-only false --master-address 0x... \
+  --network testnet --max-notional-usd 5000 --live --master-address 0x... \
   --abandon-incomplete-run
 ```
 
@@ -296,7 +302,7 @@ run を `Abandoned` としてクローズします。「照合すらせず握り
 
 ## 単一 writer ロックと nonce の運用境界 (Issue #5)
 
-**この節も本番実行 (`--read-only false`) にのみ関係します。** `--read-only`
+**この節も本番実行 (`--live`、旧 `--read-only false`) にのみ関係します。** `--read-only`
 はロックも nonce の永続化も一切行わないため、以下のいずれも読み取り専用の
 実行には影響しません。
 
@@ -762,7 +768,7 @@ ledgerも確定根拠を返せなければ推測でzero扱いせずhard-stopす�
 
 ### `live mode requires --max-notional-usd` で起動しない
 
-`--read-only false` (本番実行) には `--max-notional-usd` の指定が必須です
+`--live` (旧 `--read-only false`) には `--max-notional-usd` の指定が必須です
 (Issue #3、0.1.0 からの破壊的変更)。想定する名目額に見合った上限を指定してください。
 
 ### `--slippage-bps ... exceeds the warn threshold ...` で起動しない
@@ -776,7 +782,8 @@ override はできません — タイプミスの可能性を疑ってくださ
 `HL_INFO_URL` / `HL_EXCHANGE_URL` を設定した状態で本番実行しています。
 意図的なテスト目的であれば `--allow-custom-endpoints` を追加してください
 (https:// の URL のみ許可されます)。本番運用でこれらの環境変数を設定する
-状況は通常ありません — 環境変数の設定ミスの可能性を疑ってください。
+状況は通常ありません — 環境変数の設定ミスの可能性を疑ってください。既知の
+公式 endpoint が `--network` と逆側なら override を指定しても拒否されます。
 
 ### 実行中に `insufficient margin` で停止した
 

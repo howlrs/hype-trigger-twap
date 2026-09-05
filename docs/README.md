@@ -7,11 +7,16 @@ Hyperliquid 無期限先物向けの「トリガー付き TWAP」を実行する
 指定した価格または経過時間で発火し、目標数量を等間隔の IOC (テイカー) スライスに分割して
 執行します。スライスが約定不足のときは次スライスで自動的に取り返します (キャッチアップ方式)。
 
-**Read-only (ドライラン) が既定値です。** `--read-only false` を明示しない限り注文は一切送信されません。
+**Read-only (ドライラン) が既定値です。** 実発注には `--live` を明示します。
+旧 `--read-only false` は 0.1.x の warning 付き互換 alias です。Issue #16 完了までは
+mainnet の新規・再開発注は runtime で拒否されますが、mainnet read-only は利用できます。
+gate 導入前の未完了 mainnet journal は、追加発注しない
+`--abandon-incomplete-run` でのみ強制照合・終了できます。
 
 **Issue #16 の funded testnet 検証が未完了のため、mainnet live は現在禁止です。**
 以下の live 例は必ず `--network testnet` で実行し、checklist 完了と結果の文書化前に
 mainnet へ切り替えないでください。
+既存の未完了 mainnet journal の回復だけは `--abandon-incomplete-run` を使います。
 
 ## 目次
 
@@ -36,14 +41,14 @@ cargo build --release
 # funded testnet での live smoke
 export HL_AGENT_PK=0x<64桁の16進数>
 ./target/release/hype-twap --symbol HYPE --side long --usd 1500 --duration 30m \
-  --network testnet --max-notional-usd 2000 --read-only false
+  --network testnet --max-notional-usd 2000 --live
 ```
 
 ## 安全設計の要点
 
 このツールは実資金を扱うため、以下を既定の振る舞いとしています。
 
-- **既定はドライラン** — `--read-only false` を明示するまで署名も送信も行いません
+- **既定はドライラン** — `--live` を明示するまで署名も送信も行いません
 - **不明な銘柄は起動時に停止** — 発注前に `/info meta` と照合します
 - **取引所の拒否は即時停止** — 証拠金不足・最低数量割れは再試行せず全体を止めます
 - **秘密鍵は環境変数のみ** — コマンドライン引数では受け取らないため、シェル履歴や `ps` に残りません

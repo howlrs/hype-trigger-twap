@@ -649,8 +649,10 @@ wait_for_watchdog_healthy() {
   done
   return 1
 }
-c1=(--symbol "$l1s" --side "$l1d" --usd "$l1u" --duration "$dur" --slices "$slices" --child-algo "$a1" --read-only "$ro" --pair-ready-file "$ready1" --pair-start-file "$start_file" --pair-run-id "$rid" --pair-barrier-timeout "${barrier_timeout}s")
-c2=(--symbol "$l2s" --side "$l2d" --usd "$l2u" --duration "$dur" --slices "$slices" --child-algo "$a2" --read-only "$ro" --pair-ready-file "$ready2" --pair-start-file "$start_file" --pair-run-id "$rid" --pair-barrier-timeout "${barrier_timeout}s")
+mode_args=(--read-only true)
+$live && mode_args=(--live)
+c1=(--symbol "$l1s" --side "$l1d" --usd "$l1u" --duration "$dur" --slices "$slices" --child-algo "$a1" "${mode_args[@]}" --pair-ready-file "$ready1" --pair-start-file "$start_file" --pair-run-id "$rid" --pair-barrier-timeout "${barrier_timeout}s")
+c2=(--symbol "$l2s" --side "$l2d" --usd "$l2u" --duration "$dur" --slices "$slices" --child-algo "$a2" "${mode_args[@]}" --pair-ready-file "$ready2" --pair-start-file "$start_file" --pair-run-id "$rid" --pair-barrier-timeout "${barrier_timeout}s")
 $live && {
   c1+=(--max-notional-usd "$cap1")
   c2+=(--max-notional-usd "$cap2")
