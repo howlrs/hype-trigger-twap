@@ -40,15 +40,17 @@ live 実行の終了時に同一 schema の report を保存するには `--repo
 > 以下の live 例はすべて `--network testnet` を明示します。market/passive smoke、
 > ALO 拒否文言、cancel `expiresAfter: null` の実 API 確認と結果の文書化が終わるまで、
 > mainnet へ切り替えないでください。
+> gate 導入前の未完了 mainnet journal は例外として、追加発注を行わない
+> `--abandon-incomplete-run` で照合・cancel・終了できます。`--resume` は拒否されます。
 
 ```bash
 hype-twap --symbol HYPE --side long --usd 1500 --duration 30m \
-  --network testnet --max-notional-usd 2000 --read-only false \
+  --network testnet --max-notional-usd 2000 --live \
   --report-json /var/log/hype/final.json
 
 # stdout を JSON 専用に予約（通常の operator text は出力しない）
 hype-twap --symbol HYPE --side long --usd 1500 --duration 30m \
-  --network testnet --max-notional-usd 2000 --read-only false --report-json -
+  --network testnet --max-notional-usd 2000 --live --report-json -
 ```
 
 ファイル出力は同一ディレクトリ内の一時ファイルを `fsync` してから atomically
@@ -66,14 +68,14 @@ hype-twap --symbol HYPE --side long --usd 1500 --duration 30m
 
 ### funded testnet live (即時開始)
 
-`--read-only false` (本番実行) では `--max-notional-usd` が **必須**です (Issue #3、
+`--live` (旧 `--read-only false`) では `--max-notional-usd` が **必須**です (Issue #3、
 0.1.0 からの破壊的変更)。指定しないと起動時に拒否されます。詳細は
 [「risk envelope (Issue #3)」](#risk-envelope-issue-3) を参照してください。
 
 ```bash
 export HL_AGENT_PK=0x<64桁の16進数>
 hype-twap --symbol HYPE --side long --usd 1500 --duration 30m \
-  --network testnet --max-notional-usd 2000 --read-only false
+  --network testnet --max-notional-usd 2000 --live
 ```
 
 ### 価格トリガー + フォールバック開始
@@ -83,7 +85,7 @@ HYPE が $40 に到達したら開始。ただし 2 時間待っても到達し�
 ```bash
 hype-twap --symbol HYPE --side long --size 50 --duration 1h \
   --trigger-price 40 --trigger-when above --start-after 2h \
-  --network testnet --max-notional-usd 3000 --read-only false
+  --network testnet --max-notional-usd 3000 --live
 ```
 
 ### ショート (testnet、20 スライス / 2 時間)
@@ -91,7 +93,7 @@ hype-twap --symbol HYPE --side long --size 50 --duration 1h \
 ```bash
 hype-twap --symbol ETH --side short --usd 5000 --duration 2h --slices 20 \
   --trigger-price 3000 --trigger-when below --network testnet \
-  --max-notional-usd 6000 --read-only false
+  --max-notional-usd 6000 --live
 ```
 
 ## フラグ一覧
@@ -107,13 +109,14 @@ hype-twap --symbol ETH --side short --usd 5000 --duration 2h --slices 20 \
 | `--trigger-price` | 数値 | なし | 価格トリガーの閾値。`--trigger-when` の併記が必須です |
 | `--trigger-when` | `above` \| `below` | なし | `above`: mid が閾値以上で発火 / `below`: mid が閾値以下で発火。**自動推定はしません** |
 | `--start-after` | 期間 | なし | 指定時間の経過で発火。価格トリガーとは OR 条件 (先に成立した方が勝ち) |
-| `--read-only` | `true` \| `false` | **`true`** | `true` は署名も送信も行いません |
+| `--read-only` | `true` \| `false` | **`true`** | `true` は署名も送信も行いません。`false` は 0.1.x の非推奨な `--live` 互換 alias として残ります |
+| `--live` | フラグ | `false` | 実発注を有効化します。testnet live のみ利用可能で、Issue #16 完了までは mainnet の新規・再開発注は runtime で拒否されます。mainnet read-only と、追加発注しない `--abandon-incomplete-run` は利用できます。旧 `--read-only false` は 0.1.x の warning 付き互換 alias です |
 | `--event-jsonl` | パス | なし | read-only simulation の schema-versioned lifecycle event を明示パスへ保存します。live state directory やjournalは作成しません。本番runはrun directory内の`events.jsonl`を自動使用するため指定不可です |
-| `--network` | `mainnet` \| `testnet` | `mainnet` | API エンドポイントと EIP-712 の `Agent.source` を同時に切り替えます (不整合が起きない設計) |
+| `--network` | `mainnet` \| `testnet` | `mainnet` | 既定 API エンドポイントと EIP-712 の `Agent.source` を同時に切り替えます。上書きが反対側の公式 mainnet/testnet origin を指す場合も拒否します |
 | `--slippage-bps` | 数値 | `20` | IOC 指値に乗せるスリッページ余裕 (ベーシスポイント)。**10000 bps 以上、または非正の指値になる値は無条件で拒否** (override 不可)。**1000 bps 超は `--allow-high-slippage` が必須** |
 | `--allow-high-slippage` | フラグ | `false` | **unsafe override**。`--slippage-bps` が 1000 bps を超える場合に必須。10000 bps 以上の無条件拒否には効果なし |
-| `--max-notional-usd` | 数値 (USD) | なし | `--read-only false` (本番) では**必須** (Issue #3、破壊的変更)。同じ論理run全体の累積上限で、`--resume` 前の約定も含みます。二段階で検証されます: (1) 事前検証 — `--usd` は要求額そのもの、`--size` は保守的な指値で概算した名目額を、実行開始前に比較。(2) 各注文の送信直前 — 全既約定額 + catch-up を反映した実注文数量 × 現在の指値を比較。いずれも上限超過なら `/exchange` へ送る前に停止します。注文数量を残余上限まで自動縮小はせず、runをhard-stopします。`--read-only` では不要 (何も送信しないため) |
-| `--allow-custom-endpoints` | フラグ | `false` | **unsafe override**。本番実行時に `HL_INFO_URL` / `HL_EXCHANGE_URL` の上書きを許可します。指定しても **https:// 以外の URL は拒否**されます (ローカルホストの mock サーバーを使うテスト経路のみ例外) |
+| `--max-notional-usd` | 数値 (USD) | なし | live (`--live`、旧 `--read-only false`) では**必須** (Issue #3、破壊的変更)。同じ論理run全体の累積上限で、`--resume` 前の約定も含みます。二段階で検証されます: (1) 事前検証 — `--usd` は要求額そのもの、`--size` は保守的な指値で概算した名目額を、実行開始前に比較。(2) 各注文の送信直前 — 全既約定額 + catch-up を反映した実注文数量 × 現在の指値を比較。いずれも上限超過なら `/exchange` へ送る前に停止します。注文数量を残余上限まで自動縮小はせず、runをhard-stopします。`--read-only` では不要 (何も送信しないため) |
+| `--allow-custom-endpoints` | フラグ | `false` | **unsafe override**。本番実行時に `HL_INFO_URL` / `HL_EXCHANGE_URL` の上書きを許可します。指定しても **https:// 以外の URL は拒否**されます (ローカルホストの mock サーバーを使うテスト経路のみ例外)。既知の公式 mainnet/testnet origin は `--network` と一致しなければ拒否されます |
 | `--max-book-age-ms` | 整数 | `3000` | この時間より古い板スナップショットを拒否します。`0` は**鮮度チェックのみ**を無効化するもので、銘柄一致・正値・非交差・並び順といった意味検証と、未来方向 2秒固定の許容 (future-skew) は `0` でも常に適用されます |
 | `--settle-retries` | 整数 | `25` | cancel 済みの既知 resting child を `orderStatus` で確定する最大試行数。`HL_SETTLE_RETRIES` でも上書きできます。変更されるのは cancel/settle の待機予算だけで、ambiguous place の再送規則は変わりません。予算後の `userFillsByTime` fallback も oid/cloid/symbol/side/数量を厳密照合し、不確実なら hard-stop します |
 | `--trigger-poll-secs` | 整数 | `2` | トリガー待ち中の板ポーリング間隔 (秒) |
@@ -124,8 +127,8 @@ hype-twap --symbol ETH --side short --usd 5000 --duration 2h --slices 20 \
 | `--follow-repost-secs` | 整数 | `10` | `--child-algo follow` 専用。1 スライス内で再発注してよい最短間隔 (秒)。そのスライスの直近の発注時刻からの経過で判定します。他の `--child-algo` では無視されます (警告あり) |
 | `--follow-threshold-bps` | 数値 | `1.0` | `--child-algo follow` 専用。touch が resting 価格からこのベーシスポイント以上離れない限り再クオートしません (ヒステリシス)。他の `--child-algo` では無視されます (警告あり) |
 | `--state-dir` | パス | なし (`$XDG_STATE_HOME/hype-twap`、未設定なら `~/.local/state/hype-twap`) | 実行状態 (ジャーナル / ロック / nonce HWM) を保存するルートディレクトリ (Issue #4)。`--read-only` の実行はここに一切触れません — ディレクトリもジャーナルも作成されません |
-| `--resume` | 文字列 (run id) | なし | 指定した run id の未完了 run を再開します (Issue #4)。live では `--master-address` または `HL_MASTER_ADDRESS` が必須で、network / agent / master / symbol / side を外部 API 呼び出し前に照合します。その後、submitted/unknown cloid をすべて `orderStatus` で照合し、記録済み約定は再送しません。`--abandon-incomplete-run` とは排他です |
-| `--abandon-incomplete-run` | フラグ | `false` | 同一 network+agent で検出された未完了 run を強制照合したうえで放棄し、**続行はしません** (Issue #4)。live では事前 identity 照合用の明示 master address が必須です。`--resume` とは排他です |
+| `--resume` | 文字列 (run id) | なし | 指定した run id の未完了 run を再開します (Issue #4)。live では `--master-address` または `HL_MASTER_ADDRESS` が必須で、network / agent / master / symbol / side を外部 API 呼び出し前に照合します。その後、submitted/unknown cloid をすべて `orderStatus` で照合し、記録済み約定は再送しません。Issue #16 の gate 中は mainnet resume を拒否し、回復専用の abandon を案内します。`--abandon-incomplete-run` とは排他です |
+| `--abandon-incomplete-run` | フラグ | `false` | 同一 network+agent で検出された未完了 run を強制照合したうえで放棄し、**続行も追加発注もしません** (Issue #4)。live では事前 identity 照合用の明示 master address が必須です。gate 導入前の mainnet journal にも利用できます。`--resume` とは排他です |
 | `--shutdown-grace` | 期間 (`30m`, `1h`) | `60s` | SIGINT/SIGTERM を受けてから、進行中の注文の照合、resting 注文のキャンセル、position phase と最終確認までに費やせる単一の猶予時間 (Issue #4)。超過すると、未解決の cloid を `outcome_unknown` としてジャーナルに記録したうえで非ゼロ終了します |
 
 `--size` と `--usd` はどちらか一方が必須です。両方指定または両方省略はエラーになります。
@@ -134,7 +137,7 @@ hype-twap --symbol ETH --side short --usd 5000 --duration 2h --slices 20 \
 
 | 変数 | 必須 | 意味 |
 |---|---|---|
-| `HL_AGENT_PK` | `--read-only false` のときのみ | Agent (API ウォレット) の秘密鍵。`0x` + 64 桁の16進数。**フラグでは受け取りません** — シェル履歴や `ps` 出力に残らないためです。`secrecy::SecretString` で保持し、エラーメッセージや `Debug` 出力を含め一切ログに出しません |
+| `HL_AGENT_PK` | `--live` (または旧 `--read-only false`) のときのみ | Agent (API ウォレット) の秘密鍵。`0x` + 64 桁の16進数。**フラグでは受け取りません** — シェル履歴や `ps` 出力に残らないためです。`secrecy::SecretString` で保持し、エラーメッセージや `Debug` 出力を含め一切ログに出しません |
 | `HL_AGENT_ADDRESS` | 任意 | **Agent (API ウォレット) のアドレス** — マスターアカウントではありません。設定した場合は `HL_AGENT_PK` から導出したアドレスと照合し、不一致なら起動を中止します |
 | `HL_MASTER_ADDRESS` | live の再開・放棄時は必須 | Agent が属するマスターアカウント。新規の本番実行は `userRole` で自動解決しますが、`--resume` / `--abandon-incomplete-run` は外部 API 呼び出し前に journal identity を照合するため、この変数または `--master-address` が必須です。設定値は Hyperliquid の応答とも照合します |
 | `HL_INFO_URL` | 任意 | `/info` エンドポイントの上書き (テスト用)。**本番実行では既定で拒否**され、`--allow-custom-endpoints` (かつ https://) が必要です (Issue #3) |
@@ -326,7 +329,7 @@ taker へのフォールバック (最終的に約定しない場合に taker �
 
 ## risk envelope (Issue #3)
 
-本番実行 (`--read-only false`) には損失上限のガードレールがあります。すべて
+本番実行 (`--live`、旧 `--read-only false`) には損失上限のガードレールがあります。すべて
 `/exchange` への最初の送信より前 (ネットワークアクセスより前) に検証され、
 違反すると exit code 非ゼロで即座に停止します。ポリシーの定数は `src/risk.rs`
 に一元化されており、CLI 検証とスライスループの双方がここを参照します
@@ -351,7 +354,8 @@ taker へのフォールバック (最終的に約定しない場合に taker �
   指定した場合のみ上書きを許可しますが、その場合も **https:// の URL のみ**
   受け付けます (ローカルホストの `http://127.0.0.1` / `http://localhost` は
   自動テスト用の例外として許可されますが、実運用でこの例外が使われることは
-  想定されていません)。
+  想定されていません)。既知の公式 origin が反対側の network を指す場合は、
+  signing domain との不整合として override 指定の有無にかかわらず拒否します。
 - **送信前サマリ**: 実行開始前に一度だけ、解決済みの network/エンドポイント・
   symbol・side・target・slippage・名目額上限をまとめた1行 (`Pre-send summary: ...`)
   が出力されます。

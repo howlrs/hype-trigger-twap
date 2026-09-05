@@ -77,6 +77,14 @@ pub enum RiskError {
 
     #[error("--allow-custom-endpoints requires an https:// URL, got {url}")]
     CustomEndpointNotHttps { url: String },
+
+    #[error(
+        "official Hyperliquid endpoint host {host} does not match --network {selected_network}; endpoint routing and the signing domain must select the same network"
+    )]
+    OfficialEndpointNetworkMismatch {
+        host: String,
+        selected_network: Network,
+    },
 }
 
 /// Everything needed to judge whether a slippage/price configuration is safe,
@@ -207,6 +215,42 @@ impl RiskEnvelope {
         }
         if !url.starts_with("https://") && !is_loopback_url(url) {
             return Err(RiskError::CustomEndpointNotHttps { url: url.into() });
+        }
+        Ok(())
+    }
+
+    /// Keep the two known Hyperliquid API origins aligned with the EIP-712
+    /// signing domain selected by `--network`. Custom proxy origins remain an
+    /// explicit trust boundary under `--allow-custom-endpoints`, but spelling
+    /// an official origin for the opposite network is always an operator error
+    /// and must fail before credentials, state, or HTTP are touched.
+    pub fn validate_official_endpoint_network(
+        url: &str,
+        selected_network: Network,
+    ) -> Result<(), RiskError> {
+        let Ok(parsed) = reqwest::Url::parse(url) else {
+            // Syntax and transport suitability are handled by the existing
+            // endpoint/client validation path. This check has one narrow job:
+            // reject a recognisable official origin for the wrong network.
+            return Ok(());
+        };
+        let Some(host) = parsed.host_str() else {
+            return Ok(());
+        };
+        // A trailing dot is the DNS absolute-name spelling of the same host
+        // (`api.hyperliquid.xyz.` == `api.hyperliquid.xyz`). URL parsing keeps
+        // it, so normalize it before comparing the two official origins.
+        let canonical_host = host.trim_end_matches('.');
+        let endpoint_network = match canonical_host {
+            "api.hyperliquid.xyz" => Some(Network::Mainnet),
+            "api.hyperliquid-testnet.xyz" => Some(Network::Testnet),
+            _ => None,
+        };
+        if endpoint_network.is_some_and(|network| network != selected_network) {
+            return Err(RiskError::OfficialEndpointNetworkMismatch {
+                host: host.to_owned(),
+                selected_network,
+            });
         }
         Ok(())
     }
@@ -501,6 +545,59 @@ mod tests {
     #[test]
     fn custom_endpoint_https_accepted_with_override() {
         RiskEnvelope::validate_endpoint_override("https://example.com/info", true).unwrap();
+    }
+
+    #[test]
+    fn official_mainnet_endpoint_is_rejected_for_testnet_signing() {
+        for url in [
+            "https://api.hyperliquid.xyz/info",
+            "https://API.HYPERLIQUID.XYZ:443/exchange",
+            "https://api.hyperliquid.xyz./info",
+            "https://api.hyperliquid.xyz../info",
+            "https://api%2ehyperliquid%2exyz/info",
+            "https://api。hyperliquid。xyz/info",
+        ] {
+            let err = RiskEnvelope::validate_official_endpoint_network(url, Network::Testnet)
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                RiskError::OfficialEndpointNetworkMismatch { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn official_testnet_endpoint_is_rejected_for_mainnet_signing() {
+        for url in [
+            "https://api.hyperliquid-testnet.xyz/info",
+            "https://api.hyperliquid-testnet.xyz./exchange",
+        ] {
+            let err = RiskEnvelope::validate_official_endpoint_network(url, Network::Mainnet)
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                RiskError::OfficialEndpointNetworkMismatch { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn matching_official_and_custom_endpoint_hosts_are_accepted() {
+        RiskEnvelope::validate_official_endpoint_network(
+            "https://api.hyperliquid.xyz/info",
+            Network::Mainnet,
+        )
+        .unwrap();
+        RiskEnvelope::validate_official_endpoint_network(
+            "https://api.hyperliquid-testnet.xyz/exchange",
+            Network::Testnet,
+        )
+        .unwrap();
+        RiskEnvelope::validate_official_endpoint_network(
+            "https://proxy.example.com/info",
+            Network::Testnet,
+        )
+        .unwrap();
     }
 
     #[test]

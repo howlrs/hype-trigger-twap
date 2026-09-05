@@ -52,6 +52,14 @@ use hype_trigger_twap::types::{Address, Side, Symbol};
 /// through the two macros below and is suppressed in that mode.
 static REPORT_JSON_STDOUT: AtomicBool = AtomicBool::new(false);
 
+/// Release gate for new or resumed real-money mainnet order placement. The
+/// funded testnet conformance checklist tracked in Issue #16 is not complete
+/// yet, so a CLI typo or an omitted `--network testnet` must never silently
+/// reach mainnet. Recovery-only `--abandon-incomplete-run` remains available
+/// so pre-gate journals can be reconciled/cancelled without placing new orders.
+/// Lifting the placement gate requires a reviewed source change.
+const MAINNET_LIVE_ENABLED: bool = false;
+
 macro_rules! println {
     ($($arg:tt)*) => {
         if !REPORT_JSON_STDOUT.load(Ordering::Relaxed) {
@@ -745,7 +753,8 @@ fn execution_fingerprint(
 /// the help output rather than only in the README.
 const ENV_HELP: &str = "\
 ENVIRONMENT VARIABLES:
-  HL_AGENT_PK         Required with `--read-only false`. The AGENT (API wallet)
+  HL_AGENT_PK         Required in live mode (`--live`; legacy
+                      `--read-only false`). The AGENT (API wallet)
                       private key, `0x` + 64 hex. Accepted ONLY from the
                       environment — never as a flag — so it cannot reach shell
                       history or `ps` output. Never logged, not even on error.
@@ -763,7 +772,8 @@ ENVIRONMENT VARIABLES:
   HL_INFO_URL         Optional. Override the /info endpoint (testing). In LIVE
                       mode this is rejected by default (Issue #3) unless
                       --allow-custom-endpoints is also passed, and even then
-                      only an https:// URL is accepted.
+                      only an https:// URL is accepted. A known official origin
+                      for the opposite --network is always rejected.
   HL_EXCHANGE_URL     Optional. Override the /exchange endpoint (testing).
                       Same live-mode restriction as HL_INFO_URL above.
   RUST_LOG            Optional. Log filter; defaults to `info`.
@@ -933,8 +943,15 @@ struct Cli {
     #[arg(long, value_parser = parse_duration)]
     start_after: Option<Duration>,
 
+    /// Explicitly enable order submission. Live execution currently requires
+    /// --network testnet while the mainnet conformance gate remains closed.
+    /// The legacy `--read-only false` spelling remains accepted for 0.1.x.
+    #[arg(long, default_value_t = false, conflicts_with = "read_only")]
+    live: bool,
+
     /// Dry run. true (the DEFAULT) signs nothing and sends no orders; each
     /// slice prints the order it would have placed from the live book.
+    /// `--read-only false` is a deprecated compatibility alias for --live.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     read_only: bool,
 
@@ -970,7 +987,7 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     allow_high_slippage: bool,
 
-    /// REQUIRED in live mode (`--read-only false`): the maximum cumulative
+    /// REQUIRED in live mode (`--live`; legacy `--read-only false`): the maximum cumulative
     /// USD notional for the entire logical run, including prior fills after
     /// `--resume`. `--usd` is checked as the requested notional; `--size` via
     /// a freshly computed conservative limit price. Before every order, the
@@ -981,7 +998,8 @@ struct Cli {
     max_notional_usd: Option<Decimal>,
 
     /// Unsafe override: allow HL_INFO_URL / HL_EXCHANGE_URL to be overridden
-    /// in LIVE mode. Requires the override URL(s) to be https://. Read-only
+    /// in LIVE mode. Requires the override URL(s) to be https://. A known
+    /// official mainnet/testnet origin must still match --network. Read-only
     /// mode and tests are unaffected by this flag — the restriction it lifts
     /// only ever applies to live mode (Issue #3).
     #[arg(long, default_value_t = false)]
@@ -1318,9 +1336,36 @@ async fn wait_for_pair_start(
 }
 
 impl Cli {
+    /// Resolve the two accepted spellings onto one execution mode. Clap
+    /// rejects an explicit `--live --read-only ...` combination, while the
+    /// default `read_only = true` does not conflict with `--live`.
+    fn is_read_only(&self) -> bool {
+        self.read_only && !self.live
+    }
+
+    fn is_live(&self) -> bool {
+        !self.is_read_only()
+    }
+
     /// §4 step 1: argument validation that clap cannot express.
     fn validate(&self) -> Result<(), String> {
-        if !self.read_only && self.event_jsonl.is_some() {
+        if self.is_live()
+            && self.network == NetworkArg::Mainnet
+            && !MAINNET_LIVE_ENABLED
+            && !self.abandon_incomplete_run
+        {
+            let recovery_guidance = if self.resume.is_some() {
+                " --resume cannot continue a mainnet run while the gate is closed; use --abandon-incomplete-run to reconcile/cancel its outstanding orders without placing new ones."
+            } else {
+                " Existing mainnet journals can still be reconciled and closed with --abandon-incomplete-run, which never places a new order."
+            };
+            return Err(
+                format!(
+                    "mainnet live execution is disabled pending the funded-testnet conformance checklist in Issue #16; use --network testnet for live execution or the default read-only mode for a mainnet rehearsal.{recovery_guidance}"
+                ),
+            );
+        }
+        if self.is_live() && self.event_jsonl.is_some() {
             return Err(
                 "--event-jsonl is for read-only simulations; live runs use the run-directory events.jsonl sidecar"
                     .into(),
@@ -1374,7 +1419,7 @@ impl Cli {
             .map_err(|e| e.to_string())?;
         // Issue #3: live mode requires --max-notional-usd (breaking change,
         // documented in docs/USAGE.md / docs/OPERATIONS.md).
-        RiskEnvelope::validate_max_notional_required(self.read_only, self.max_notional_usd)
+        RiskEnvelope::validate_max_notional_required(self.is_read_only(), self.max_notional_usd)
             .map_err(|e| e.to_string())?;
         if self.trigger_price.is_some() != self.trigger_when.is_some() {
             return Err("--trigger-price and --trigger-when must be given together".into());
@@ -1458,6 +1503,9 @@ impl Cli {
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
+        // stdout may be reserved for `--report-json -`; diagnostics must
+        // never corrupt that single-document machine-readable channel.
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -1510,6 +1558,10 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         .is_some_and(|path| path == Path::new("-"));
     REPORT_JSON_STDOUT.store(report_to_stdout, Ordering::Relaxed);
     cli.validate()?;
+    let read_only = cli.is_read_only();
+    if !cli.read_only {
+        tracing::warn!("--read-only false is deprecated; use --live");
+    }
     // Observability is never part of the trading critical path. The hook URL
     // is env-only so a bearer token cannot reach argv/history/ps. Any invalid
     // URL, listener bind, or hook setup simply disables observability while
@@ -1528,8 +1580,8 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         }
     };
     let result = async {
-    if cli.read_only && cli.report_json.is_some() {
-        return Err("--report-json is available only with --read-only false".into());
+    if read_only && cli.report_json.is_some() {
+        return Err("--report-json is available only in live mode (--live)".into());
     }
     // Resolve this before any network operation.  The actual ready publication
     // is deliberately deferred until all normal pre-flight/journal work is
@@ -1559,7 +1611,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         .as_deref()
         .map(|value| parse_public_address("master address", value))
         .transpose()?;
-    if !cli.read_only
+    if !read_only
         && (cli.resume.is_some() || cli.abandon_incomplete_run)
         && configured_master.is_none()
     {
@@ -1569,7 +1621,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         );
     }
 
-    if cli.read_only {
+    if read_only {
         println!("{READ_ONLY_BANNER}");
     } else {
         tracing::warn!("LIVE MODE: orders WILL be sent to {network}");
@@ -1592,9 +1644,9 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     // rejected by default. This MUST run before any network access — it sits
     // ahead of the signer/client construction below, which is itself already
     // ahead of the first network call. Read-only is UNAFFECTED (the check
-    // below is gated on `!cli.read_only`), which is what keeps the existing
+    // below is gated on live mode), which is what keeps the existing
     // mockito-based read-only test seam working unchanged.
-    if !cli.read_only {
+    if !read_only {
         for url in [
             std::env::var("HL_INFO_URL").ok(),
             std::env::var("HL_EXCHANGE_URL").ok(),
@@ -1604,16 +1656,18 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         {
             RiskEnvelope::validate_endpoint_override(&url, cli.allow_custom_endpoints)
                 .map_err(|e| e.to_string())?;
+            RiskEnvelope::validate_official_endpoint_network(&url, network)
+                .map_err(|e| e.to_string())?;
         }
     }
 
     // §4 step 3 (partial): build the signer before any network call so a bad
     // key fails fast. Read-only never touches the key at all.
-    let signer: Option<Box<dyn Signer>> = if cli.read_only {
+    let signer: Option<Box<dyn Signer>> = if read_only {
         None
     } else {
         let pk = std::env::var("HL_AGENT_PK").map_err(|_| {
-            "HL_AGENT_PK is required when --read-only false (0x + 64 hex, env var only)".to_string()
+            "HL_AGENT_PK is required in live mode (0x + 64 hex, env var only)".to_string()
         })?;
         let s = Eip712AgentSigner::from_secret(SecretString::new(pk.into()), network.is_mainnet())
             .map_err(|e| e.to_string())?;
@@ -1638,7 +1692,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
 
     // Issue #4: state-dir resolution and incomplete-run detection. Read-only
     // never creates a directory or touches the journal at all — this whole
-    // block is gated on `!cli.read_only`, mirroring the endpoint-override
+    // block is gated on live mode, mirroring the endpoint-override
     // gate above. Live mode checks BEFORE any network call (fetch_meta is
     // the very next one below), so a blocked startup never wastes a request.
     let resolved_state_dir = hype_trigger_twap::journal::state_dir(cli.state_dir.as_deref());
@@ -1654,7 +1708,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     // in this file's test module for the regression this guards).
     //
     // Read-only is completely unaffected (no lock file, no lock directory,
-    // nothing written) — gated on `!cli.read_only` exactly like every other
+    // nothing written) — gated on live mode exactly like every other
     // live-only block in this function, preserving the "read-only creates
     // nothing" invariant `read_only_creates_no_state_dir_or_journal_file`
     // already covers for the journal.
@@ -1665,7 +1719,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     // Task 9 #1 (passive/post-only) runs entirely inside this same
     // `run_with_cli` body and needs no changes here — one live process still
     // equals one lock holder regardless of order style.
-    let _process_lock = if !cli.read_only {
+    let _process_lock = if !read_only {
         let agent = agent_address.as_ref().ok_or_else(|| {
             "internal error: live mode must have an agent address by this point".to_string()
         })?;
@@ -1692,7 +1746,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     // before the first HTTP request (`meta` below). A position run has no
     // CLI side; its immutable Header/Prepared sides are validated internally
     // and the phase fingerprint is checked before any new order later.
-    if !cli.read_only {
+    if !read_only {
         if let Some(resume_id) = &cli.resume {
             validated_resume_replay(
                 &resolved_state_dir,
@@ -1706,7 +1760,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         }
     }
 
-    if !cli.read_only {
+    if !read_only {
         let incomplete = hype_trigger_twap::journal::find_incomplete_run(
             &resolved_state_dir,
             network.to_string().as_str(),
@@ -1771,7 +1825,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     // seeding would touch disk under the state dir, violating the
     // read-only-creates-nothing invariant this whole function's live-only
     // blocks already preserve.
-    if !cli.read_only {
+    if !read_only {
         if let Some(agent) = agent_address.as_ref() {
             let key = hype_trigger_twap::lock::lock_key(&network.to_string(), agent);
             let hwm = hype_trigger_twap::lock::NonceHwm::load(&resolved_state_dir, &key)
@@ -1877,7 +1931,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     // only ever gets MORE resolved, never less, regardless of which flags
     // the operator got wrong.
     let mut resume_observability_started = false;
-    if !cli.read_only && (cli.resume.is_some() || cli.abandon_incomplete_run) {
+    if !read_only && (cli.resume.is_some() || cli.abandon_incomplete_run) {
         // #27: identity and journal-state validation precede the first
         // `orderStatus` request.  A wrong run id must never be able to add a
         // reconciliation result to another account/network's journal.
@@ -2055,7 +2109,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     // result. Unsupported/legacy plans are allowed to reconcile but are
     // stopped here, before trigger/book/position preflight can create a new
     // order intent.
-    let resume_replay_after_reconcile = if !cli.read_only {
+    let resume_replay_after_reconcile = if !read_only {
         if let Some(resume_id) = &cli.resume {
             Some(validated_resume_replay(
                 &resolved_state_dir,
@@ -2128,7 +2182,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     // An expired logical deadline permits only the reconciliation above.  Do
     // this before trigger/pre-flight book access, so a late resume cannot
     // fetch a book or place a fresh child order.
-    if !cli.read_only {
+    if !read_only {
         if let (Some(resume_id), Some(replay)) =
             (&cli.resume, resume_replay_after_reconcile.as_ref())
         {
@@ -2310,7 +2364,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     // obtained above (whichever branch produced it) applies the same check
     // uniformly to both trigger modes, exactly once, with no extra l2Book
     // call of its own — it fails closed before ANY place happens.
-    if !cli.read_only {
+    if !read_only {
         check_clock_skew(wall_clock_now_ms() as i64, snapshot.server_ts_ms)
             .map_err(|e| e.to_string())?;
     }
@@ -2543,7 +2597,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
             } else {
                 cli.flatten_deadline_unix_ms
             };
-            if !cli.read_only && deadline.is_none() {
+            if !read_only && deadline.is_none() {
                 return Err("live --flatten requires --flatten-deadline-unix-ms so its confirmation token is stable across prepare/confirm".into());
             }
             if deadline.is_none() && !cli.json {
@@ -2581,11 +2635,11 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
                 println!("{}", format_flatten_confirmation_preflight(&confirmation));
                 println!("FLATTEN CONFIRMATION: {token}");
             }
-            if !cli.read_only && cli.confirm_flatten.as_deref() != Some(token.as_str()) {
+            if !read_only && cli.confirm_flatten.as_deref() != Some(token.as_str()) {
                 return Err("live --flatten requires the exact --confirm-flatten token printed by this preflight; no order was sent".into());
             }
         }
-        if cli.read_only {
+        if read_only {
             let planned_slices = cli
                 .slices
                 .saturating_mul(u32::try_from(plan.phases.len()).unwrap_or(u32::MAX));
@@ -2673,7 +2727,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     // sites share the one risk module (src/risk.rs), never duplicated
     // constants.
     let max_notional_usd =
-        RiskEnvelope::validate_max_notional_required(cli.read_only, risk.max_notional_usd)
+        RiskEnvelope::validate_max_notional_required(read_only, risk.max_notional_usd)
             .map_err(|e| e.to_string())?;
     let preflight_notional = match (cli.size, cli.usd, position_plan.as_ref()) {
         (Some(_), _, _) => {
@@ -2730,7 +2784,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
             side,
             &requested_desc,
             risk.slippage_bps,
-            if cli.read_only {
+            if read_only {
                 None
             } else {
                 Some(max_notional_usd)
@@ -2741,7 +2795,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     // Fix one absolute deadline for the logical run before the journal is
     // created/reopened. Every local send gate and wire `expiresAfter` uses
     // this exact value, including ordinary and position-aware resumes.
-    let fixed_execution_deadline_unix_ms = if cli.read_only {
+    let fixed_execution_deadline_unix_ms = if read_only {
         cli.flatten_deadline_unix_ms
     } else if let Some(replay) = resume_replay_after_reconcile.as_ref() {
         Some(
@@ -2778,7 +2832,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
         slippage_bps: risk.slippage_bps,
         max_book_age_ms: cli.max_book_age_ms,
         settle_retries: cli.settle_retries,
-        read_only: cli.read_only,
+        read_only,
         reduce_only: position_plan
             .as_ref()
             .and_then(|plan| plan.phases.first())
@@ -2864,7 +2918,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     // the same schema-versioned event contract at an explicit standalone
     // path. This stream contains simulation lifecycle events only; it is not
     // a journal and never becomes resume authority.
-    let mut read_only_observer = if cli.read_only {
+    let mut read_only_observer = if read_only {
         cli.event_jsonl.as_ref().map(|path| {
             let mut observer = JournalEventObserver::open(
                 path,
@@ -2929,7 +2983,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     // it is retained here solely for that best-effort replay.
     let mut observability_header: Option<hype_trigger_twap::journal::RunHeader> = None;
 
-    let mut journal = if cli.read_only {
+    let mut journal = if read_only {
         None
     } else if let Some(resume_id) = &cli.resume {
         let replay = validated_resume_replay(
@@ -3124,7 +3178,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
                         .map(|whole| Duration::from_millis(whole.logical_elapsed_ms))
                         .unwrap_or(Duration::ZERO),
                     abort_reason: None,
-                    read_only: cli.read_only,
+                    read_only,
                 };
                 print!("{}", report.render());
                 if let Some(j) = journal.as_ref() {
@@ -3185,7 +3239,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
                         .map(|whole| Duration::from_millis(whole.logical_elapsed_ms))
                         .unwrap_or(Duration::ZERO),
                     abort_reason: Some(reason),
-                    read_only: cli.read_only,
+                    read_only,
                 };
                 print!("{}", report.render());
                 if let Some(j) = journal.as_ref() {
@@ -3300,7 +3354,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
     let shutdown_signal = hype_trigger_twap::twap::ShutdownSignal::new(shutdown_rx);
     let first_phase_shutdown = shutdown_signal.clone();
     let grace_shutdown = shutdown_signal.clone();
-    let signal_task = if cli.read_only {
+    let signal_task = if read_only {
         None
     } else {
         Some(tokio::spawn(async move {
@@ -3556,7 +3610,7 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
             slippage_bps: risk.slippage_bps,
             max_book_age_ms: cli.max_book_age_ms,
             settle_retries: cli.settle_retries,
-            read_only: cli.read_only,
+            read_only,
             reduce_only: false,
             max_notional_usd,
             agent: agent_address.clone(),
@@ -4048,7 +4102,7 @@ fn emit_read_only_position_lifecycle(
     plan: &PositionExecutionPlan,
     planned_slices: u32,
 ) {
-    if !cli.read_only {
+    if !cli.is_read_only() {
         return;
     }
     let Some(path) = cli.event_jsonl.as_ref() else {
@@ -4442,24 +4496,49 @@ mod tests {
             "1500",
             "--duration",
             "30m",
+            "--network",
+            "testnet",
             "--max-notional-usd",
             "5000",
-            "--read-only",
-            "false",
+            "--live",
         ])
         .unwrap();
         assert_eq!(cli.symbol, "HYPE");
         assert_eq!(cli.side, Some(SideArg::Long));
         assert_eq!(cli.usd, Some(Decimal::from(1500)));
         assert_eq!(cli.duration, Duration::from_secs(1800));
+        assert!(cli.live);
+        assert!(cli.is_live());
+        cli.validate().unwrap();
+    }
+
+    #[test]
+    fn legacy_read_only_false_remains_a_live_compatibility_alias() {
+        let cli = Cli::try_parse_from(
+            base_args()
+                .into_iter()
+                .chain([
+                    "--network",
+                    "testnet",
+                    "--max-notional-usd",
+                    "5000",
+                    "--read-only",
+                    "false",
+                ])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(!cli.live);
         assert!(!cli.read_only);
+        assert!(cli.is_live());
         cli.validate().unwrap();
     }
 
     #[test]
     fn read_only_defaults_to_true() {
         let cli = Cli::try_parse_from(base_args()).unwrap();
-        assert!(cli.read_only, "read-only MUST default to true (§3)");
+        assert!(cli.is_read_only(), "read-only MUST default to true (§3)");
+        assert!(!cli.live);
     }
 
     #[test]
@@ -4816,7 +4895,7 @@ mod tests {
         let cli = Cli::try_parse_from(
             base_args()
                 .into_iter()
-                .chain(["--read-only", "false"])
+                .chain(["--network", "testnet", "--live"])
                 .collect::<Vec<_>>(),
         )
         .unwrap();
@@ -4829,10 +4908,114 @@ mod tests {
         let cli = Cli::try_parse_from(
             base_args()
                 .into_iter()
+                .chain([
+                    "--network",
+                    "testnet",
+                    "--live",
+                    "--max-notional-usd",
+                    "5000",
+                ])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(cli.is_live());
+        cli.validate().unwrap();
+    }
+
+    #[test]
+    fn live_conflicts_with_an_explicit_read_only_setting() {
+        for value in ["true", "false"] {
+            let result = Cli::try_parse_from(
+                base_args()
+                    .into_iter()
+                    .chain(["--live", "--read-only", value])
+                    .collect::<Vec<_>>(),
+            );
+            assert!(
+                result.is_err(),
+                "--live must conflict with --read-only {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn mainnet_live_is_rejected_while_issue_16_gate_is_closed() {
+        let cli = Cli::try_parse_from(
+            base_args()
+                .into_iter()
+                .chain(["--live", "--max-notional-usd", "5000"])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let error = cli.validate().unwrap_err();
+        assert!(
+            error.contains("mainnet live execution is disabled"),
+            "{error}"
+        );
+        assert!(error.contains("Issue #16"), "{error}");
+        assert!(error.contains("--network testnet"), "{error}");
+    }
+
+    #[test]
+    fn mainnet_live_gate_also_covers_the_legacy_alias() {
+        let cli = Cli::try_parse_from(
+            base_args()
+                .into_iter()
                 .chain(["--read-only", "false", "--max-notional-usd", "5000"])
                 .collect::<Vec<_>>(),
         )
         .unwrap();
+        assert!(cli.is_live());
+        let error = cli.validate().unwrap_err();
+        assert!(
+            error.contains("mainnet live execution is disabled"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn mainnet_resume_is_rejected_with_a_recovery_only_escape_hatch() {
+        let cli = Cli::try_parse_from(
+            base_args()
+                .into_iter()
+                .chain([
+                    "--live",
+                    "--max-notional-usd",
+                    "5000",
+                    "--resume",
+                    "existing-run",
+                ])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let error = cli.validate().unwrap_err();
+        assert!(error.contains("--resume cannot continue"), "{error}");
+        assert!(error.contains("--abandon-incomplete-run"), "{error}");
+    }
+
+    #[test]
+    fn mainnet_abandon_recovery_remains_available_while_gate_is_closed() {
+        let cli = Cli::try_parse_from(
+            base_args()
+                .into_iter()
+                .chain([
+                    "--live",
+                    "--max-notional-usd",
+                    "5000",
+                    "--abandon-incomplete-run",
+                ])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(cli.is_live());
+        cli.validate().unwrap();
+    }
+
+    #[test]
+    fn mainnet_read_only_remains_available() {
+        let cli = Cli::try_parse_from(base_args()).unwrap();
+        assert_eq!(cli.network, NetworkArg::Mainnet);
+        assert!(cli.is_read_only());
         cli.validate().unwrap();
     }
 
@@ -5338,6 +5521,8 @@ mod tests {
             "1500",
             "--duration",
             "5m",
+            "--network",
+            "testnet",
             "--start-after",
             "1s",
             "--max-book-age-ms",
@@ -5401,6 +5586,8 @@ mod tests {
             "1500",
             "--duration",
             "5m",
+            "--network",
+            "testnet",
             "--max-notional-usd",
             "5000",
             "--read-only",
@@ -5418,6 +5605,59 @@ mod tests {
 
         let err = result.expect_err("a live custom endpoint override must be rejected");
         assert!(err.contains("--allow-custom-endpoints"), "{err}");
+    }
+
+    /// The temporary Issue #16 release gate is a true safety boundary, not
+    /// documentation alone: it must fire before credentials, state, locks,
+    /// journals, or HTTP can be touched.
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn mainnet_live_gate_rejects_before_network_or_state_access() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+        let mut server = mockito::Server::new_async().await;
+        let info = server.mock("POST", "/info").expect(0).create_async().await;
+
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+
+        let cli = Cli::try_parse_from([
+            "hype-twap",
+            "--symbol",
+            "HYPE",
+            "--side",
+            "long",
+            "--usd",
+            "50",
+            "--duration",
+            "1m",
+            "--max-notional-usd",
+            "100",
+            "--allow-custom-endpoints",
+            "--state-dir",
+            &state_dir.display().to_string(),
+            "--live",
+        ])
+        .unwrap();
+        let result = run_with_cli(cli).await;
+
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+
+        let error = result.expect_err("mainnet live must remain release-gated");
+        assert!(
+            error.contains("mainnet live execution is disabled"),
+            "{error}"
+        );
+        info.assert_async().await;
+        assert!(
+            !state_dir.exists(),
+            "the gate must fire before state-dir or lock creation"
+        );
     }
 
     // === Issue #4: state-dir / journal / incomplete-run tests ===
@@ -6208,6 +6448,8 @@ mod tests {
             "--symbol".into(),
             "HYPE".into(),
             "--flatten".into(),
+            "--network".into(),
+            "testnet".into(),
             "--duration".into(),
             "1m".into(),
             "--slices".into(),
@@ -7466,7 +7708,7 @@ mod tests {
         std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
         std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
 
-        let args = live_cli(&[], &state_dir);
+        let args = live_cli(&["--network", "testnet"], &state_dir);
         let cli = Cli::try_parse_from(&args).unwrap();
         let result = run_with_cli(cli).await;
 
@@ -8658,7 +8900,7 @@ mod tests {
         std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
         std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
 
-        let args = live_cli(&[], &state_dir);
+        let args = live_cli(&["--network", "testnet"], &state_dir);
         let cli = Cli::try_parse_from(&args).unwrap();
         let result = run_with_cli(cli).await;
 
