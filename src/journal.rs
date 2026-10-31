@@ -615,7 +615,6 @@ impl ExecutionJournal {
 /// `read_all`'s parser, shared with `open_existing` so a journal is only ever
 /// repaired for appending when `read_all` itself accepts it.
 fn parse_records(path: &Path, bytes: &[u8]) -> Result<Vec<JournalRecord>, JournalError> {
-    let ends_with_newline = bytes.last() == Some(&b'\n');
     let lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
     let mut out = Vec::new();
     for (idx, line) in lines.iter().enumerate() {
@@ -625,15 +624,16 @@ fn parse_records(path: &Path, bytes: &[u8]) -> Result<Vec<JournalRecord>, Journa
         match serde_json::from_slice::<JournalRecord>(line) {
             Ok(rec) => out.push(rec),
             Err(e) => {
-                let is_last_nonblank = lines[idx + 1..]
-                    .iter()
-                    .all(|later| later.iter().all(u8::is_ascii_whitespace));
                 // Torn final line IS the normal crash-mid-append shape
                 // ONLY when its trailing newline was never persisted and
                 // at least one prior record (starting with the Header)
                 // parsed. `BufRead::lines` discards that distinction, so
-                // this parser intentionally retains the raw EOF byte.
-                if is_last_nonblank && !ends_with_newline && !out.is_empty() {
+                // this parser intentionally splits the raw bytes: only the
+                // physically last segment has no newline after it. (An
+                // invalid line followed by a newline and blank space was
+                // fully written and is corruption, not a torn tail.)
+                let is_unterminated_last = idx + 1 == lines.len();
+                if is_unterminated_last && !out.is_empty() {
                     break;
                 }
                 return Err(JournalError::Parse {
@@ -3650,7 +3650,15 @@ mod tests {
             filled_sz: "1".into(),
             avg_px: Some("50".into()),
         };
+        drop(ExecutionJournal::open_existing(root, "run-torn-append").unwrap());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            intact_len,
+            "the torn fragment is dropped back to the last complete record"
+        );
         {
+            // Reopening a repaired journal (e.g. a crash right after the
+            // repair) is a no-op.
             let mut j = ExecutionJournal::open_existing(root, "run-torn-append").unwrap();
             j.record(&terminal).unwrap();
         }
@@ -3720,6 +3728,9 @@ mod tests {
             "{\"kind\":\"Header\",\"run_id\":\"run-on".to_owned(),
             "\n\n{\"kind\":\"Header\",\"run_id\":\"run-on".to_owned(),
             format!("{header}\n{{\"kind\":\"Prepared\",not-valid}}\n{{\"kind\":\"Abandon"),
+            // The invalid line has its newline; the blank after it does not
+            // make it a torn tail.
+            format!("{header}\n{{\"kind\":\"Prepar\n  "),
         ] {
             let tmp = TempDir::new().unwrap();
             let root = tmp.path();
