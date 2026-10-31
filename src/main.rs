@@ -229,6 +229,29 @@ fn execution_sizing(
     Ok(sizing)
 }
 
+/// Per-unit price the live preflight checks `--max-notional-usd` with: one
+/// that bounds the first order's fills at this snapshot. A taker buy fills at
+/// or below its limit and a taker sell at or below the best bid
+/// ([`RiskEnvelope::taker_notional_price`]). A post-only sell quotes at the
+/// ask, above both; a post-only buy quotes at the bid, which the taker limit
+/// already bounds.
+fn preflight_cap_price(
+    child_algo: ChildAlgoArg,
+    side: Side,
+    taker_limit_px: Decimal,
+    best_bid: Decimal,
+    best_ask: Decimal,
+    sz_decimals: u32,
+) -> Decimal {
+    let taker = RiskEnvelope::taker_notional_price(taker_limit_px, best_bid, side);
+    match (child_algo, side) {
+        (ChildAlgoArg::Passive | ChildAlgoArg::Follow, Side::Short) => taker.max(
+            hype_trigger_twap::format::round_price(best_ask, sz_decimals, side),
+        ),
+        _ => taker,
+    }
+}
+
 fn child_algo_name(value: ChildAlgoArg) -> &'static str {
     match value {
         ChildAlgoArg::Market => "market",
@@ -2763,7 +2786,15 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
             )
             .map_err(|e| e.to_string())?;
             total_coin
-                * RiskEnvelope::taker_notional_price(conservative_px, snapshot.best_bid, side)
+                .checked_mul(preflight_cap_price(
+                    cli.child_algo,
+                    side,
+                    conservative_px,
+                    snapshot.best_bid,
+                    snapshot.best_ask,
+                    asset.sz_decimals,
+                ))
+                .ok_or_else(|| "requested notional overflow; no order was sent".to_string())?
         }
         (_, Some(usd), _) => usd,
         (None, None, Some(position_plan)) => {
@@ -2792,10 +2823,13 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
             )
             .map_err(|e| e.to_string())?;
             plan_coin
-                .checked_mul(RiskEnvelope::taker_notional_price(
+                .checked_mul(preflight_cap_price(
+                    cli.child_algo,
+                    side,
                     conservative_px,
                     snapshot.best_bid,
-                    side,
+                    snapshot.best_ask,
+                    asset.sz_decimals,
                 ))
                 .ok_or_else(|| "position plan notional overflow; no order was sent".to_string())?
         }
@@ -7335,6 +7369,61 @@ mod tests {
             "1".into(),
             "--max-notional-usd".into(),
             "4985".into(),
+            "--master-address".into(),
+            MASTER.into(),
+            "--allow-custom-endpoints".into(),
+            "--live".into(),
+            "--state-dir".into(),
+            state_dir.display().to_string(),
+        ];
+        let result = run_with_cli(Cli::try_parse_from(args).unwrap()).await;
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+        let error = result.unwrap_err();
+        assert!(error.contains("exceeds --max-notional-usd"), "{error}");
+        exchange.assert_async().await;
+        assert!(!state_dir.join("runs").exists());
+    }
+
+    /// A post-only sell quotes at the ask (50.1), above both its taker limit
+    /// and the bid: 100 HYPE is $5010, so a $5000 cap must be refused at
+    /// preflight rather than only at the first slice after the run started.
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn size_preflight_prices_a_passive_sell_at_its_ask_quote() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+        let mut server = mockito::Server::new_async().await;
+        mock_position_preflight_common(&mut server, true).await;
+        let exchange = server
+            .mock("POST", "/exchange")
+            .expect(0)
+            .create_async()
+            .await;
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+        let args = vec![
+            "hype-twap".to_owned(),
+            "--symbol".into(),
+            "HYPE".into(),
+            "--side".into(),
+            "short".into(),
+            "--size".into(),
+            "100".into(),
+            "--child-algo".into(),
+            "passive".into(),
+            "--network".into(),
+            "testnet".into(),
+            "--duration".into(),
+            "1m".into(),
+            "--slices".into(),
+            "1".into(),
+            "--max-notional-usd".into(),
+            "5000".into(),
             "--master-address".into(),
             MASTER.into(),
             "--allow-custom-endpoints".into(),
