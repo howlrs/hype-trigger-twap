@@ -91,7 +91,7 @@ hype-twap --symbol HYPE --side long --usd 1500 --duration 30m --slices 10
 - `rounding dropped` の警告が出ている場合、その残余が許容できる大きさか
 - 各スライスの想定価格が現在の板と整合しているか
 
-### ステップ 2: funded testnet で Issue #16 を完了する
+### ステップ 2: funded testnet で Issue #16 を確認する (2026-10-31 完了)
 
 **mainnet live はまだ許可されていません。** これまでに実 API で確認できた事項と、
 残っている事項は次のとおりです。
@@ -104,7 +104,7 @@ hype-twap --symbol HYPE --side long --usd 1500 --duration 30m --slices 10
 | 約定済み注文への cancel 拒否文言 | 確認済み | 同ログ: 残り 1,483 件は `cancel_error` / `Order was never placed, already canceled, or filled. asset=N` で拒否され、同数の 1,483 件の settle が `filled` で確定 |
 | 現行バイナリでの funded market smoke | 確認済み | 2026-10-31 funded testnet (main `a1a3717` の release build): ETH long $50 を IOC 2 スライスで全量約定、exit 0。取引所の建玉と journal が一致し、`hype-twap-runs verify` で valid |
 | passive の境界 cancel → settle → requote | 確認済み | 同日 testnet: ETH passive 3 スライスは全量 maker 約定。境界の cancel は「注文はもう無い」拒否として認識され (#50)、`filled` で確定。SOL passive では境界の cancel が受理され `canceled` (約定 0) で確定し、catch-up 分を再発注 |
-| shutdown 時の resting cancel | 確認済み | 同日 testnet: SOL の resting ALO が `openOrders` にあることを確認してから SIGTERM → cancel 受理 → `canceled` で確定、未解決 cloid 0、`openOrders` 0。中断 run は `--abandon-incomplete-run` で照合のうえクローズ (exit 0、追加注文なし) |
+| shutdown 時の resting cancel | 確認済み | 同日 testnet: SOL の resting ALO が `openOrders` にあることを確認してから SIGTERM → cancel → `canceled` (約定 0) で確定、未解決 cloid 0。終了後の `openOrders` は 0。run は shutdown による中断として仕様どおり exit 1 で終了し、`--abandon-incomplete-run` で照合のうえクローズ (exit 0、追加注文なし) |
 | `--flatten` (確認 token・reduce-only) | 確認済み | 同日 testnet: read-only preflight の token で live 実行し、ETH 0.0489 を reduce-only の IOC 2 スライスで解消、`POSITION VERIFIED: signed size 0`、exit 0 |
 
 これで Issue #16 の checklist はすべて実 API で確認できました。ALO 拒否文言は手動手順
@@ -581,8 +581,8 @@ leg に継承されません。例外として `HL_ALERT_HOOK_URL` は allowlist
 上回る額) に絞った**プローブ運用**を必ず行ってください。極小 mainnet
 プローブは過去に実バグ (orderStatus の avgPx 欠落による計上不備、
 resume の二重執行など) をフルサイズ投入前に複数回捕捉した実績が
-ありますが、現在は Issue #16 が未完了なので mainnet probe 自体を行ってはいけません。
-全 checklist の完了を記録して gate を解除した後も、最初は極小額から始めます。
+ありますが、Issue #16 の gate が閉じている間は mainnet probe 自体を行ってはいけません。
+gate を解除した後も、最初は極小額から始めます。
 
 ### `dn-pair.sh` の使用例
 
