@@ -2551,13 +2551,14 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
                 ));
             }
             // A sub-minimum delta is a legitimate no-op for a target that is
-            // already within one minimum order (#43), but `--flatten` asks for
+            // already within one minimum order (#43), but a flat target
+            // (`--flatten`, `--target-sz 0`, `--target-usd 0`) asks for
             // exactly zero: a residual this tool cannot close must not be
-            // reported as success. (A resumed flatten is already reported as
+            // reported as success. (A resumed run is already reported as
             // durably incomplete below.)
-            if cli.flatten && cli.resume.is_none() {
+            if plan.target_szi.is_zero() && cli.resume.is_none() {
                 return Err(format!(
-                    "--flatten cannot reach flat: residual position {} {} (~${} notional) is below the minimum order value {}; no order was sent and the position is NOT flat — close it outside this tool",
+                    "cannot reach flat: residual position {} {} (~${} notional) is below the minimum order value {}; no order was sent and the position is NOT flat — close it outside this tool",
                     human(plan.current_szi),
                     plan.symbol,
                     human(first_phase_notional.round_dp(2)),
@@ -7456,15 +7457,21 @@ mod tests {
         assert!(!state_dir.join("runs").exists());
     }
 
-    /// `--flatten` targets exactly zero. A residual below the minimum order
-    /// value cannot be closed by this tool, so reporting it as a successful
-    /// no-op (exit 0) let automation read "flattened" while a position was
-    /// still open. Nothing is sent either way; the outcome is now a failure
-    /// that says the position is not flat — in dry-run too.
+    /// A flat target (`--flatten`, or an explicit zero target) asks for
+    /// exactly zero. A residual below the minimum order value cannot be
+    /// closed by this tool, so reporting it as a successful no-op (exit 0)
+    /// let automation read "flattened" while a position was still open.
+    /// Nothing is sent either way; the outcome is now a failure that says the
+    /// position is not flat — in dry-run too.
     #[tokio::test]
     #[serial_test::serial(hl_env_vars)]
     async fn flatten_of_a_sub_minimum_residual_fails_instead_of_reporting_flat() {
-        for live in [false, true] {
+        for (live, mode) in [
+            (false, ["--flatten", ""]),
+            (true, ["--flatten", ""]),
+            (false, ["--target-sz", "0"]),
+            (false, ["--target-usd", "0"]),
+        ] {
             let tmp = TempDir::new();
             let state_dir = tmp.path().join("state");
             let mut server = mockito::Server::new_async().await;
@@ -7485,11 +7492,13 @@ mod tests {
             }
             std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
             std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
-            let mut args = vec![
-                "hype-twap".to_owned(),
-                "--symbol".into(),
-                "HYPE".into(),
-                "--flatten".into(),
+            let mut args = vec!["hype-twap".to_owned(), "--symbol".into(), "HYPE".into()];
+            args.extend(
+                mode.iter()
+                    .filter(|arg| !arg.is_empty())
+                    .map(|arg| (*arg).to_owned()),
+            );
+            args.extend([
                 "--network".into(),
                 "testnet".into(),
                 "--duration".into(),
@@ -7500,7 +7509,7 @@ mod tests {
                 MASTER.into(),
                 "--state-dir".into(),
                 state_dir.display().to_string(),
-            ];
+            ]);
             if live {
                 args.extend([
                     "--max-notional-usd".into(),
@@ -7517,10 +7526,10 @@ mod tests {
             let error = result.unwrap_err();
             assert!(
                 error.contains("NOT flat") && error.contains("no order was sent"),
-                "live={live}: {error}"
+                "live={live} {mode:?}: {error}"
             );
             exchange.assert_async().await;
-            assert!(!state_dir.join("runs").exists(), "live={live}");
+            assert!(!state_dir.join("runs").exists(), "live={live} {mode:?}");
         }
     }
 
