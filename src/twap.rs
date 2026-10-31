@@ -892,12 +892,91 @@ pub async fn fetch_fresh_book(
 /// Even though the request was keyed by `oid`, a buggy proxy/client or a
 /// future response-shape change must not let a different order's terminal
 /// fill enter accounting.
+/// What HL has confirmed about a settle cancel so far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelConfirmation {
+    /// No answer from HL yet (e.g. the request or its response was lost).
+    Unconfirmed,
+    /// HL acknowledged the cancel.
+    Cancelled,
+    /// HL rejected the cancel because no live order exists under the cloid
+    /// any more (already filled or cancelled — e.g. an earlier cancel whose
+    /// response was lost did land).
+    NotLive,
+}
+
+/// The `cancelByCloid` that settles a resting child, tracked until HL
+/// confirms nothing under the cloid can fill any more.
+///
+/// A lost cancel is not fatal by itself — `orderStatus` decides what filled —
+/// but while it stays unconfirmed a maker order may still be live, and a
+/// settle that then gives up would leave it on the book after the run exits.
+/// Re-sending is safe: every send is freshly signed (new nonce), and a cancel
+/// can only remove exposure, never add it.
+struct SettleCancel {
+    intent: CancelIntent,
+    confirmation: CancelConfirmation,
+}
+
+impl SettleCancel {
+    fn new(plan: &TwapPlan, cloid: Cloid) -> Self {
+        Self {
+            intent: CancelIntent {
+                symbol: plan.symbol.clone(),
+                by_cloid: cloid,
+            },
+            confirmation: CancelConfirmation::Unconfirmed,
+        }
+    }
+
+    /// HL has confirmed the order can no longer accrue fills.
+    fn confirmed(&self) -> bool {
+        self.confirmation != CancelConfirmation::Unconfirmed
+    }
+
+    /// Send the cancel unless HL already confirmed one.
+    async fn send(&mut self, client: &dyn HlApi, asset: u32) {
+        if self.confirmed() {
+            return;
+        }
+        match client.cancel_by_cloid(&self.intent, asset).await {
+            Ok(()) => self.confirmation = CancelConfirmation::Cancelled,
+            Err(e) if is_cancel_of_non_live_order(&e) => {
+                tracing::info!(
+                    cloid = %self.intent.by_cloid,
+                    "cancelByCloid: HL reports no live order under this cloid any more"
+                );
+                self.confirmation = CancelConfirmation::NotLive;
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                cloid = %self.intent.by_cloid,
+                "cancelByCloid failed; querying orderStatus anyway and re-sending before the next poll"
+            ),
+        }
+    }
+}
+
+/// HL's per-cancel rejection for a cloid with no live order, matched on its
+/// exact known wording (see the `tests/exchange_parse.rs` fixture). A
+/// reworded message is merely not recognised: the cancel keeps being re-sent
+/// while `orderStatus` decides, which is the safe direction.
+fn is_cancel_of_non_live_order(error: &HlError) -> bool {
+    matches!(
+        error,
+        HlError::Exchange { code: Some(code), message }
+            if code == "cancel_error"
+                && message.contains("Order was never placed, already canceled, or filled")
+    )
+}
+
 async fn poll_terminal_status(
     client: &dyn HlApi,
     plan: &TwapPlan,
     user: &Address,
     oid: crate::types::OrderId,
     expected_cloid: Cloid,
+    mut cancel: Option<&mut SettleCancel>,
 ) -> Result<OrderStatusFill, HlError> {
     let mut last_err: Option<String> = None;
     for attempt in 0..plan.settle_retries {
@@ -956,6 +1035,9 @@ async fn poll_terminal_status(
             Err(e) => last_err = Some(e.to_string()),
         }
         if attempt + 1 < plan.settle_retries {
+            if let Some(cancel) = cancel.as_deref_mut() {
+                cancel.send(client, plan.asset_index).await;
+            }
             tokio::time::sleep(order_status_retry_delay_settle(attempt)).await;
         }
     }
@@ -985,12 +1067,9 @@ async fn recover_resting_fill(
     intent: &OrderIntent,
 ) -> Result<OrderStatusFill, HlError> {
     tracing::warn!(oid = %oid, cloid = %cloid, "IOC order rested unexpectedly; cancelling");
-    let cancel = CancelIntent {
-        symbol: plan.symbol.clone(),
-        by_cloid: cloid,
-    };
     // A cancel failure is not fatal by itself — the order may have filled in
-    // the interim. orderStatus below is what decides.
+    // the interim. orderStatus below is what decides; until HL confirms the
+    // cancel it is re-sent between polls (see `SettleCancel`).
     // Keep the ledger query tightly bounded around the cancel.  A fill that
     // belongs to this oid is independently identified below, but bounding the
     // read still prevents a lagging `/info` index from turning this recovery
@@ -999,20 +1078,15 @@ async fn recover_resting_fill(
         .duration_since(UNIX_EPOCH)
         .map_err(|e| HlError::InvalidResponse(format!("system clock before Unix epoch: {e}")))?
         .as_millis() as u64;
-    let cancel_acknowledged = match client.cancel_by_cloid(&cancel, plan.asset_index).await {
-        Ok(()) => true,
-        Err(e) => {
-            tracing::warn!(error = %e, "cancelByCloid failed; querying orderStatus anyway");
-            false
-        }
-    };
+    let mut cancel = SettleCancel::new(plan, cloid);
+    cancel.send(client, plan.asset_index).await;
 
     // F1: orderStatus must be queried as the MASTER, not the agent.
     let user = plan.status_user()?;
-    match poll_terminal_status(client, plan, user, oid, cloid).await {
+    match poll_terminal_status(client, plan, user, oid, cloid, Some(&mut cancel)).await {
         Ok(status) => Ok(status),
-        Err(status_err) if cancel_acknowledged => {
-            // After an acknowledged cancel the order can no longer accrue
+        Err(status_err) if cancel.confirmed() => {
+            // After a confirmed cancel the order can no longer accrue
             // fills.  The official fill ledger is safe to consult only now;
             // query a small pre-cancel overlap to cover exchange timestamps
             // around the cancel race.
@@ -1044,7 +1118,7 @@ async fn recover_resting_fill(
                         "{status_err}; userFillsByTime fallback rejected: {fill_err}"
                     ))
                 })?;
-            // The acknowledged cancel is the settlement boundary: no further
+            // The confirmed cancel is the settlement boundary: no further
             // fills for this child can accrue.  The ledger endpoint is still
             // a bounded view, however, so a positive partial total does not
             // prove that older fills for this oid were included.  Only a
@@ -1577,14 +1651,42 @@ async fn place_alo_child(
                         px: vf.avg_px.unwrap_or(px),
                     }))
                 }
-                Ok(None) | Err(_) => Err(format!(
-                    "slice {slice_idx} failed after ambiguous ALO send: {e}; no resend was attempted; \
-                     SubmittedUnknown remains — rerun with --resume"
-                )),
+                Ok(None) | Err(_) => {
+                    // The single probe can miss a live order (HL's info index
+                    // lags fresh orders). Still never resend, but cancel the
+                    // cloid so a live maker order cannot keep trading after
+                    // this run exits; whatever it did is reconciled by
+                    // --resume either way.
+                    let mut cancel = SettleCancel::new(plan, cloid);
+                    for attempt in 0..AMBIGUOUS_ALO_CANCEL_ATTEMPTS {
+                        cancel.send(client, plan.asset_index).await;
+                        if cancel.confirmed() {
+                            break;
+                        }
+                        if attempt + 1 < AMBIGUOUS_ALO_CANCEL_ATTEMPTS {
+                            tokio::time::sleep(order_status_retry_delay_settle(attempt)).await;
+                        }
+                    }
+                    let cancel_note = match cancel.confirmation {
+                        CancelConfirmation::Cancelled => "a cancel for this cloid was acknowledged",
+                        CancelConfirmation::NotLive => "HL reports no live order for this cloid",
+                        CancelConfirmation::Unconfirmed => {
+                            "no cancel for this cloid was confirmed, so the order may still be live"
+                        }
+                    };
+                    Err(format!(
+                        "slice {slice_idx} failed after ambiguous ALO send: {e}; no resend was attempted; \
+                         {cancel_note}; SubmittedUnknown remains — rerun with --resume"
+                    ))
+                }
             }
         }
     }
 }
+
+/// Bounded cancel attempts for an ambiguous ALO whose single cloid probe
+/// could not confirm it (see `place_alo_child`).
+const AMBIGUOUS_ALO_CANCEL_ATTEMPTS: u32 = 3;
 
 /// How many times a place may be re-signed and re-sent after an AMBIGUOUS
 /// transport failure (W1). Each attempt is preceded by an `orderStatus`
@@ -4560,7 +4662,7 @@ mod loop_tests {
             "B",
         ))));
 
-        let error = poll_terminal_status(&api, &p, &Address::new(MASTER), OrderId(77), cloid)
+        let error = poll_terminal_status(&api, &p, &Address::new(MASTER), OrderId(77), cloid, None)
             .await
             .expect_err("a terminal response for a foreign oid must never be credited");
         assert!(error.to_string().contains("oid mismatch"), "{error}");
@@ -4582,9 +4684,10 @@ mod loop_tests {
             "B",
         ))));
 
-        let error = poll_terminal_status(&api, &p, &Address::new(MASTER), OrderId(77), expected)
-            .await
-            .expect_err("a terminal response for a foreign cloid must never be credited");
+        let error =
+            poll_terminal_status(&api, &p, &Address::new(MASTER), OrderId(77), expected, None)
+                .await
+                .expect_err("a terminal response for a foreign cloid must never be credited");
         assert!(error.to_string().contains("cloid mismatch"), "{error}");
     }
 
@@ -4959,6 +5062,268 @@ mod loop_tests {
             };
         assert!(err.contains("--resume"));
         assert_eq!(api.place_count(), 1);
+    }
+
+    /// A single lost `cancelByCloid` used to be final: the poll loop only
+    /// re-read the status, so a still-`open` maker order outlived the run.
+    /// The cancel is now re-sent (freshly signed) between polls until HL
+    /// acknowledges it.
+    #[tokio::test(start_paused = true)]
+    async fn settle_resends_an_unacknowledged_cancel_between_status_polls() {
+        let mut p = plan(false);
+        p.settle_retries = 3;
+        let cloid = Cloid::new();
+        let intent = OrderIntent {
+            cloid,
+            symbol: Symbol::new("HYPE"),
+            side: Side::Long,
+            px: dec!(51),
+            sz: dec!(2),
+            tif: Tif::Alo,
+            reduce_only: false,
+        };
+        let api = ScriptedApi::new()
+            .push_cancel(Err(HlError::Network("cancel response lost".into())))
+            .push_status(Ok(Some(status_full(
+                dec!(0),
+                None,
+                "open",
+                OrderId(77),
+                Some(cloid),
+                "HYPE",
+                "B",
+            ))))
+            .push_cancel(Ok(()))
+            .push_status(Ok(Some(status_full(
+                dec!(0),
+                None,
+                "canceled",
+                OrderId(77),
+                Some(cloid),
+                "HYPE",
+                "B",
+            ))));
+        let settled = recover_resting_fill(&api, &p, cloid, OrderId(77), &intent)
+            .await
+            .unwrap();
+        assert_eq!(settled.status, "canceled");
+        assert!(
+            matches!(
+                api.calls().as_slice(),
+                [
+                    Call::Cancel { cloid: first },
+                    Call::StatusByOid { .. },
+                    Call::Cancel { cloid: second },
+                    Call::StatusByOid { .. },
+                ] if *first == cloid && *second == cloid
+            ),
+            "{:?}",
+            api.calls()
+        );
+    }
+
+    /// Once a re-sent cancel is acknowledged, the order can no longer accrue
+    /// fills, so the verified ledger fallback becomes as safe as after an
+    /// initially acknowledged cancel.
+    #[tokio::test(start_paused = true)]
+    async fn late_cancel_ack_enables_the_verified_ledger_fallback() {
+        let mut p = plan(false);
+        p.settle_retries = 2;
+        let cloid = Cloid::new();
+        let intent = OrderIntent {
+            cloid,
+            symbol: Symbol::new("HYPE"),
+            side: Side::Long,
+            px: dec!(51),
+            sz: dec!(2),
+            tif: Tif::Alo,
+            reduce_only: false,
+        };
+        let api = ScriptedApi::new()
+            .push_cancel(Err(HlError::Network("cancel response lost".into())))
+            .push_status(Ok(None))
+            .push_cancel(Ok(()))
+            .push_status(Ok(None))
+            .push_fills(Ok(vec![UserFill {
+                coin: "HYPE".into(),
+                px: dec!(50),
+                sz: dec!(2),
+                side: "B".into(),
+                time_ms: 1,
+                oid: OrderId(77),
+                tid: 11,
+                cloid: Some(cloid),
+            }]));
+        let settled = recover_resting_fill(&api, &p, cloid, OrderId(77), &intent)
+            .await
+            .unwrap();
+        assert_eq!(
+            (settled.filled_sz, settled.avg_px),
+            (dec!(2), Some(dec!(50)))
+        );
+    }
+
+    /// If the first cancel landed but its response was lost, the re-sent
+    /// cancel is rejected because nothing is live under the cloid any more.
+    /// That is the same "no more fills" boundary as an acknowledged cancel:
+    /// stop re-sending, and allow the verified ledger fallback.
+    #[tokio::test(start_paused = true)]
+    async fn cancel_rejected_as_no_longer_live_confirms_the_settle_boundary() {
+        let mut p = plan(false);
+        p.settle_retries = 3;
+        let cloid = Cloid::new();
+        let intent = OrderIntent {
+            cloid,
+            symbol: Symbol::new("HYPE"),
+            side: Side::Long,
+            px: dec!(51),
+            sz: dec!(2),
+            tif: Tif::Alo,
+            reduce_only: false,
+        };
+        let api = ScriptedApi::new()
+            .push_cancel(Err(HlError::Network("cancel response lost".into())))
+            .push_status(Ok(None))
+            .push_cancel(Err(HlError::Exchange {
+                code: Some("cancel_error".into()),
+                message: "Order was never placed, already canceled, or filled. asset=0".into(),
+            }))
+            .push_status(Ok(None))
+            .push_status(Ok(None))
+            .push_fills(Ok(vec![UserFill {
+                coin: "HYPE".into(),
+                px: dec!(50),
+                sz: dec!(2),
+                side: "B".into(),
+                time_ms: 1,
+                oid: OrderId(77),
+                tid: 11,
+                cloid: Some(cloid),
+            }]));
+        let settled = recover_resting_fill(&api, &p, cloid, OrderId(77), &intent)
+            .await
+            .unwrap();
+        assert_eq!(
+            (settled.filled_sz, settled.avg_px),
+            (dec!(2), Some(dec!(50)))
+        );
+        assert_eq!(
+            api.calls()
+                .iter()
+                .filter(|call| matches!(call, Call::Cancel { .. }))
+                .count(),
+            2,
+            "no further cancel once HL reports nothing live under the cloid"
+        );
+    }
+
+    /// Re-sending never weakens the fail-closed rule: if no cancel is ever
+    /// confirmed, the ledger is still not consulted.
+    #[tokio::test(start_paused = true)]
+    async fn settle_with_no_confirmed_cancel_still_skips_the_ledger() {
+        let mut p = plan(false);
+        p.settle_retries = 2;
+        let cloid = Cloid::new();
+        let intent = OrderIntent {
+            cloid,
+            symbol: Symbol::new("HYPE"),
+            side: Side::Long,
+            px: dec!(51),
+            sz: dec!(2),
+            tif: Tif::Alo,
+            reduce_only: false,
+        };
+        let api = ScriptedApi::new()
+            .push_cancel(Err(HlError::Network("cancel response lost".into())))
+            .push_status(Ok(None))
+            .push_cancel(Err(HlError::Network("cancel response lost again".into())))
+            .push_status(Ok(None));
+        let err = recover_resting_fill(&api, &p, cloid, OrderId(77), &intent)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("could not determine a terminal fill"),
+            "{err}"
+        );
+        let calls = api.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, Call::Cancel { .. }))
+                .count(),
+            2
+        );
+        assert!(!calls
+            .iter()
+            .any(|call| matches!(call, Call::UserFillsByTime { .. })));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_alo_cancel_reporting_no_live_order_stops_and_says_so() {
+        let p = plan(false);
+        let cloid = Cloid::new();
+        let api = ScriptedApi::new()
+            .push_place(Err(HlError::Network("lost response".into())))
+            .push_status(Ok(None))
+            .push_cancel(Err(HlError::Exchange {
+                code: Some("cancel_error".into()),
+                message: "Order was never placed, already canceled, or filled. asset=0".into(),
+            }));
+        let dl =
+            ExecutionDeadline::new(tokio::time::Instant::now(), p.duration, wall_clock_now_ms());
+        let err =
+            match place_alo_child(&api, &p, &dl, 1, cloid, dec!(51), dec!(2), None, None, None)
+                .await
+            {
+                Err(err) => err,
+                Ok(_) => panic!("an unconfirmed ambiguous ALO must still abort"),
+            };
+        assert!(
+            err.contains("no live order") && err.contains("--resume"),
+            "{err}"
+        );
+        assert_eq!(
+            api.calls()
+                .iter()
+                .filter(|call| matches!(call, Call::Cancel { .. }))
+                .count(),
+            1
+        );
+    }
+
+    /// The single cloid probe after an ambiguous ALO send can miss a live
+    /// order (HL's info index lags fresh orders). The run still aborts for
+    /// `--resume`, but it first cancels the cloid so a live maker order does
+    /// not keep trading after the process exits.
+    #[tokio::test(start_paused = true)]
+    async fn ambiguous_unconfirmed_alo_is_cancelled_before_aborting() {
+        let p = plan(false);
+        let cloid = Cloid::new();
+        let api = ScriptedApi::new()
+            .push_place(Err(HlError::Network("lost response".into())))
+            .push_status(Ok(None))
+            .push_cancel(Err(HlError::Network("cancel response lost".into())))
+            .push_cancel(Ok(()));
+        let dl =
+            ExecutionDeadline::new(tokio::time::Instant::now(), p.duration, wall_clock_now_ms());
+        let err =
+            match place_alo_child(&api, &p, &dl, 1, cloid, dec!(51), dec!(2), None, None, None)
+                .await
+            {
+                Err(err) => err,
+                Ok(_) => panic!("an unconfirmed ambiguous ALO must still abort"),
+            };
+        assert!(err.contains("--resume"), "{err}");
+        assert_eq!(api.place_count(), 1, "cancelling is never a resend");
+        assert_eq!(
+            api.calls()
+                .iter()
+                .filter(|call| matches!(call, Call::Cancel { cloid: got } if *got == cloid))
+                .count(),
+            2,
+            "a lost cancel is retried until confirmed"
+        );
     }
 
     // === (d) happy path ===
