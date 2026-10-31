@@ -115,7 +115,7 @@ hype-twap --symbol ETH --side short --usd 5000 --duration 2h --slices 20 \
 | `--network` | `mainnet` \| `testnet` | `mainnet` | 既定 API エンドポイントと EIP-712 の `Agent.source` を同時に切り替えます。上書きが反対側の公式 mainnet/testnet origin を指す場合も拒否します |
 | `--slippage-bps` | 数値 | `20` | IOC 指値に乗せるスリッページ余裕 (ベーシスポイント)。**10000 bps 以上、または非正の指値になる値は無条件で拒否** (override 不可)。**1000 bps 超は `--allow-high-slippage` が必須** |
 | `--allow-high-slippage` | フラグ | `false` | **unsafe override**。`--slippage-bps` が 1000 bps を超える場合に必須。10000 bps 以上の無条件拒否には効果なし |
-| `--max-notional-usd` | 数値 (USD) | なし | live (`--live`、旧 `--read-only false`) では**必須** (Issue #3、破壊的変更)。同じ論理run全体の累積上限で、`--resume` 前の約定も含みます。二段階で検証されます: (1) 事前検証 — `--usd` は要求額そのもの、`--size` は保守的な指値で概算した名目額、position mode は全 phase の合計数量 (符号を跨ぐ反転では close と open の両方) を保守的な指値で概算した名目額を、実行開始前に比較。(2) 各注文の送信直前 — 全既約定額 + catch-up を反映した実注文数量 × 現在の指値を比較。いずれも上限超過なら `/exchange` へ送る前に停止します。注文数量を残余上限まで自動縮小はせず、runをhard-stopします。`--read-only` では不要 (何も送信しないため) |
+| `--max-notional-usd` | 数値 (USD) | なし | live (`--live`、旧 `--read-only false`) では**必須** (Issue #3、破壊的変更)。同じ論理run全体の累積上限で、`--resume` 前の約定も含みます。二段階で検証されます: (1) 事前検証 — `--usd` は要求額そのもの、`--size` は保守的な価格で概算した名目額、position mode は全 phase の合計数量 (符号を跨ぐ反転では close と open の両方) を保守的な価格で概算した名目額を、実行開始前に比較。(2) 各注文の送信直前 — 全既約定額 + catch-up を反映した実注文数量 × 価格を比較。価格は注文の指値だが、成行の売りは指値より高く約定しうるため最良 bid を使う (snapshot から約定までに板が上がった場合のみ、それを上回りうる)。いずれも上限超過なら `/exchange` へ送る前に停止します。注文数量を残余上限まで自動縮小はせず、runをhard-stopします。`--read-only` では不要 (何も送信しないため) |
 | `--allow-custom-endpoints` | フラグ | `false` | **unsafe override**。本番実行時に `HL_INFO_URL` / `HL_EXCHANGE_URL` の上書きを許可します。指定しても **https:// 以外の URL は拒否**されます (ローカルホストの mock サーバーを使うテスト経路のみ例外)。既知の公式 mainnet/testnet origin は `--network` と一致しなければ拒否されます |
 | `--max-book-age-ms` | 整数 | `3000` | この時間より古い板スナップショットを拒否します。`0` は**鮮度チェックのみ**を無効化するもので、銘柄一致・正値・非交差・並び順といった意味検証と、未来方向 2秒固定の許容 (future-skew) は `0` でも常に適用されます |
 | `--settle-retries` | 整数 | `25` | cancel 済みの既知 resting child を `orderStatus` で確定する最大試行数。`HL_SETTLE_RETRIES` でも上書きできます。変更されるのは cancel/settle の待機予算だけで、ambiguous place の再送規則は変わりません。予算後の `userFillsByTime` fallback も oid/cloid/symbol/side/数量を厳密照合し、不確実なら hard-stop します |
@@ -340,10 +340,11 @@ taker へのフォールバック (最終的に約定しない場合に taker �
   **1000 bps 超**は `--allow-high-slippage` の明示が必須です。
 - **名目額上限**: 本番実行には `--max-notional-usd` が**必須**です
   (0.1.0 からの破壊的変更)。`--usd` は要求額そのもの、`--size` は
-  トリガー時点の板から計算した保守的な指値で概算した名目額として、事前に
+  トリガー時点の板から計算した保守的な価格で概算した名目額として、事前に
   検証されます。さらに**各注文の送信直前にも**、同じ論理runで既に約定した
-  名目額 (`--resume` 前を含む) + catch-up を反映した実注文数量 × 現在の指値を
-  同じ上限と比較します。超過する注文は送信されず、残余上限に収まるよう
+  名目額 (`--resume` 前を含む) + catch-up を反映した実注文数量 × 価格を
+  同じ上限と比較します。価格は注文の指値ですが、成行の売り (IOC) は指値より
+  高い bid で約定しうるため、指値ではなく最良 bid で見積もります。超過する注文は送信されず、残余上限に収まるよう
   数量を縮小することもなくrunをhard-stopします。
 - **価格不明fillの再開会計**: `orderStatus` に `avg_px` がないLong fillは指値を
   保守的な上限として使い、ALO makerはjournalへ保存したTIFから指値約定と

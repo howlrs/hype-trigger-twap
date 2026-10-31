@@ -177,11 +177,30 @@ impl RiskEnvelope {
         Ok(cap)
     }
 
+    /// §2 cont'd: the per-unit price that bounds a TAKER order's notional for
+    /// [`Self::check_notional_cap`]. A buy IOC fills at or below its limit,
+    /// so the limit bounds it. A sell IOC fills at or ABOVE its limit —
+    /// against bids from the best one down — so its limit understates the
+    /// notional by up to the slippage cushion; the touch (best bid) is used
+    /// instead. Only a book that moves up between this snapshot and the
+    /// match can still fill a sell above it.
+    pub fn taker_notional_price(
+        limit_px: Decimal,
+        best_bid: Decimal,
+        side: crate::types::Side,
+    ) -> Decimal {
+        match side {
+            crate::types::Side::Long => limit_px,
+            crate::types::Side::Short => limit_px.max(best_bid),
+        }
+    }
+
     /// §2 cont'd: check a requested/estimated notional against the cap.
-    /// Used both at CLI-validation time (against `--usd`, or a freshly
-    /// computed conservative limit price × `--size`) and again before EACH
-    /// order in the TWAP loop (against prior/current filled notional plus the
-    /// exact catch-up-aware order size at that order's actual limit price).
+    /// Used both at CLI-validation time (against `--usd`, or `--size` /
+    /// a position plan priced by [`Self::taker_notional_price`]) and again
+    /// before EACH order in the TWAP loop (against prior/current filled
+    /// notional plus the exact catch-up-aware order size at the price that
+    /// bounds that order's fills).
     pub fn check_notional_cap(requested: Decimal, cap: Decimal) -> Result<(), RiskError> {
         if requested > cap {
             return Err(RiskError::NotionalCapExceeded { requested, cap });
