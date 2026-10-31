@@ -2762,7 +2762,8 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
                 snapshot.best_ask,
             )
             .map_err(|e| e.to_string())?;
-            total_coin * conservative_px
+            total_coin
+                * RiskEnvelope::taker_notional_price(conservative_px, snapshot.best_bid, side)
         }
         (_, Some(usd), _) => usd,
         (None, None, Some(position_plan)) => {
@@ -2791,7 +2792,11 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
             )
             .map_err(|e| e.to_string())?;
             plan_coin
-                .checked_mul(conservative_px)
+                .checked_mul(RiskEnvelope::taker_notional_price(
+                    conservative_px,
+                    snapshot.best_bid,
+                    side,
+                ))
                 .ok_or_else(|| "position plan notional overflow; no order was sent".to_string())?
         }
         (None, None, None) => return Err("no size specified".into()),
@@ -7276,6 +7281,60 @@ mod tests {
             "1".into(),
             "--max-notional-usd".into(),
             "60".into(),
+            "--master-address".into(),
+            MASTER.into(),
+            "--allow-custom-endpoints".into(),
+            "--live".into(),
+            "--state-dir".into(),
+            state_dir.display().to_string(),
+        ];
+        let result = run_with_cli(Cli::try_parse_from(args).unwrap()).await;
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+        let error = result.unwrap_err();
+        assert!(error.contains("exceeds --max-notional-usd"), "{error}");
+        exchange.assert_async().await;
+        assert!(!state_dir.join("runs").exists());
+    }
+
+    /// The live preflight prices `--size` the same way the slice loop does:
+    /// a market sell can fill at the touch, above its slippage-adjusted
+    /// limit, so 100 HYPE short is ~$4990 at the 49.9 bid (not $4980 at the
+    /// 49.8 limit) and must not pass a $4985 cap.
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn size_preflight_prices_a_market_sell_at_the_touch() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+        let mut server = mockito::Server::new_async().await;
+        mock_position_preflight_common(&mut server, true).await;
+        let exchange = server
+            .mock("POST", "/exchange")
+            .expect(0)
+            .create_async()
+            .await;
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+        let args = vec![
+            "hype-twap".to_owned(),
+            "--symbol".into(),
+            "HYPE".into(),
+            "--side".into(),
+            "short".into(),
+            "--size".into(),
+            "100".into(),
+            "--network".into(),
+            "testnet".into(),
+            "--duration".into(),
+            "1m".into(),
+            "--slices".into(),
+            "1".into(),
+            "--max-notional-usd".into(),
+            "4985".into(),
             "--master-address".into(),
             MASTER.into(),
             "--allow-custom-endpoints".into(),

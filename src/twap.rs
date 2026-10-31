@@ -3262,7 +3262,13 @@ async fn run_twap_journaled_with_prior_notional_and_completion(
         // Using `plan.per_slice` here lets a catch-up order containing several
         // slices pass a check for only one slice. The filled side of the sum
         // includes journal-restored fills from a prior process on `--resume`.
-        let order_notional = order_sz * px;
+        // A market sell can fill above its limit, so it is priced at the
+        // touch; an ALO only ever fills at its own price.
+        let cap_px = match plan.child_algo {
+            ChildAlgo::Market => RiskEnvelope::taker_notional_price(px, bid, plan.side),
+            ChildAlgo::Passive | ChildAlgo::Follow => px,
+        };
+        let order_notional = order_sz * cap_px;
         let filled_notional = stats.cumulative_notional();
         let cumulative_notional_estimate = filled_notional + order_notional;
         if let Err(e) =
@@ -7190,6 +7196,24 @@ mod loop_tests {
 
         assert_eq!(api.place_count(), 1, "order must be placed");
         assert!(report.abort_reason.is_none(), "{:?}", report.abort_reason);
+    }
+
+    /// A market sell is an IOC at `bid * (1 - slippage)`, but it fills
+    /// against bids from the best one down — at or ABOVE that limit. Pricing
+    /// the cap check at the limit understated its notional by up to the
+    /// slippage cushion: 100 @ limit 49.8 = 4980 passed a 4985 cap although
+    /// the order can fill at the 49.9 touch (4990).
+    #[tokio::test(start_paused = true)]
+    async fn notional_cap_prices_a_market_sell_at_the_touch_not_its_limit() {
+        let per_slice = dec!(100);
+        let plan = plan_with_cap(Side::Short, per_slice, dec!(4985));
+        let api = ScriptedApi::new().with_default_book(book_at(dec!(49.9), dec!(50.1)));
+
+        let report = run_twap(&api, &plan).await;
+
+        assert_eq!(api.place_count(), 0, "must reject before /exchange");
+        let reason = report.abort_reason.expect("must abort");
+        assert!(reason.contains("notional"), "{reason}");
     }
 
     #[tokio::test(start_paused = true)]
