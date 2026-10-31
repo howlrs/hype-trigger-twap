@@ -2566,6 +2566,22 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
                 ExitCode::SUCCESS
             });
         }
+        // The open phase of a reversal is only sized after the close phase
+        // has flattened the account. Size every phase now with the exact
+        // inputs execution uses (this preflight `mid`, `--slices`,
+        // szDecimals) so a plan whose open phase can never run is refused
+        // before the close sends anything, rather than after it has stranded
+        // the account flat — and so dry-run reports what live would refuse.
+        for phase in &plan.phases {
+            execution_sizing(phase.size, cli.slices, asset.sz_decimals, mid, true).map_err(|e| {
+                let kind = match phase.kind {
+                    PositionPhaseKind::Adjust => "adjust",
+                    PositionPhaseKind::CloseToFlat => "close-to-flat",
+                    PositionPhaseKind::OpenFromFlat => "open-from-flat",
+                };
+                format!("position {kind} phase cannot be executed: {e}; no order was sent")
+            })?;
+        }
         if cli.flatten {
             // A resumed flatten may have partially reduced the position, so
             // `plan` describes only the remaining delta.  The operator
@@ -2749,7 +2765,16 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
             total_coin * conservative_px
         }
         (_, Some(usd), _) => usd,
-        (None, None, Some(_)) => {
+        (None, None, Some(position_plan)) => {
+            // The cap bounds the whole logical run, and a reversal spends it
+            // on both phases. Both phases trade the same side (closing a long
+            // and opening a short both sell), so one conservative price
+            // prices the whole plan.
+            let plan_coin = position_plan
+                .phases
+                .iter()
+                .try_fold(Decimal::ZERO, |acc, phase| acc.checked_add(phase.size))
+                .ok_or_else(|| "position plan size overflow; no order was sent".to_string())?;
             let conservative_px = hype_trigger_twap::format::taker_limit_price(
                 snapshot.best_bid,
                 snapshot.best_ask,
@@ -2765,7 +2790,9 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
                 snapshot.best_ask,
             )
             .map_err(|e| e.to_string())?;
-            total_coin * conservative_px
+            plan_coin
+                .checked_mul(conservative_px)
+                .ok_or_else(|| "position plan notional overflow; no order was sent".to_string())?
         }
         (None, None, None) => return Err("no size specified".into()),
     };
@@ -7009,6 +7036,169 @@ mod tests {
             1,
             "only authoritative target verification finishes the run: {events:?}"
         );
+    }
+
+    /// A reversal whose open phase can never be sized (here 0.1 HYPE ≈ $5,
+    /// below the $10 minimum) must be refused before the close phase sends
+    /// anything — in dry-run too, so the preflight predicts the live result.
+    /// Otherwise the run flattens the whole long, then fails at open-phase
+    /// sizing and leaves the account flat instead of short.
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn zero_crossing_unexecutable_open_phase_is_rejected_before_any_close_order() {
+        for live in [false, true] {
+            let tmp = TempDir::new();
+            let state_dir = tmp.path().join("state");
+            let mut server = mockito::Server::new_async().await;
+            mock_position_preflight(
+                &mut server,
+                r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"5"}}]}"#,
+                live,
+            )
+            .await;
+            let exchange = server
+                .mock("POST", "/exchange")
+                .expect(0)
+                .create_async()
+                .await;
+            if live {
+                std::env::set_var("HL_AGENT_PK", TEST_PK);
+                std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+            }
+            std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+            std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+            let mut args = vec![
+                "hype-twap".to_owned(),
+                "--symbol".into(),
+                "HYPE".into(),
+                "--target-sz".into(),
+                "-0.1".into(),
+                "--network".into(),
+                "testnet".into(),
+                "--duration".into(),
+                "1m".into(),
+                "--slices".into(),
+                "1".into(),
+                "--master-address".into(),
+                MASTER.into(),
+                "--state-dir".into(),
+                state_dir.display().to_string(),
+            ];
+            if live {
+                args.extend([
+                    "--max-notional-usd".into(),
+                    "1000".into(),
+                    "--allow-custom-endpoints".into(),
+                    "--live".into(),
+                ]);
+            }
+            let result = run_with_cli(Cli::try_parse_from(args).unwrap()).await;
+            std::env::remove_var("HL_AGENT_PK");
+            std::env::remove_var("HL_AGENT_ADDRESS");
+            std::env::remove_var("HL_INFO_URL");
+            std::env::remove_var("HL_EXCHANGE_URL");
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("open-from-flat phase") && error.contains("no order was sent"),
+                "live={live}: {error}"
+            );
+            exchange.assert_async().await;
+            assert!(
+                !state_dir.join("runs").exists(),
+                "live={live}: a rejected plan must not create a run journal"
+            );
+        }
+    }
+
+    /// The same preflight sizing applies to a single-phase plan, so dry-run
+    /// no longer reports success for a target live would refuse: flat →
+    /// 0.4 HYPE (~$20) over 4 slices is $5 per slice, below the minimum.
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn read_only_position_plan_reports_unexecutable_slice_sizing() {
+        let mut server = mockito::Server::new_async().await;
+        mock_position_preflight(&mut server, r#"{"assetPositions":[]}"#, false).await;
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+        let cli = Cli::try_parse_from([
+            "hype-twap",
+            "--symbol",
+            "HYPE",
+            "--target-sz",
+            "0.4",
+            "--master-address",
+            MASTER,
+            "--duration",
+            "1m",
+            "--slices",
+            "4",
+        ])
+        .unwrap();
+        let result = run_with_cli(cli).await;
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("position adjust phase cannot be executed"),
+            "{error}"
+        );
+    }
+
+    /// `--max-notional-usd` bounds the whole logical run. A reversal spends
+    /// it on BOTH phases, so checking only the close phase at preflight let
+    /// a 1 → -1 reversal under a $60 cap close fully (~$50) and then
+    /// hard-stop at the first open slice, stranding the account flat.
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn zero_crossing_preflight_caps_the_whole_reversal_notional() {
+        let tmp = TempDir::new();
+        let state_dir = tmp.path().join("state");
+        let mut server = mockito::Server::new_async().await;
+        mock_position_preflight(
+            &mut server,
+            r#"{"assetPositions":[{"position":{"coin":"HYPE","szi":"1"}}]}"#,
+            true,
+        )
+        .await;
+        let exchange = server
+            .mock("POST", "/exchange")
+            .expect(0)
+            .create_async()
+            .await;
+        std::env::set_var("HL_AGENT_PK", TEST_PK);
+        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+        let args = vec![
+            "hype-twap".to_owned(),
+            "--symbol".into(),
+            "HYPE".into(),
+            "--target-sz".into(),
+            "-1".into(),
+            "--network".into(),
+            "testnet".into(),
+            "--duration".into(),
+            "1m".into(),
+            "--slices".into(),
+            "1".into(),
+            "--max-notional-usd".into(),
+            "60".into(),
+            "--master-address".into(),
+            MASTER.into(),
+            "--allow-custom-endpoints".into(),
+            "--live".into(),
+            "--state-dir".into(),
+            state_dir.display().to_string(),
+        ];
+        let result = run_with_cli(Cli::try_parse_from(args).unwrap()).await;
+        std::env::remove_var("HL_AGENT_PK");
+        std::env::remove_var("HL_AGENT_ADDRESS");
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+        let error = result.unwrap_err();
+        assert!(error.contains("exceeds --max-notional-usd"), "{error}");
+        exchange.assert_async().await;
+        assert!(!state_dir.join("runs").exists());
     }
 
     #[tokio::test]
