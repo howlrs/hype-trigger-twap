@@ -93,13 +93,32 @@ hype-twap --symbol HYPE --side long --usd 1500 --duration 30m --slices 10
 
 ### ステップ 2: funded testnet で Issue #16 を完了する
 
-**mainnet live はまだ許可されていません。** 2026-09-04 に testnet の read-only
-`meta` / unknown-oid `orderStatus` conformance は通過しましたが、funded account を
-使う market/passive の実発注、ALO 拒否文言、cancel の `expiresAfter: null` は未検証です。
-まず funded testnet account で、ごく少額の market smoke を実施します。
+**mainnet live はまだ許可されていません。** これまでに実 API で確認できた事項と、
+残っている事項は次のとおりです。
+
+| 項目 | 状態 | 根拠 |
+|---|---|---|
+| `meta` / unknown-oid `orderStatus` の応答 shape | 確認済み | testnet read-only conformance (`tests/status_vocabulary_conformance.rs`)、2026-09-04 と 2026-10-31 に通過 |
+| ALO 拒否文言 | 確認済み | gate 導入前の mainnet 本番ログ (2026-08-20〜23): `Post only order would have immediately matched, bbo was …` 531 件、すべて ALO 拒否 (zero-fill skip) として分類 |
+| cancel の `expiresAfter: null` 受理 | 確認済み | 同ログ: 境界 cancel 2,305 件のうち 822 件が受理され `canceled` で確定 |
+| 約定済み注文への cancel 拒否文言 | 確認済み | 同ログ: 残り 1,483 件は `cancel_error` / `Order was never placed, already canceled, or filled. asset=N` で拒否され、全件 `filled` で確定 |
+| 現行バイナリでの funded market / passive smoke | **未実施** | 上記ログは大規模改修 (#45) 前のバイナリ。cancel・署名のワイヤ形式は現在まで不変だが、実行ロジックは現行版で実 API 未確認 |
+| shutdown 時の resting cancel | **未実施** | 同ログの SIGTERM 停止 3 回はいずれも resting 注文がない時点だった (境界の cancel→settle と同じ関数だが、この経路そのものは未観測) |
+
+gate の解除条件は、残っている 2 項目を **現行バイナリ** の funded testnet で確認し、
+この表を更新することです。testnet は mainnet と別チェーンなので、事前に次の準備が
+必要です (いずれも master ウォレットの操作で、このツールからは行いません)。
+
+1. testnet の faucet で master に mock USDC を受け取る (mainnet で入金履歴のある
+   アドレスが必要)。
+2. testnet の UI で API wallet (agent) を承認し、その秘密鍵を mainnet 用とは別の
+   エントリ (例: `pass insert hyperliquid/testnet-agent-pk`) に保存する。
+   mainnet で承認済みの agent は testnet では未登録 (`userRole` が `missing`) です。
+
+準備ができたら、まずごく少額の market smoke を実施します。
 
 ```bash
-export HL_AGENT_PK=$(pass show hyperliquid/agent-pk)
+export HL_AGENT_PK=$(pass show hyperliquid/testnet-agent-pk)
 hype-twap --symbol HYPE --side long --usd 50 --duration 5m --slices 2 \
   --network testnet --max-notional-usd 60 --live
 ```
@@ -861,10 +880,11 @@ override はできません — タイプミスの可能性を疑ってくださ
   いずれもタイムアウト時のテイカー切り替えは行いません — 未約定分は次の
   スライスへ持ち越されるのみです
   ([issue #1](https://github.com/howlrs/hype-trigger-twap/issues/1))
-- **testnet conformance は一部のみ確認済みです。** 2026-09-04 に公開 `meta` と
-  unknown-oid `orderStatus` の応答shapeを実APIで確認済みです。funded account が必要な
-  market/passive smoke、ALO拒否文言、cancel `expiresAfter: null` は未実施なので、
-  mainnet live の前に Issue #16 の手順を完了し、初回は少額から始めてください
+- **Issue #16 の実 API 確認は一部のみ完了です。** 応答 shape (testnet read-only)、
+  ALO 拒否文言、cancel の `expiresAfter: null` 受理、約定済み注文への cancel 拒否文言
+  (gate 導入前の mainnet 本番ログ) は確認済みです。現行バイナリでの funded
+  market/passive smoke と shutdown 時の resting cancel は未実施なので、mainnet live
+  は引き続き gate で拒否されます (「ステップ 2」の表を参照)
 - **単一ホスト内の単一 writer のみ保証します。** 同一ホスト・同一
   `network + agent` の二重起動は起動時ロックで検知しますが、複数ホストに
   またがる二重起動は検知できません。「単一 writer ロックと nonce の運用境界」
