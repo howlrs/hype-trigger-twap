@@ -91,7 +91,7 @@ hype-twap --symbol HYPE --side long --usd 1500 --duration 30m --slices 10
 - `rounding dropped` の警告が出ている場合、その残余が許容できる大きさか
 - 各スライスの想定価格が現在の板と整合しているか
 
-### ステップ 2: funded testnet で Issue #16 を完了する
+### ステップ 2: funded testnet で Issue #16 を確認する (2026-10-31 完了)
 
 **mainnet live はまだ許可されていません。** これまでに実 API で確認できた事項と、
 残っている事項は次のとおりです。
@@ -102,14 +102,16 @@ hype-twap --symbol HYPE --side long --usd 1500 --duration 30m --slices 10
 | ALO 拒否文言 | 確認済み | gate 導入前の mainnet 本番ログ (2026-08-20〜23): `Post only order would have immediately matched, bbo was …` 531 件、すべて ALO 拒否 (zero-fill skip) として分類 |
 | cancel の `expiresAfter: null` 受理 | 確認済み | 同ログ: 境界 cancel 2,305 件のうち 822 件が受理され `canceled` で確定 |
 | 約定済み注文への cancel 拒否文言 | 確認済み | 同ログ: 残り 1,483 件は `cancel_error` / `Order was never placed, already canceled, or filled. asset=N` で拒否され、同数の 1,483 件の settle が `filled` で確定 |
-| 現行バイナリでの funded market / passive smoke | **未実施** | 上記ログは 2026-09-05 にマージされた大規模改修 (#45) より前にビルドされたバイナリのもの。cancel のワイヤ形式と署名実装 (`src/eip712.rs` / `src/signer.rs`) は現在まで不変だが、実行ロジックは現行版で実 API 未確認 |
-| shutdown 時の resting cancel | **未実施** | 同ログの SIGTERM 停止 3 回はいずれも resting 注文がない時点だった (境界の cancel→settle と同じ関数だが、この経路そのものは未観測) |
+| 現行バイナリでの funded market smoke | 確認済み | 2026-10-31 funded testnet (main `a1a3717` の release build): ETH long $50 を IOC 2 スライスで全量約定、exit 0。取引所の建玉と journal が一致し、`hype-twap-runs verify` で valid |
+| passive の境界 cancel → settle → requote | 確認済み | 同日 testnet: ETH passive 3 スライスは全量 maker 約定。境界の cancel は「注文はもう無い」拒否として認識され (#50)、`filled` で確定。SOL passive では境界の cancel が受理され `canceled` (約定 0) で確定し、catch-up 分を再発注 |
+| shutdown 時の resting cancel | 確認済み | 同日 testnet: SOL の resting ALO が `openOrders` にあることを確認してから SIGTERM → cancel → `canceled` (約定 0) で確定、未解決 cloid 0。終了後の `openOrders` は 0。run は shutdown による中断として仕様どおり exit 1 で終了し、`--abandon-incomplete-run` で照合のうえクローズ (exit 0、追加注文なし) |
+| `--flatten` (確認 token・reduce-only) | 確認済み | 同日 testnet: read-only preflight の token で live 実行し、ETH 0.0489 を reduce-only の IOC 2 スライスで解消、`POSITION VERIFIED: signed size 0`、exit 0 |
 
-Issue #16 の checklist のうち残っているのは、表の **未実施** 2 項目 (現行バイナリでの
-market smoke と、passive の境界 cancel → settle → requote / 終了時 resting cancel)
-です。ALO 拒否文言は手動手順 (`live_alo_rejection_wording_matches_what_is_alo_reject_recognises`)
-ではなく上記の本番ログで確認しました。gate の解除条件は、この 2 項目を
-**現行バイナリ** の funded testnet で確認し、この表を更新することです。
+これで Issue #16 の checklist はすべて実 API で確認できました。ALO 拒否文言は手動手順
+(`live_alo_rejection_wording_matches_what_is_alo_reject_recognises`) ではなく上記の
+本番ログで確認しています (testnet smoke では拒否は発生しなかった)。ただし runtime gate
+(`MAINNET_LIVE_ENABLED`) はまだ有効化していません。mainnet live の解禁は、この結果を
+踏まえた別の release 変更として行います。
 
 testnet は mainnet と別チェーンなので、事前に次の準備が必要です (いずれも master
 ウォレットの操作で、このツールからは行いません)。
@@ -137,9 +139,10 @@ cancel を確認して、上の表を更新してください (ALO 拒否文言�
 ### ステップ 3: mainnet 移行判定
 
 Issue #16 の **全 checklist が実 API で完了し、その結果が文書化されるまで、
-mainnet で `--live` を実行しないでください。** 現在は runtime gate でも拒否されるため、
-mainnet live 用の実行コマンドは掲載しません。read-only で計画確認を続けるか、
-明示的な `--network testnet` でのみ検証してください。
+mainnet で `--live` を実行しないでください。** checklist は 2026-10-31 に完了しました
+(ステップ 2 の表) が、gate の有効化は別の release 変更として行うため、現在も runtime
+gate で拒否されます。そのため mainnet live 用の実行コマンドは掲載しません。
+read-only で計画確認を続けるか、明示的な `--network testnet` でのみ検証してください。
 
 gate 導入前の mainnet 未完了 journal がある場合、放置してはいけません。
 `--resume` は新規注文へ進み得るため拒否されますが、`--abandon-incomplete-run` は
@@ -578,8 +581,8 @@ leg に継承されません。例外として `HL_ALERT_HOOK_URL` は allowlist
 上回る額) に絞った**プローブ運用**を必ず行ってください。極小 mainnet
 プローブは過去に実バグ (orderStatus の avgPx 欠落による計上不備、
 resume の二重執行など) をフルサイズ投入前に複数回捕捉した実績が
-ありますが、現在は Issue #16 が未完了なので mainnet probe 自体を行ってはいけません。
-全 checklist の完了を記録して gate を解除した後も、最初は極小額から始めます。
+ありますが、Issue #16 の gate が閉じている間は mainnet probe 自体を行ってはいけません。
+gate を解除した後も、最初は極小額から始めます。
 
 ### `dn-pair.sh` の使用例
 
@@ -886,11 +889,10 @@ override はできません — タイプミスの可能性を疑ってくださ
   いずれもタイムアウト時のテイカー切り替えは行いません — 未約定分は次の
   スライスへ持ち越されるのみです
   ([issue #1](https://github.com/howlrs/hype-trigger-twap/issues/1))
-- **Issue #16 の実 API 確認は一部のみ完了です。** 応答 shape (testnet read-only)、
-  ALO 拒否文言、cancel の `expiresAfter: null` 受理、約定済み注文への cancel 拒否文言
-  (gate 導入前の mainnet 本番ログ) は確認済みです。現行バイナリでの funded
-  market/passive smoke と shutdown 時の resting cancel は未実施なので、mainnet live
-  は引き続き gate で拒否されます (「ステップ 2」の表を参照)
+- **mainnet live は runtime gate で無効のままです。** Issue #16 の実 API 確認は
+  2026-10-31 に完了しました (応答 shape、ALO 拒否文言、cancel の受理/拒否文言、現行
+  バイナリでの funded testnet market/passive smoke、shutdown 時の resting cancel、
+  flatten。「ステップ 2」の表を参照)。gate の有効化は別の release 変更として行います
 - **単一ホスト内の単一 writer のみ保証します。** 同一ホスト・同一
   `network + agent` の二重起動は起動時ロックで検知しますが、複数ホストに
   またがる二重起動は検知できません。「単一 writer ロックと nonce の運用境界」

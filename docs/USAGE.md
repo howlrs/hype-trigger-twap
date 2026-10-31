@@ -36,10 +36,10 @@ live 実行の終了時に同一 schema の report を保存するには `--repo
 この report はプロセス内の集計ではなく、終了後に journal を再読込して
 `ValidatedJournalReplay` から作られるため、`hype-twap-runs inspect` と一致します。
 
-> **Issue #16 の funded testnet checklist が未完了のため、mainnet live は現在禁止です。**
-> 以下の live 例はすべて `--network testnet` を明示します。market/passive smoke、
-> ALO 拒否文言、cancel `expiresAfter: null` の実 API 確認と結果の文書化が終わるまで、
-> mainnet へ切り替えないでください。
+> **mainnet live は Issue #16 の runtime gate で現在も禁止です。** market/passive smoke、
+> ALO 拒否文言、cancel `expiresAfter: null` の実 API 確認は 2026-10-31 に完了し、
+> docs/OPERATIONS.md「ステップ 2」に記録しました。mainnet の有効化は別の release 変更で
+> 行うため、それまで以下の live 例はすべて `--network testnet` を明示します。
 > gate 導入前の未完了 mainnet journal は例外として、追加発注を行わない
 > `--abandon-incomplete-run` で照合・cancel・終了できます。`--resume` は拒否されます。
 
@@ -110,7 +110,7 @@ hype-twap --symbol ETH --side short --usd 5000 --duration 2h --slices 20 \
 | `--trigger-when` | `above` \| `below` | なし | `above`: mid が閾値以上で発火 / `below`: mid が閾値以下で発火。**自動推定はしません** |
 | `--start-after` | 期間 | なし | 指定時間の経過で発火。価格トリガーとは OR 条件 (先に成立した方が勝ち) |
 | `--read-only` | `true` \| `false` | **`true`** | `true` は署名も送信も行いません。`false` は 0.1.x の非推奨な `--live` 互換 alias として残ります |
-| `--live` | フラグ | `false` | 実発注を有効化します。testnet live のみ利用可能で、Issue #16 完了までは mainnet の新規・再開発注は runtime で拒否されます。mainnet read-only と、追加発注しない `--abandon-incomplete-run` は利用できます。旧 `--read-only false` は 0.1.x の warning 付き互換 alias です |
+| `--live` | フラグ | `false` | 実発注を有効化します。testnet live のみ利用可能で、Issue #16 の gate を解除するまでは mainnet の新規・再開発注は runtime で拒否されます。mainnet read-only と、追加発注しない `--abandon-incomplete-run` は利用できます。旧 `--read-only false` は 0.1.x の warning 付き互換 alias です |
 | `--event-jsonl` | パス | なし | read-only simulation の schema-versioned lifecycle event を明示パスへ保存します。live state directory やjournalは作成しません。本番runはrun directory内の`events.jsonl`を自動使用するため指定不可です |
 | `--network` | `mainnet` \| `testnet` | `mainnet` | 既定 API エンドポイントと EIP-712 の `Agent.source` を同時に切り替えます。上書きが反対側の公式 mainnet/testnet origin を指す場合も拒否します |
 | `--slippage-bps` | 数値 | `20` | IOC 指値に乗せるスリッページ余裕 (ベーシスポイント)。**10000 bps 以上、または非正の指値になる値は無条件で拒否** (override 不可)。**1000 bps 超は `--allow-high-slippage` が必須** |
