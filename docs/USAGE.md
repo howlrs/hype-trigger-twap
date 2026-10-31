@@ -127,7 +127,7 @@ hype-twap --symbol ETH --side short --usd 5000 --duration 2h --slices 20 \
 | `--follow-threshold-bps` | 数値 | `1.0` | `--child-algo follow` 専用。touch が resting 価格からこのベーシスポイント以上離れない限り再クオートしません (ヒステリシス)。他の `--child-algo` では無視されます (警告あり) |
 | `--state-dir` | パス | なし (`$XDG_STATE_HOME/hype-twap`、未設定なら `~/.local/state/hype-twap`) | 実行状態 (ジャーナル / ロック / nonce HWM) を保存するルートディレクトリ (Issue #4)。`--read-only` の実行はここに一切触れません — ディレクトリもジャーナルも作成されません |
 | `--resume` | 文字列 (run id) | なし | 指定した run id の未完了 run を再開します (Issue #4)。live では `--master-address` または `HL_MASTER_ADDRESS` が必須で、network / agent / master / symbol / side を外部 API 呼び出し前に照合します。その後、submitted/unknown cloid をすべて `orderStatus` で照合し、記録済み約定は再送しません。`--abandon-incomplete-run` とは排他です |
-| `--abandon-incomplete-run` | フラグ | `false` | 同一 network+agent で検出された未完了 run を強制照合したうえで放棄し、**続行も追加発注もしません** (Issue #4)。live では事前 identity 照合用の明示 master address が必須です。gate 導入前の mainnet journal にも利用できます。`--resume` とは排他です |
+| `--abandon-incomplete-run` | フラグ | `false` | 同一 network+agent で検出された未完了 run を強制照合したうえで放棄し、**続行も追加発注もしません** (Issue #4)。live では事前 identity 照合用の明示 master address が必須です。どの network でも回復専用です。`--resume` とは排他です |
 | `--shutdown-grace` | 期間 (`30m`, `1h`) | `60s` | SIGINT/SIGTERM を受けてから、進行中の注文の照合、resting 注文のキャンセル、position phase と最終確認までに費やせる単一の猶予時間 (Issue #4)。超過すると、未解決の cloid を `outcome_unknown` としてジャーナルに記録したうえで非ゼロ終了します |
 
 `--size` と `--usd` はどちらか一方が必須です。両方指定または両方省略はエラーになります。

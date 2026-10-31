@@ -132,7 +132,7 @@ append-only record of everything that was sent.
 | `--wait-network-grace` | humantime | `30m` | How long a consecutive trigger-poll failure streak (network error or empty book) may run before the wait hard-stops. Timed from the first failure in the streak, resets on any successful poll. |
 | `--state-dir` | path | `$XDG_STATE_HOME/hype-twap` or `~/.local/state/hype-twap` | Root directory for run-state persistence (journal/lock/nonce-HWM). A read-only run never touches this. |
 | `--resume` | string (run id) | none | Resume a specific incomplete run by its run id. Live use requires `--master-address` or `HL_MASTER_ADDRESS`, allowing network/agent/master/symbol/side identity validation before any external API call. Every submitted/unknown cloid is then reconciled via `orderStatus`. Mutually exclusive with `--abandon-incomplete-run`. |
-| `--abandon-incomplete-run` | bool | `false` | Force-reconcile the incomplete run detected for this network+agent and mark it abandoned, WITHOUT continuing it or placing a new order. Also requires an explicit master address for the pre-network identity check. This recovery-only path remains available for pre-gate mainnet journals. |
+| `--abandon-incomplete-run` | bool | `false` | Force-reconcile the incomplete run detected for this network+agent and mark it abandoned, WITHOUT continuing it or placing a new order. Also requires an explicit master address for the pre-network identity check. It is recovery-only on every network. |
 | `--shutdown-grace` | humantime | `60s` | How long a SIGINT/SIGTERM shutdown may spend reconciling in-flight orders, cancelling confirmed resting ones, and completing position-phase/final verification before giving up. |
 
 ### Journal inspection
