@@ -17,8 +17,8 @@ closing an older incomplete mainnet journal without placing a new order.
 
 > **Mainnet live is currently blocked by Issue #16.** Public testnet response
 > conformance has passed, and pre-gate mainnet production logs confirm the
-> ALO-rejection wording and cancel acceptance with `expiresAfter: null` (same
-> cancel/signing wire format as today). A funded testnet market/passive smoke
+> ALO-rejection wording and cancel acceptance with `expiresAfter: null` (the
+> cancel wire format and signing code are unchanged since). A funded testnet market/passive smoke
 > with the current binary is still outstanding (see docs/OPERATIONS.md, step 2).
 > Every live example below therefore selects `--network testnet`; do not remove
 > it until that checklist is completed and documented.

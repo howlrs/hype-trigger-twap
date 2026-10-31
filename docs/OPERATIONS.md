@@ -101,16 +101,21 @@ hype-twap --symbol HYPE --side long --usd 1500 --duration 30m --slices 10
 | `meta` / unknown-oid `orderStatus` の応答 shape | 確認済み | testnet read-only conformance (`tests/status_vocabulary_conformance.rs`)、2026-09-04 と 2026-10-31 に通過 |
 | ALO 拒否文言 | 確認済み | gate 導入前の mainnet 本番ログ (2026-08-20〜23): `Post only order would have immediately matched, bbo was …` 531 件、すべて ALO 拒否 (zero-fill skip) として分類 |
 | cancel の `expiresAfter: null` 受理 | 確認済み | 同ログ: 境界 cancel 2,305 件のうち 822 件が受理され `canceled` で確定 |
-| 約定済み注文への cancel 拒否文言 | 確認済み | 同ログ: 残り 1,483 件は `cancel_error` / `Order was never placed, already canceled, or filled. asset=N` で拒否され、全件 `filled` で確定 |
-| 現行バイナリでの funded market / passive smoke | **未実施** | 上記ログは大規模改修 (#45) 前のバイナリ。cancel・署名のワイヤ形式は現在まで不変だが、実行ロジックは現行版で実 API 未確認 |
+| 約定済み注文への cancel 拒否文言 | 確認済み | 同ログ: 残り 1,483 件は `cancel_error` / `Order was never placed, already canceled, or filled. asset=N` で拒否され、同数の 1,483 件の settle が `filled` で確定 |
+| 現行バイナリでの funded market / passive smoke | **未実施** | 上記ログは 2026-09-05 にマージされた大規模改修 (#45) より前にビルドされたバイナリのもの。cancel のワイヤ形式と署名実装 (`src/eip712.rs` / `src/signer.rs`) は現在まで不変だが、実行ロジックは現行版で実 API 未確認 |
 | shutdown 時の resting cancel | **未実施** | 同ログの SIGTERM 停止 3 回はいずれも resting 注文がない時点だった (境界の cancel→settle と同じ関数だが、この経路そのものは未観測) |
 
-gate の解除条件は、残っている 2 項目を **現行バイナリ** の funded testnet で確認し、
-この表を更新することです。testnet は mainnet と別チェーンなので、事前に次の準備が
-必要です (いずれも master ウォレットの操作で、このツールからは行いません)。
+Issue #16 の checklist のうち残っているのは、表の **未実施** 2 項目 (現行バイナリでの
+market smoke と、passive の境界 cancel → settle → requote / 終了時 resting cancel)
+です。ALO 拒否文言は手動手順 (`live_alo_rejection_wording_matches_what_is_alo_reject_recognises`)
+ではなく上記の本番ログで確認しました。gate の解除条件は、この 2 項目を
+**現行バイナリ** の funded testnet で確認し、この表を更新することです。
 
-1. testnet の faucet で master に mock USDC を受け取る (mainnet で入金履歴のある
-   アドレスが必要)。
+testnet は mainnet と別チェーンなので、事前に次の準備が必要です (いずれも master
+ウォレットの操作で、このツールからは行いません)。
+
+1. testnet の faucet で master に mock USDC を受け取る (受け取り条件は
+   Hyperliquid 側の案内に従う)。
 2. testnet の UI で API wallet (agent) を承認し、その秘密鍵を mainnet 用とは別の
    エントリ (例: `pass insert hyperliquid/testnet-agent-pk`) に保存する。
    mainnet で承認済みの agent は testnet では未登録 (`userRole` が `missing`) です。
@@ -123,10 +128,11 @@ hype-twap --symbol HYPE --side long --usd 50 --duration 5m --slices 2 \
   --network testnet --max-notional-usd 60 --live
 ```
 
-続いて Issue #16 の checklist に従い、passive の境界 cancel → settle → requote、
-終了時 resting cancel、ALO 拒否文言、cancel の `expiresAfter: null` を同じ testnet
-account で確認し、結果をこの文書へ記録してください。失敗する場合は mainnet へ
-進まず、API との乖離を修正します。
+続いて同じ testnet account で `--child-algo passive` (または `follow`) を実行し、
+境界 cancel → settle → requote と、resting 注文がある状態での SIGTERM による終了時
+cancel を確認して、上の表を更新してください (ALO 拒否文言と cancel の
+`expiresAfter: null` は確認済みですが、同じ実行で再観測できればその旨も記録します)。
+失敗する場合は mainnet へ進まず、API との乖離を修正します。
 
 ### ステップ 3: mainnet 移行判定
 
