@@ -44,7 +44,7 @@
 //!   same journal rather than inventing a second log.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use rust_decimal::{prelude::Signed, Decimal};
@@ -547,7 +547,7 @@ impl ExecutionJournal {
         let path = run_dir.join("journal.jsonl");
         reject_symlink(&run_dir)?;
         reject_symlink(&path)?;
-        let mut file = OpenOptions::new().append(true).open(&path)?;
+        let mut file = OpenOptions::new().read(true).append(true).open(&path)?;
         restore_line_boundary(&mut file, &path, run_id)?;
         Ok(Self {
             file,
@@ -608,37 +608,43 @@ impl ExecutionJournal {
         reject_symlink(&Self::run_dir(state_root, run_id))?;
         reject_symlink(&path)?;
         let bytes = std::fs::read(&path)?;
-        let ends_with_newline = bytes.last() == Some(&b'\n');
-        let lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
-        let mut out = Vec::new();
-        for (idx, line) in lines.iter().enumerate() {
-            if line.iter().all(u8::is_ascii_whitespace) {
-                continue;
-            }
-            match serde_json::from_slice::<JournalRecord>(line) {
-                Ok(rec) => out.push(rec),
-                Err(e) => {
-                    let is_last_nonblank = lines[idx + 1..]
-                        .iter()
-                        .all(|later| later.iter().all(u8::is_ascii_whitespace));
-                    // Torn final line IS the normal crash-mid-append shape
-                    // ONLY when its trailing newline was never persisted and
-                    // at least one prior record (starting with the Header)
-                    // parsed. `BufRead::lines` discards that distinction, so
-                    // this parser intentionally retains the raw EOF byte.
-                    if is_last_nonblank && !ends_with_newline && !out.is_empty() {
-                        break;
-                    }
-                    return Err(JournalError::Parse {
-                        path,
-                        line: idx + 1,
-                        source: e,
-                    });
+        parse_records(&path, &bytes)
+    }
+}
+
+/// `read_all`'s parser, shared with `open_existing` so a journal is only ever
+/// repaired for appending when `read_all` itself accepts it.
+fn parse_records(path: &Path, bytes: &[u8]) -> Result<Vec<JournalRecord>, JournalError> {
+    let ends_with_newline = bytes.last() == Some(&b'\n');
+    let lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
+    let mut out = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        match serde_json::from_slice::<JournalRecord>(line) {
+            Ok(rec) => out.push(rec),
+            Err(e) => {
+                let is_last_nonblank = lines[idx + 1..]
+                    .iter()
+                    .all(|later| later.iter().all(u8::is_ascii_whitespace));
+                // Torn final line IS the normal crash-mid-append shape
+                // ONLY when its trailing newline was never persisted and
+                // at least one prior record (starting with the Header)
+                // parsed. `BufRead::lines` discards that distinction, so
+                // this parser intentionally retains the raw EOF byte.
+                if is_last_nonblank && !ends_with_newline && !out.is_empty() {
+                    break;
                 }
+                return Err(JournalError::Parse {
+                    path: path.to_path_buf(),
+                    line: idx + 1,
+                    source: e,
+                });
             }
         }
-        Ok(out)
     }
+    Ok(out)
 }
 
 /// Make the end of an existing journal a line boundary before anything is
@@ -648,47 +654,40 @@ impl ExecutionJournal {
 /// `read_all` tolerates that shape only while it stays the LAST line; an
 /// append straight after it would glue the new record onto the same physical
 /// line and turn a tolerated torn tail into permanent corruption that also
-/// hides the appended record. So:
+/// hides the appended record. So, for a journal `read_all` accepts:
 ///
 /// - a final line that already parses (its JSON reached disk, its newline did
 ///   not) is a complete record `read_all` returns — terminate it;
-/// - an unparseable fragment after at least one complete line is exactly what
-///   `read_all` drops — truncate it away (no order decision depends on it:
-///   `Prepared` is durable before any send, and a lost later record leaves
-///   the cloid in an earlier, still-reconciled state);
-/// - a file that is nothing but a fragment has no record to resume from —
-///   fail closed without modifying it.
+/// - otherwise the final line is the torn fragment `read_all` drops — truncate
+///   it away (no order decision depends on it: `Prepared` is durable before
+///   any send, and a lost later record leaves the cloid in an earlier,
+///   still-reconciled state).
+///
+/// A journal `read_all` rejects (e.g. nothing but a fragment) fails closed
+/// here without being modified.
 fn restore_line_boundary(file: &mut File, path: &Path, run_id: &str) -> Result<(), JournalError> {
-    let bytes = std::fs::read(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
     if bytes.last().is_none_or(|byte| *byte == b'\n') {
         return Ok(());
     }
+    parse_records(path, &bytes)?;
     let tail_start = bytes
         .iter()
         .rposition(|byte| *byte == b'\n')
         .map_or(0, |idx| idx + 1);
     let tail = &bytes[tail_start..];
-    if tail.iter().all(u8::is_ascii_whitespace) {
+    if tail.iter().all(u8::is_ascii_whitespace)
+        || serde_json::from_slice::<JournalRecord>(tail).is_ok()
+    {
         file.write_all(b"\n")?;
     } else {
-        match serde_json::from_slice::<JournalRecord>(tail) {
-            Ok(_) => file.write_all(b"\n")?,
-            Err(source) if tail_start == 0 => {
-                return Err(JournalError::Parse {
-                    path: path.to_path_buf(),
-                    line: 1,
-                    source,
-                });
-            }
-            Err(_) => {
-                tracing::warn!(
-                    run_id,
-                    dropped_bytes = tail.len(),
-                    "journal ended in a torn record; dropping it before appending"
-                );
-                file.set_len(tail_start as u64)?;
-            }
-        }
+        tracing::warn!(
+            run_id,
+            dropped_bytes = tail.len(),
+            "journal ended in a torn record; dropping it before appending"
+        );
+        file.set_len(tail_start as u64)?;
     }
     file.sync_data()?;
     Ok(())
@@ -3709,29 +3708,36 @@ mod tests {
         assert!(matches!(records[2], JournalRecord::Abandoned { .. }));
     }
 
-    /// With no complete record before the fragment there is nothing to
-    /// resume from; reopening must fail closed rather than truncate the
-    /// file to empty.
+    /// Only a journal `read_all` accepts is repaired. With no complete record
+    /// before the fragment (even behind blank lines) there is nothing to
+    /// resume from, and an earlier corrupt line is corruption regardless of
+    /// the tail: reopening must fail closed and leave the bytes untouched.
     #[test]
-    fn open_existing_refuses_a_journal_that_is_only_a_torn_fragment() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-        let run_dir = root.join("runs").join("run-only-torn");
-        std::fs::create_dir_all(&run_dir).unwrap();
-        let path = run_dir.join("journal.jsonl");
-        std::fs::write(&path, "{\"kind\":\"Header\",\"run_id\":\"run-on").unwrap();
+    fn open_existing_refuses_to_repair_a_journal_read_all_rejects() {
+        let header =
+            serde_json::to_string(&JournalRecord::Header(header("run-unrepairable"))).unwrap();
+        for content in [
+            "{\"kind\":\"Header\",\"run_id\":\"run-on".to_owned(),
+            "\n\n{\"kind\":\"Header\",\"run_id\":\"run-on".to_owned(),
+            format!("{header}\n{{\"kind\":\"Prepared\",not-valid}}\n{{\"kind\":\"Abandon"),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            let run_dir = root.join("runs").join("run-unrepairable");
+            std::fs::create_dir_all(&run_dir).unwrap();
+            let path = run_dir.join("journal.jsonl");
+            std::fs::write(&path, &content).unwrap();
+            assert!(ExecutionJournal::read_all(root, "run-unrepairable").is_err());
 
-        let error = ExecutionJournal::open_existing(root, "run-only-torn")
-            .err()
-            .expect("an all-torn journal must not be opened for append");
-        assert!(
-            matches!(error, JournalError::Parse { line: 1, .. }),
-            "{error:?}"
-        );
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            b"{\"kind\":\"Header\",\"run_id\":\"run-on"
-        );
+            let error = ExecutionJournal::open_existing(root, "run-unrepairable")
+                .err()
+                .unwrap_or_else(|| panic!("must not open for append: {content:?}"));
+            assert!(
+                matches!(error, JournalError::Parse { .. }),
+                "{content:?}: {error:?}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), content.as_bytes());
+        }
     }
 
     // === Read-only regression: no state dir, no journal file ===

@@ -4065,9 +4065,9 @@ fn whole_run_from_replay(
 
 /// Durably close a run whose pair barrier failed before this process placed
 /// anything. A `--resume`d leg may already carry fills from its earlier
-/// process, and replay rejects a FinalReport whose `filled_total` disagrees
-/// with the journal's terminal fills, so the total must come from the replay
-/// rather than "nothing was placed here".
+/// process, and replay rejects an incomplete FinalReport whose `filled_total`
+/// or `outcome_unknown_cloids` disagree with the journal, so both come from
+/// the replay rather than "nothing was placed here".
 fn record_pair_barrier_abort(
     state_root: &Path,
     journal: &mut hype_trigger_twap::journal::ExecutionJournal,
@@ -4088,7 +4088,7 @@ fn record_pair_barrier_abort(
         .record(&hype_trigger_twap::journal::JournalRecord::FinalReport {
             completed: false,
             filled_total: replay.fill_totals.filled_sz.to_string(),
-            outcome_unknown_cloids: Vec::new(),
+            outcome_unknown_cloids: replay.summary.unresolved_cloids(),
             note: format!("pair barrier aborted before any order: {error}"),
             whole_run: Some(whole_run_from_replay(&replay)),
         })
@@ -5818,11 +5818,10 @@ mod tests {
     }
 
     /// A `--resume`d pair leg can carry fills from its earlier process. If
-    /// its barrier then fails, the incomplete FinalReport must report those
-    /// durable fills: replay rejects a FinalReport whose `filled_total`
-    /// disagrees with the terminal fills, and a hardcoded "0" turned the
-    /// journal permanently invalid (startup scan and `hype-twap-runs` both
-    /// failed on it).
+    /// its barrier then fails, the incomplete FinalReport must report the
+    /// journal's own fills and unresolved cloids: replay rejects one that
+    /// disagrees, and a hardcoded "0" turned the journal permanently invalid
+    /// (startup scan and `hype-twap-runs` both failed on it).
     #[test]
     fn pair_barrier_abort_report_keeps_a_resumed_leg_journal_replayable() {
         let tmp = TempDir::new();
@@ -5865,6 +5864,18 @@ mod tests {
             avg_px: Some("50".into()),
         })
         .unwrap();
+        let unresolved = hype_trigger_twap::types::Cloid::new();
+        j.record(&hype_trigger_twap::journal::JournalRecord::Prepared {
+            slice_idx: 2,
+            cloid: unresolved,
+            nonce: None,
+            symbol: hype_trigger_twap::types::Symbol::new("HYPE"),
+            side: hype_trigger_twap::types::Side::Long,
+            px: "50".into(),
+            sz: "2".into(),
+            tif: None,
+        })
+        .unwrap();
 
         record_pair_barrier_abort(&state_dir, &mut j, "timed out waiting for pair start").unwrap();
 
@@ -5875,6 +5886,10 @@ mod tests {
             .expect("the barrier-abort FinalReport must keep the journal replayable");
         assert_eq!(replay.fill_totals.filled_sz, Decimal::from(3));
         assert_eq!(replay.summary.last_final_report_completed, Some(false));
+        assert_eq!(
+            replay.summary.last_final_report_unknown_cloids,
+            Some(vec![unresolved])
+        );
     }
 
     #[test]
