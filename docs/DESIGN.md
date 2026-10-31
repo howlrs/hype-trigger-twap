@@ -372,7 +372,9 @@ status 照会/cancel は継続可" ポリシー)。ループを抜けた直後
 cancel→確定させてから最終レポートを組み立てる。これにより
 「resting のまま板に注文が残る」リークは構造的に発生しない。cancel の送信が
 失敗しても、確認が取れるまで settle の poll の合間に再送する (cancel は
-約定を増やし得ないので再送は安全)。settle 予算 (`--settle-retries`) の間ずっと
+約定を増やし得ないので再送は安全)。cancel 成功、または HL の
+`Order was never placed, already canceled, or filled` 拒否 (= その cloid に
+板上の注文はもうない) を確認とみなし、以後は再送しない。settle 予算 (`--settle-retries`) の間ずっと
 取引所に届かない場合に限り、未解決のまま非ゼロ終了し、次項の `--resume` が回収する。
 送信結果が曖昧な ALO で単発の cloid 照会が注文を確認できなかった場合も、
 再送はしないが cloid の cancel を (有限回) 送ってから中止する。
