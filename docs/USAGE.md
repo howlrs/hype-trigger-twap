@@ -36,12 +36,11 @@ live 実行の終了時に同一 schema の report を保存するには `--repo
 この report はプロセス内の集計ではなく、終了後に journal を再読込して
 `ValidatedJournalReplay` から作られるため、`hype-twap-runs inspect` と一致します。
 
-> **mainnet live は Issue #16 の runtime gate で現在も禁止です。** market/passive smoke、
-> ALO 拒否文言、cancel `expiresAfter: null` の実 API 確認は 2026-10-31 に完了し、
-> docs/OPERATIONS.md「ステップ 2」に記録しました。mainnet の有効化は別の release 変更で
-> 行うため、それまで以下の live 例はすべて `--network testnet` を明示します。
-> gate 導入前の未完了 mainnet journal は例外として、追加発注を行わない
-> `--abandon-incomplete-run` で照合・cancel・終了できます。`--resume` は拒否されます。
+> **mainnet は極小プローブから始めてください。** Issue #16 の実 API 確認
+> (market/passive smoke、ALO 拒否文言、cancel `expiresAfter: null` など) が 2026-10-31
+> に完了し (docs/OPERATIONS.md「ステップ 2」)、mainnet live の runtime gate は撤去
+> されました。フルサイズの前とバイナリ更新後は極小額で live を確認してください。以下の
+> live 例はコピーしても安全なよう `--network testnet` を明示しています。
 
 ```bash
 hype-twap --symbol HYPE --side long --usd 1500 --duration 30m \
@@ -110,7 +109,7 @@ hype-twap --symbol ETH --side short --usd 5000 --duration 2h --slices 20 \
 | `--trigger-when` | `above` \| `below` | なし | `above`: mid が閾値以上で発火 / `below`: mid が閾値以下で発火。**自動推定はしません** |
 | `--start-after` | 期間 | なし | 指定時間の経過で発火。価格トリガーとは OR 条件 (先に成立した方が勝ち) |
 | `--read-only` | `true` \| `false` | **`true`** | `true` は署名も送信も行いません。`false` は 0.1.x の非推奨な `--live` 互換 alias として残ります |
-| `--live` | フラグ | `false` | 実発注を有効化します。testnet live のみ利用可能で、Issue #16 の gate を解除するまでは mainnet の新規・再開発注は runtime で拒否されます。mainnet read-only と、追加発注しない `--abandon-incomplete-run` は利用できます。旧 `--read-only false` は 0.1.x の warning 付き互換 alias です |
+| `--live` | フラグ | `false` | 選択した `--network` (既定 `mainnet`) で実発注を有効化します。`--abandon-incomplete-run` は追加発注しない回復専用です。旧 `--read-only false` は 0.1.x の warning 付き互換 alias です |
 | `--event-jsonl` | パス | なし | read-only simulation の schema-versioned lifecycle event を明示パスへ保存します。live state directory やjournalは作成しません。本番runはrun directory内の`events.jsonl`を自動使用するため指定不可です |
 | `--network` | `mainnet` \| `testnet` | `mainnet` | 既定 API エンドポイントと EIP-712 の `Agent.source` を同時に切り替えます。上書きが反対側の公式 mainnet/testnet origin を指す場合も拒否します |
 | `--slippage-bps` | 数値 | `20` | IOC 指値に乗せるスリッページ余裕 (ベーシスポイント)。**10000 bps 以上、または非正の指値になる値は無条件で拒否** (override 不可)。**1000 bps 超は `--allow-high-slippage` が必須** |
@@ -127,7 +126,7 @@ hype-twap --symbol ETH --side short --usd 5000 --duration 2h --slices 20 \
 | `--follow-repost-secs` | 整数 | `10` | `--child-algo follow` 専用。1 スライス内で再発注してよい最短間隔 (秒)。そのスライスの直近の発注時刻からの経過で判定します。他の `--child-algo` では無視されます (警告あり) |
 | `--follow-threshold-bps` | 数値 | `1.0` | `--child-algo follow` 専用。touch が resting 価格からこのベーシスポイント以上離れない限り再クオートしません (ヒステリシス)。他の `--child-algo` では無視されます (警告あり) |
 | `--state-dir` | パス | なし (`$XDG_STATE_HOME/hype-twap`、未設定なら `~/.local/state/hype-twap`) | 実行状態 (ジャーナル / ロック / nonce HWM) を保存するルートディレクトリ (Issue #4)。`--read-only` の実行はここに一切触れません — ディレクトリもジャーナルも作成されません |
-| `--resume` | 文字列 (run id) | なし | 指定した run id の未完了 run を再開します (Issue #4)。live では `--master-address` または `HL_MASTER_ADDRESS` が必須で、network / agent / master / symbol / side を外部 API 呼び出し前に照合します。その後、submitted/unknown cloid をすべて `orderStatus` で照合し、記録済み約定は再送しません。Issue #16 の gate 中は mainnet resume を拒否し、回復専用の abandon を案内します。`--abandon-incomplete-run` とは排他です |
+| `--resume` | 文字列 (run id) | なし | 指定した run id の未完了 run を再開します (Issue #4)。live では `--master-address` または `HL_MASTER_ADDRESS` が必須で、network / agent / master / symbol / side を外部 API 呼び出し前に照合します。その後、submitted/unknown cloid をすべて `orderStatus` で照合し、記録済み約定は再送しません。`--abandon-incomplete-run` とは排他です |
 | `--abandon-incomplete-run` | フラグ | `false` | 同一 network+agent で検出された未完了 run を強制照合したうえで放棄し、**続行も追加発注もしません** (Issue #4)。live では事前 identity 照合用の明示 master address が必須です。gate 導入前の mainnet journal にも利用できます。`--resume` とは排他です |
 | `--shutdown-grace` | 期間 (`30m`, `1h`) | `60s` | SIGINT/SIGTERM を受けてから、進行中の注文の照合、resting 注文のキャンセル、position phase と最終確認までに費やせる単一の猶予時間 (Issue #4)。超過すると、未解決の cloid を `outcome_unknown` としてジャーナルに記録したうえで非ゼロ終了します |
 
