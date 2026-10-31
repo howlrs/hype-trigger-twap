@@ -547,7 +547,8 @@ impl ExecutionJournal {
         let path = run_dir.join("journal.jsonl");
         reject_symlink(&run_dir)?;
         reject_symlink(&path)?;
-        let file = OpenOptions::new().append(true).open(&path)?;
+        let mut file = OpenOptions::new().append(true).open(&path)?;
+        restore_line_boundary(&mut file, &path, run_id)?;
         Ok(Self {
             file,
             run_id: run_id.to_string(),
@@ -594,7 +595,8 @@ impl ExecutionJournal {
     /// last one that parses successfully are returned; an invalid last line
     /// is silently dropped only when the physical file does not end in a
     /// newline. A newline-terminated invalid record was fully written and is
-    /// corruption, even when it is last. Any other parse failure is likewise
+    /// corruption, even when it is last (which is why `open_existing` drops
+    /// such a fragment before appending). Any other parse failure is likewise
     /// a hard error, and a file that yields NO parseable records at
     /// all (e.g. not even a valid `Header`) is likewise a hard error — see
     /// `find_incomplete_run`, whose caller (`main.rs`, live startup) must
@@ -637,6 +639,59 @@ impl ExecutionJournal {
         }
         Ok(out)
     }
+}
+
+/// Make the end of an existing journal a line boundary before anything is
+/// appended to it.
+///
+/// A crash mid-append (B4) can leave the file without its final newline.
+/// `read_all` tolerates that shape only while it stays the LAST line; an
+/// append straight after it would glue the new record onto the same physical
+/// line and turn a tolerated torn tail into permanent corruption that also
+/// hides the appended record. So:
+///
+/// - a final line that already parses (its JSON reached disk, its newline did
+///   not) is a complete record `read_all` returns — terminate it;
+/// - an unparseable fragment after at least one complete line is exactly what
+///   `read_all` drops — truncate it away (no order decision depends on it:
+///   `Prepared` is durable before any send, and a lost later record leaves
+///   the cloid in an earlier, still-reconciled state);
+/// - a file that is nothing but a fragment has no record to resume from —
+///   fail closed without modifying it.
+fn restore_line_boundary(file: &mut File, path: &Path, run_id: &str) -> Result<(), JournalError> {
+    let bytes = std::fs::read(path)?;
+    if bytes.last().is_none_or(|byte| *byte == b'\n') {
+        return Ok(());
+    }
+    let tail_start = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |idx| idx + 1);
+    let tail = &bytes[tail_start..];
+    if tail.iter().all(u8::is_ascii_whitespace) {
+        file.write_all(b"\n")?;
+    } else {
+        match serde_json::from_slice::<JournalRecord>(tail) {
+            Ok(_) => file.write_all(b"\n")?,
+            Err(source) if tail_start == 0 => {
+                return Err(JournalError::Parse {
+                    path: path.to_path_buf(),
+                    line: 1,
+                    source,
+                });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    run_id,
+                    dropped_bytes = tail.len(),
+                    "journal ended in a torn record; dropping it before appending"
+                );
+                file.set_len(tail_start as u64)?;
+            }
+        }
+    }
+    file.sync_data()?;
+    Ok(())
 }
 
 /// One cloid's reconciliation state, derived by replaying a run's journal
@@ -3555,6 +3610,128 @@ mod tests {
             .expect("a torn FINAL line with valid prior records must not hard-error")
             .expect("the run must still be detected as incomplete from its prior records");
         assert_eq!(found, "run-torn");
+    }
+
+    /// `--resume` / `--abandon-incomplete-run` append reconciliation records
+    /// to a journal that may end in a torn fragment (host power loss / VM
+    /// kill mid-append). Appending straight after the fragment glued the
+    /// first new record onto it, turning a tolerated torn tail into a
+    /// newline-terminated invalid line: the journal became permanently
+    /// unreadable and the reconciled fill was buried inside that line.
+    #[test]
+    fn open_existing_drops_a_torn_tail_so_appended_records_stay_readable() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let cloid = Cloid::new();
+        {
+            let mut j =
+                ExecutionJournal::start(root, "run-torn-append".into(), header("run-torn-append"))
+                    .unwrap();
+            j.record(&JournalRecord::SubmittedUnknown {
+                slice_idx: 1,
+                cloid,
+            })
+            .unwrap();
+        }
+        let path = ExecutionJournal::journal_path(root, "run-torn-append");
+        let intact_len = std::fs::metadata(&path).unwrap().len();
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            write!(f, "{{\"kind\":\"Acknowledged\",\"slice_idx\":1,\"cloi").unwrap();
+        }
+
+        let terminal = JournalRecord::Terminal {
+            slice_idx: 1,
+            cloid,
+            status: "filled".into(),
+            filled_sz: "1".into(),
+            avg_px: Some("50".into()),
+        };
+        {
+            let mut j = ExecutionJournal::open_existing(root, "run-torn-append").unwrap();
+            j.record(&terminal).unwrap();
+        }
+
+        let records = ExecutionJournal::read_all(root, "run-torn-append")
+            .expect("a resumed journal must stay readable after a torn tail");
+        assert_eq!(records.len(), 3, "{records:?}");
+        assert_eq!(records[2], terminal);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            !bytes
+                .windows(b"cloi{".len())
+                .any(|window| window == b"cloi{"),
+            "the torn fragment must not be glued to the appended record"
+        );
+        assert!(bytes.len() as u64 > intact_len);
+    }
+
+    /// A record whose JSON reached disk but whose trailing newline did not
+    /// is complete and already returned by `read_all`; reopening must keep
+    /// it (terminating the line), never truncate it as if it were torn.
+    #[test]
+    fn open_existing_keeps_a_complete_final_record_that_lacks_its_newline() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let run_dir = root.join("runs").join("run-no-newline");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let first =
+            serde_json::to_string(&JournalRecord::Header(header("run-no-newline"))).unwrap();
+        let cloid = Cloid::new();
+        let unknown = JournalRecord::SubmittedUnknown {
+            slice_idx: 1,
+            cloid,
+        };
+        let second = serde_json::to_string(&unknown).unwrap();
+        std::fs::write(run_dir.join("journal.jsonl"), format!("{first}\n{second}")).unwrap();
+        assert_eq!(
+            ExecutionJournal::read_all(root, "run-no-newline")
+                .unwrap()
+                .len(),
+            2
+        );
+
+        {
+            let mut j = ExecutionJournal::open_existing(root, "run-no-newline").unwrap();
+            j.record(&JournalRecord::Abandoned {
+                note: "test".into(),
+            })
+            .unwrap();
+        }
+
+        let records = ExecutionJournal::read_all(root, "run-no-newline").unwrap();
+        assert_eq!(records.len(), 3, "{records:?}");
+        assert_eq!(records[1], unknown);
+        assert!(matches!(records[2], JournalRecord::Abandoned { .. }));
+    }
+
+    /// With no complete record before the fragment there is nothing to
+    /// resume from; reopening must fail closed rather than truncate the
+    /// file to empty.
+    #[test]
+    fn open_existing_refuses_a_journal_that_is_only_a_torn_fragment() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let run_dir = root.join("runs").join("run-only-torn");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let path = run_dir.join("journal.jsonl");
+        std::fs::write(&path, "{\"kind\":\"Header\",\"run_id\":\"run-on").unwrap();
+
+        let error = ExecutionJournal::open_existing(root, "run-only-torn")
+            .err()
+            .expect("an all-torn journal must not be opened for append");
+        assert!(
+            matches!(error, JournalError::Parse { line: 1, .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{\"kind\":\"Header\",\"run_id\":\"run-on"
+        );
     }
 
     // === Read-only regression: no state dir, no journal file ===
