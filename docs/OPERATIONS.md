@@ -687,9 +687,12 @@ token の直前には `FLATTEN PREFLIGHT` として、token に束縛される `
 `--target-sz` / `--target-usd` は `target - current` だけを実行します。既存建玉を
 減らす phase は reduce-only です。符号を跨ぐ target は close-to-flat が terminal、
 未確定 cloid なし、最新 position が厳密に zero と確認できるまで open phase を
-開始してはいけません。外部約定や reduce-only rejection を成功と推測せず、状態を
-再取得して判断してください。失敗・中断時は journal を `--resume` で先に
-reconcile し、手作業で反対注文を送らないでください。
+開始してはいけません。open phase のスライスが最低名目額を満たせない計画は
+read-only でも preflight で拒否し、live では close と open の合計名目額が
+`--max-notional-usd` を超える計画も、close を 1 枚も送る前に拒否します。
+外部約定や reduce-only rejection を成功と推測せず、状態を再取得して判断して
+ください。失敗・中断時は journal を `--resume` で先に reconcile し、手作業で
+反対注文を送らないでください。
 
 ### `--max-notional-usd` は総額判定であることへの注意
 
