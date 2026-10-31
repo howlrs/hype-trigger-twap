@@ -663,6 +663,10 @@ hype-twap --symbol HYPE --target-usd 1000 --master-address 0x... --duration 10m 
 `--flatten` は `clearinghouseState` の対象 perpetual symbol 一つだけを読み、
 long なら short、short なら long の**最大 current size**を全 child order の
 `reduce_only=true` で送ります。zero、取得失敗、symbol/精度不正は注文しません。
+残量が最小注文額 ($10) 未満の場合も注文できないため、read-only/live とも
+「建玉は flat ではない」旨のエラー (exit 1) で終了します。これにより exit 0 は
+「もともと flat だった」か「執行後に取引所の建玉をゼロと再確認できた」場合だけに
+なります。
 live flatten は、preflight が表示する `FLATTEN CONFIRMATION` token を同じ内容で
 `--confirm-flatten` に渡すまで注文しません。token は network/master/symbol/
 initial size/close side/max size/cap/algo/deadline に束縛されます。agent key は
