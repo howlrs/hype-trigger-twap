@@ -2567,15 +2567,19 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
             });
         }
         // The open phase of a reversal is only sized after the close phase
-        // has flattened the account. Size it now with the exact inputs that
-        // code uses (this preflight `mid`, `--slices`, szDecimals) so a plan
-        // whose open phase can never run is refused before the close sends
-        // anything, rather than after it has stranded the account flat.
-        for phase in plan.phases.iter().skip(1) {
+        // has flattened the account. Size every phase now with the exact
+        // inputs execution uses (this preflight `mid`, `--slices`,
+        // szDecimals) so a plan whose open phase can never run is refused
+        // before the close sends anything, rather than after it has stranded
+        // the account flat — and so dry-run reports what live would refuse.
+        for phase in &plan.phases {
             execution_sizing(phase.size, cli.slices, asset.sz_decimals, mid, true).map_err(|e| {
-                format!(
-                    "position reversal open-from-flat phase cannot be executed: {e}; no order was sent"
-                )
+                let kind = match phase.kind {
+                    PositionPhaseKind::Adjust => "adjust",
+                    PositionPhaseKind::CloseToFlat => "close-to-flat",
+                    PositionPhaseKind::OpenFromFlat => "open-from-flat",
+                };
+                format!("position {kind} phase cannot be executed: {e}; no order was sent")
             })?;
         }
         if cli.flatten {
@@ -2786,7 +2790,9 @@ async fn run_with_cli(cli: Cli) -> Result<ExitCode, String> {
                 snapshot.best_ask,
             )
             .map_err(|e| e.to_string())?;
-            plan_coin * conservative_px
+            plan_coin
+                .checked_mul(conservative_px)
+                .ok_or_else(|| "position plan notional overflow; no order was sent".to_string())?
         }
         (None, None, None) => return Err("no size specified".into()),
     };
@@ -7102,6 +7108,40 @@ mod tests {
                 "live={live}: a rejected plan must not create a run journal"
             );
         }
+    }
+
+    /// The same preflight sizing applies to a single-phase plan, so dry-run
+    /// no longer reports success for a target live would refuse: flat →
+    /// 0.4 HYPE (~$20) over 4 slices is $5 per slice, below the minimum.
+    #[tokio::test]
+    #[serial_test::serial(hl_env_vars)]
+    async fn read_only_position_plan_reports_unexecutable_slice_sizing() {
+        let mut server = mockito::Server::new_async().await;
+        mock_position_preflight(&mut server, r#"{"assetPositions":[]}"#, false).await;
+        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
+        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
+        let cli = Cli::try_parse_from([
+            "hype-twap",
+            "--symbol",
+            "HYPE",
+            "--target-sz",
+            "0.4",
+            "--master-address",
+            MASTER,
+            "--duration",
+            "1m",
+            "--slices",
+            "4",
+        ])
+        .unwrap();
+        let result = run_with_cli(cli).await;
+        std::env::remove_var("HL_INFO_URL");
+        std::env::remove_var("HL_EXCHANGE_URL");
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("position adjust phase cannot be executed"),
+            "{error}"
+        );
     }
 
     /// `--max-notional-usd` bounds the whole logical run. A reversal spends
