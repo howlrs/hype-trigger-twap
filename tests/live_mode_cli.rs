@@ -113,8 +113,11 @@ fn legacy_read_only_false_is_live_equivalent_and_loud() {
     );
 }
 
+/// The Issue #16 release gate has been lifted, so mainnet `--live` is no
+/// longer refused outright — but it must still fail closed on missing
+/// credentials before any network call, state directory, or lock.
 #[test]
-fn mainnet_live_is_rejected_before_credentials_or_state_are_touched() {
+fn mainnet_live_without_credentials_stops_before_network_or_state() {
     let state = TempState::new();
     let output = command()
         .args([
@@ -134,13 +137,16 @@ fn mainnet_live_is_rejected_before_credentials_or_state_are_touched() {
     );
     let stderr = stderr(&output);
     assert!(
-        stderr.contains("mainnet live execution is disabled"),
+        stderr.contains("HL_AGENT_PK is required in live mode"),
         "{stderr}"
     );
-    assert!(!stderr.contains("HL_AGENT_PK"), "{stderr}");
+    assert!(
+        !stderr.contains("mainnet live execution is disabled"),
+        "{stderr}"
+    );
     assert!(
         !state.path().exists(),
-        "mainnet gate must precede state and lock creation"
+        "credential validation must precede state and lock creation"
     );
 }
 

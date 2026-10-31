@@ -8,17 +8,13 @@ Hyperliquid 無期限先物向けの「トリガー付き TWAP」を実行する
 執行します。スライスが約定不足のときは次スライスで自動的に取り返します (キャッチアップ方式)。
 
 **Read-only (ドライラン) が既定値です。** 実発注には `--live` を明示します。
-旧 `--read-only false` は 0.1.x の warning 付き互換 alias です。Issue #16 の gate を
-解除するまでは mainnet の新規・再開発注は runtime で拒否されますが、mainnet read-only は
-利用できます。
-gate 導入前の未完了 mainnet journal は、追加発注しない
-`--abandon-incomplete-run` でのみ強制照合・終了できます。
+旧 `--read-only false` は 0.1.x の warning 付き互換 alias です。
 
-**mainnet live は Issue #16 の runtime gate で現在も禁止です。** funded testnet を含む
-checklist の実 API 確認は 2026-10-31 に完了しました (OPERATIONS「ステップ 2」) が、
-mainnet の有効化は別の release 変更で行います。それまで以下の live 例は必ず
-`--network testnet` で実行してください。
-既存の未完了 mainnet journal の回復だけは `--abandon-incomplete-run` を使います。
+**mainnet は極小プローブから始めてください。** Issue #16 の checklist (funded testnet
+を含む実 API 確認) が 2026-10-31 に完了したため、mainnet live の runtime gate は撤去
+されました (OPERATIONS「ステップ 2」「ステップ 3」)。フルサイズの mainnet 実行の前と
+バイナリ更新後は、極小額の live プローブで report と journal を確認します。以下の
+live 例はそのままコピーしても安全なよう `--network testnet` を指定しています。
 
 ## 目次
 

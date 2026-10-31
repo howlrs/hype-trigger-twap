@@ -93,8 +93,7 @@ hype-twap --symbol HYPE --side long --usd 1500 --duration 30m --slices 10
 
 ### ステップ 2: funded testnet で Issue #16 を確認する (2026-10-31 完了)
 
-**mainnet live はまだ許可されていません。** これまでに実 API で確認できた事項と、
-残っている事項は次のとおりです。
+Issue #16 で実 API に対して確認した事項は次のとおりです。
 
 | 項目 | 状態 | 根拠 |
 |---|---|---|
@@ -109,12 +108,12 @@ hype-twap --symbol HYPE --side long --usd 1500 --duration 30m --slices 10
 
 これで Issue #16 の checklist はすべて実 API で確認できました。ALO 拒否文言は手動手順
 (`live_alo_rejection_wording_matches_what_is_alo_reject_recognises`) ではなく上記の
-本番ログで確認しています (testnet smoke では拒否は発生しなかった)。ただし runtime gate
-(`MAINNET_LIVE_ENABLED`) はまだ有効化していません。mainnet live の解禁は、この結果を
-踏まえた別の release 変更として行います。
+本番ログで確認しています (testnet smoke では拒否は発生しなかった)。この結果を受けて
+mainnet live の runtime gate を撤去しました (ステップ 3)。
 
-testnet は mainnet と別チェーンなので、事前に次の準備が必要です (いずれも master
-ウォレットの操作で、このツールからは行いません)。
+挙動に影響する変更の後で同じ確認をやり直す場合の手順は次のとおりです。testnet は
+mainnet と別チェーンなので、事前に次の準備が必要です (いずれも master ウォレットの
+操作で、このツールからは行いません)。
 
 1. testnet の faucet で master に mock USDC を受け取る (受け取り条件は
    Hyperliquid 側の案内に従う)。
@@ -136,22 +135,24 @@ cancel を確認して、上の表を更新してください (ALO 拒否文言�
 `expiresAfter: null` は確認済みですが、同じ実行で再観測できればその旨も記録します)。
 失敗する場合は mainnet へ進まず、API との乖離を修正します。
 
-### ステップ 3: mainnet 移行判定
+### ステップ 3: mainnet での初回実行
 
-Issue #16 の **全 checklist が実 API で完了し、その結果が文書化されるまで、
-mainnet で `--live` を実行しないでください。** checklist は 2026-10-31 に完了しました
-(ステップ 2 の表) が、gate の有効化は別の release 変更として行うため、現在も runtime
-gate で拒否されます。そのため mainnet live 用の実行コマンドは掲載しません。
-read-only で計画確認を続けるか、明示的な `--network testnet` でのみ検証してください。
+Issue #16 の checklist が実 API で完了した (ステップ 2) ため、mainnet live の
+runtime gate は 2026-10-31 に撤去しました。`--network` の既定は `mainnet` なので、
+`--live` を付ければ mainnet に発注します。
 
-gate 導入前の mainnet 未完了 journal がある場合、放置してはいけません。
-`--resume` は新規注文へ進み得るため拒否されますが、`--abandon-incomplete-run` は
-例外的に利用でき、既存 cloid の照合、必要な resting cancel、journal の終了だけを
-行って追加注文せずに戻ります。通常どおり明示 master address と認証情報が必要です。
+初回、およびバイナリを更新した後の最初の実行は、`cargo build --release --locked`
+でビルドが最新であることを確かめたうえで、per-slice が最小名目額 $10 をわずかに
+上回る極小プローブにとどめます。report と `hype-twap-runs verify <run-id>` を確認
+してから、フルサイズに進んでください。
 
 ```bash
-hype-twap --symbol HYPE --side long --usd 1500 --duration 30m --network testnet
+hype-twap --symbol HYPE --side long --usd 25 --duration 2m --slices 2 \
+  --max-notional-usd 30 --master-address 0x... --live
 ```
+
+未完了の mainnet journal がある場合は、通常どおり `--resume` で再開するか、
+`--abandon-incomplete-run` で照合・終了します (「クラッシュ・再起動時の手順」)。
 
 ## 実行中の監視
 
@@ -581,8 +582,7 @@ leg に継承されません。例外として `HL_ALERT_HOOK_URL` は allowlist
 上回る額) に絞った**プローブ運用**を必ず行ってください。極小 mainnet
 プローブは過去に実バグ (orderStatus の avgPx 欠落による計上不備、
 resume の二重執行など) をフルサイズ投入前に複数回捕捉した実績が
-ありますが、Issue #16 の gate が閉じている間は mainnet probe 自体を行ってはいけません。
-gate を解除した後も、最初は極小額から始めます。
+あります。mainnet でも、最初は極小額から始めます。
 
 ### `dn-pair.sh` の使用例
 
@@ -889,10 +889,6 @@ override はできません — タイプミスの可能性を疑ってくださ
   いずれもタイムアウト時のテイカー切り替えは行いません — 未約定分は次の
   スライスへ持ち越されるのみです
   ([issue #1](https://github.com/howlrs/hype-trigger-twap/issues/1))
-- **mainnet live は runtime gate で無効のままです。** Issue #16 の実 API 確認は
-  2026-10-31 に完了しました (応答 shape、ALO 拒否文言、cancel の受理/拒否文言、現行
-  バイナリでの funded testnet market/passive smoke、shutdown 時の resting cancel、
-  flatten。「ステップ 2」の表を参照)。gate の有効化は別の release 変更として行います
 - **単一ホスト内の単一 writer のみ保証します。** 同一ホスト・同一
   `network + agent` の二重起動は起動時ロックで検知しますが、複数ホストに
   またがる二重起動は検知できません。「単一 writer ロックと nonce の運用境界」

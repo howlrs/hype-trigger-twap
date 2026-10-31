@@ -52,14 +52,6 @@ use hype_trigger_twap::types::{Address, Side, Symbol};
 /// through the two macros below and is suppressed in that mode.
 static REPORT_JSON_STDOUT: AtomicBool = AtomicBool::new(false);
 
-/// Release gate for new or resumed real-money mainnet order placement. The
-/// funded testnet conformance checklist tracked in Issue #16 is not complete
-/// yet, so a CLI typo or an omitted `--network testnet` must never silently
-/// reach mainnet. Recovery-only `--abandon-incomplete-run` remains available
-/// so pre-gate journals can be reconciled/cancelled without placing new orders.
-/// Lifting the placement gate requires a reviewed source change.
-const MAINNET_LIVE_ENABLED: bool = false;
-
 macro_rules! println {
     ($($arg:tt)*) => {
         if !REPORT_JSON_STDOUT.load(Ordering::Relaxed) {
@@ -1372,22 +1364,6 @@ impl Cli {
 
     /// §4 step 1: argument validation that clap cannot express.
     fn validate(&self) -> Result<(), String> {
-        if self.is_live()
-            && self.network == NetworkArg::Mainnet
-            && !MAINNET_LIVE_ENABLED
-            && !self.abandon_incomplete_run
-        {
-            let recovery_guidance = if self.resume.is_some() {
-                " --resume cannot continue a mainnet run while the gate is closed; use --abandon-incomplete-run to reconcile/cancel its outstanding orders without placing new ones."
-            } else {
-                " Existing mainnet journals can still be reconciled and closed with --abandon-incomplete-run, which never places a new order."
-            };
-            return Err(
-                format!(
-                    "mainnet live execution is disabled pending the funded-testnet conformance checklist in Issue #16; use --network testnet for live execution or the default read-only mode for a mainnet rehearsal.{recovery_guidance}"
-                ),
-            );
-        }
         if self.is_live() && self.event_jsonl.is_some() {
             return Err(
                 "--event-jsonl is for read-only simulations; live runs use the run-directory events.jsonl sidecar"
@@ -5037,77 +5013,32 @@ mod tests {
         }
     }
 
+    /// The Issue #16 release gate was lifted once its funded testnet
+    /// checklist passed (docs/OPERATIONS.md step 2): mainnet live, its legacy
+    /// spelling, resume and abandon all pass CLI validation again. The
+    /// remaining live guards (mandatory cap, credentials, endpoint checks)
+    /// are covered by their own tests.
     #[test]
-    fn mainnet_live_is_rejected_while_issue_16_gate_is_closed() {
-        let cli = Cli::try_parse_from(
-            base_args()
-                .into_iter()
-                .chain(["--live", "--max-notional-usd", "5000"])
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
-        let error = cli.validate().unwrap_err();
-        assert!(
-            error.contains("mainnet live execution is disabled"),
-            "{error}"
-        );
-        assert!(error.contains("Issue #16"), "{error}");
-        assert!(error.contains("--network testnet"), "{error}");
-    }
-
-    #[test]
-    fn mainnet_live_gate_also_covers_the_legacy_alias() {
-        let cli = Cli::try_parse_from(
-            base_args()
-                .into_iter()
-                .chain(["--read-only", "false", "--max-notional-usd", "5000"])
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
-        assert!(cli.is_live());
-        let error = cli.validate().unwrap_err();
-        assert!(
-            error.contains("mainnet live execution is disabled"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn mainnet_resume_is_rejected_with_a_recovery_only_escape_hatch() {
-        let cli = Cli::try_parse_from(
-            base_args()
-                .into_iter()
-                .chain([
-                    "--live",
-                    "--max-notional-usd",
-                    "5000",
-                    "--resume",
-                    "existing-run",
-                ])
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
-        let error = cli.validate().unwrap_err();
-        assert!(error.contains("--resume cannot continue"), "{error}");
-        assert!(error.contains("--abandon-incomplete-run"), "{error}");
-    }
-
-    #[test]
-    fn mainnet_abandon_recovery_remains_available_while_gate_is_closed() {
-        let cli = Cli::try_parse_from(
-            base_args()
-                .into_iter()
-                .chain([
-                    "--live",
-                    "--max-notional-usd",
-                    "5000",
-                    "--abandon-incomplete-run",
-                ])
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
-        assert!(cli.is_live());
-        cli.validate().unwrap();
+    fn mainnet_live_resume_and_abandon_pass_cli_validation() {
+        for extra in [
+            &["--live"][..],
+            &["--read-only", "false"][..],
+            &["--live", "--resume", "existing-run"][..],
+            &["--live", "--abandon-incomplete-run"][..],
+        ] {
+            let cli = Cli::try_parse_from(
+                base_args()
+                    .into_iter()
+                    .chain(extra.iter().copied())
+                    .chain(["--max-notional-usd", "5000"])
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            assert_eq!(cli.network, NetworkArg::Mainnet);
+            assert!(cli.is_live(), "{extra:?}");
+            cli.validate()
+                .unwrap_or_else(|error| panic!("{extra:?}: {error}"));
+        }
     }
 
     #[test]
@@ -5704,59 +5635,6 @@ mod tests {
 
         let err = result.expect_err("a live custom endpoint override must be rejected");
         assert!(err.contains("--allow-custom-endpoints"), "{err}");
-    }
-
-    /// The temporary Issue #16 release gate is a true safety boundary, not
-    /// documentation alone: it must fire before credentials, state, locks,
-    /// journals, or HTTP can be touched.
-    #[tokio::test]
-    #[serial_test::serial(hl_env_vars)]
-    async fn mainnet_live_gate_rejects_before_network_or_state_access() {
-        let tmp = TempDir::new();
-        let state_dir = tmp.path().join("state");
-        let mut server = mockito::Server::new_async().await;
-        let info = server.mock("POST", "/info").expect(0).create_async().await;
-
-        std::env::set_var("HL_AGENT_PK", TEST_PK);
-        std::env::set_var("HL_AGENT_ADDRESS", AGENT);
-        std::env::set_var("HL_INFO_URL", format!("{}/info", server.url()));
-        std::env::set_var("HL_EXCHANGE_URL", format!("{}/exchange", server.url()));
-
-        let cli = Cli::try_parse_from([
-            "hype-twap",
-            "--symbol",
-            "HYPE",
-            "--side",
-            "long",
-            "--usd",
-            "50",
-            "--duration",
-            "1m",
-            "--max-notional-usd",
-            "100",
-            "--allow-custom-endpoints",
-            "--state-dir",
-            &state_dir.display().to_string(),
-            "--live",
-        ])
-        .unwrap();
-        let result = run_with_cli(cli).await;
-
-        std::env::remove_var("HL_AGENT_PK");
-        std::env::remove_var("HL_AGENT_ADDRESS");
-        std::env::remove_var("HL_INFO_URL");
-        std::env::remove_var("HL_EXCHANGE_URL");
-
-        let error = result.expect_err("mainnet live must remain release-gated");
-        assert!(
-            error.contains("mainnet live execution is disabled"),
-            "{error}"
-        );
-        info.assert_async().await;
-        assert!(
-            !state_dir.exists(),
-            "the gate must fire before state-dir or lock creation"
-        );
     }
 
     // === Issue #4: state-dir / journal / incomplete-run tests ===
