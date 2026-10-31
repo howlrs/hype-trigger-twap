@@ -11,17 +11,17 @@ under-fills.
 **Read-only is the default.** Pass `--live` to enable order submission. The
 legacy `--read-only false` spelling remains a warning-emitting compatibility
 alias in 0.1.x. New or resumed mainnet order execution is rejected at runtime
-until Issue #16 is complete; mainnet read-only remains available. The
+until the Issue #16 gate is lifted; mainnet read-only remains available. The
 reconciliation-only `--abandon-incomplete-run` path remains available for
 closing an older incomplete mainnet journal without placing a new order.
 
-> **Mainnet live is currently blocked by Issue #16.** Public testnet response
-> conformance has passed, and pre-gate mainnet production logs confirm the
-> ALO-rejection wording and cancel acceptance with `expiresAfter: null` (the
-> cancel wire format and signing code are unchanged since). A funded testnet market/passive smoke
-> with the current binary is still outstanding (see docs/OPERATIONS.md, step 2).
-> Every live example below therefore selects `--network testnet`; do not remove
-> it until that checklist is completed and documented.
+> **Mainnet live is still disabled by the Issue #16 runtime gate.** The
+> Issue #16 checklist has now passed against the real API: testnet response
+> conformance, the ALO-rejection and cancel wordings (pre-gate mainnet production
+> logs), and a funded testnet market/passive/flatten smoke with the current
+> binary, including a shutdown cancel of a resting order (2026-10-31; see
+> docs/OPERATIONS.md, step 2). Enabling mainnet is a separate release change;
+> until it lands, every live example below selects `--network testnet`.
 > Existing incomplete mainnet journals are the sole exception: use
 > `--abandon-incomplete-run` to reconcile/cancel outstanding children and stop.
 
@@ -118,7 +118,7 @@ append-only record of everything that was sent.
 | `--trigger-when` | `above` \| `below` | none | `above`: fire when `mid >= price`. `below`: fire when `mid <= price`. Never inferred — omitting it with `--trigger-price` is an error. |
 | `--start-after` | humantime | none | Also fire after this much time. OR'd with the price trigger. |
 | `--read-only` | `true` \| `false` | **`true`** | `true` signs nothing and sends nothing. `false` remains a deprecated 0.1.x compatibility alias for `--live`. |
-| `--live` | flag | `false` | Enable live order submission. Testnet live is permitted; new/resumed mainnet execution is rejected until Issue #16 is complete. Mainnet `--abandon-incomplete-run` remains recovery-only and never places a new order. |
+| `--live` | flag | `false` | Enable live order submission. Testnet live is permitted; new/resumed mainnet execution is rejected until the Issue #16 gate is lifted. Mainnet `--abandon-incomplete-run` remains recovery-only and never places a new order. |
 | `--event-jsonl` | path | none | Optional schema-versioned lifecycle event stream for a read-only simulation. It writes only the explicit path and does not create or use the live state directory. Live runs always use their run-directory `events.jsonl` sidecar. |
 | `--network` | `mainnet` \| `testnet` | `mainnet` | Sets the default API URLs and the EIP-712 `Agent.source` domain together. An override naming the known official origin for the opposite network is rejected. |
 | `--slippage-bps` | decimal | `20` | Cushion on the IOC limit price. |
@@ -135,7 +135,7 @@ append-only record of everything that was sent.
 | `--allow-custom-endpoints` | bool | `false` | Unsafe override: allow `HL_INFO_URL` / `HL_EXCHANGE_URL` to be overridden in **live** mode. The override URL must be `https://` unless it is loopback (`127.0.0.1`/`localhost`, no userinfo) — used only by the test seam. A known official mainnet/testnet origin must match `--network`. Has no effect in read-only mode. |
 | `--wait-network-grace` | humantime | `30m` | How long a consecutive trigger-poll failure streak (network error or empty book) may run before the wait hard-stops. Timed from the first failure in the streak, resets on any successful poll. |
 | `--state-dir` | path | `$XDG_STATE_HOME/hype-twap` or `~/.local/state/hype-twap` | Root directory for run-state persistence (journal/lock/nonce-HWM). A read-only run never touches this. |
-| `--resume` | string (run id) | none | Resume a specific incomplete run by its run id. Live use requires `--master-address` or `HL_MASTER_ADDRESS`, allowing network/agent/master/symbol/side identity validation before any external API call. Every submitted/unknown cloid is then reconciled via `orderStatus`. Mainnet resume is blocked while Issue #16 is open; use the recovery-only abandon path instead. Mutually exclusive with `--abandon-incomplete-run`. |
+| `--resume` | string (run id) | none | Resume a specific incomplete run by its run id. Live use requires `--master-address` or `HL_MASTER_ADDRESS`, allowing network/agent/master/symbol/side identity validation before any external API call. Every submitted/unknown cloid is then reconciled via `orderStatus`. Mainnet resume is blocked while the Issue #16 gate is closed; use the recovery-only abandon path instead. Mutually exclusive with `--abandon-incomplete-run`. |
 | `--abandon-incomplete-run` | bool | `false` | Force-reconcile the incomplete run detected for this network+agent and mark it abandoned, WITHOUT continuing it or placing a new order. Also requires an explicit master address for the pre-network identity check. This recovery-only path remains available for pre-gate mainnet journals. |
 | `--shutdown-grace` | humantime | `60s` | How long a SIGINT/SIGTERM shutdown may spend reconciling in-flight orders, cancelling confirmed resting ones, and completing position-phase/final verification before giving up. |
 
