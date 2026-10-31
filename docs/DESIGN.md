@@ -333,7 +333,8 @@ resting-IOC 回収経路と**同じ関数** `recover_resting_fill` を呼び出�
 
 ```
 cancelByCloid(cloid)  // 失敗しても致命的ではない — 次の orderStatus が真実を語る
-poll_terminal_status(oid)  // 終端ステータスが返るまでリトライ
+poll_terminal_status(oid)  // 終端ステータスが返るまでリトライ。cancel が未確認なら
+                           // poll の合間に新しい nonce で再送し続ける
 ```
 
 cancel を送った直後に約定がすり抜けて着地する race が起きても、
@@ -369,7 +370,12 @@ status 照会/cancel は継続可" ポリシー)。ループを抜けた直後
 ループを抜けるため、この後処理は無条件に到達する) に、
 `resting` がまだ `Some` であれば同じ `settle_resting_child` で
 cancel→確定させてから最終レポートを組み立てる。これにより
-「resting のまま板に注文が残る」リークは構造的に発生しない。
+「resting のまま板に注文が残る」リークは構造的に発生しない。cancel の送信が
+失敗しても、確認が取れるまで settle の poll の合間に再送する (cancel は
+約定を増やし得ないので再送は安全)。settle 予算 (`--settle-retries`) の間ずっと
+取引所に届かない場合に限り、未解決のまま非ゼロ終了し、次項の `--resume` が回収する。
+送信結果が曖昧な ALO で単発の cloid 照会が注文を確認できなかった場合も、
+再送はしないが cloid の cancel を (有限回) 送ってから中止する。
 
 この無条件クリーンアップが保証するのは **プロセスが生きたまま終了する
 経路** (正常終了・`--duration` 経過・`SIGINT`/`SIGTERM` によるシャット
@@ -422,6 +428,8 @@ place/settle/journal は passive と同一の機構を再利用し、「いつ�
    どちらかに決め打ちすると二重約定のリスクがあり、それは取り消せない
 
 cancel の失敗は致命的ではありません。その後の `orderStatus` 照会が真実を確定させるためです。
+ただし未確認の cancel は、注文が板に残り続けないよう `orderStatus` の poll の合間に
+新しい nonce で再送します (cancel は約定を増やさないため、place と違って再送は安全です)。
 
 ### 終端ステータスのみを採用する
 

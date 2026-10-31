@@ -350,7 +350,11 @@ Passive mode still respects `--duration` exactly as market mode does: once the
 run's `ExecutionDeadline` has passed, no *new* quote is placed. A resting order
 is always cancelled and settled during final cleanup — on normal completion,
 on hitting the duration deadline, and on `SIGINT`/`SIGTERM` — so a passive run
-never leaves an order resting on the book after the process exits.
+does not leave an order resting on the book after the process exits. A cancel
+whose request fails is re-sent (freshly signed) between the settle status polls
+until Hyperliquid acknowledges it; only if the exchange stays unreachable for
+the whole settle window (`--settle-retries`) does the run exit non-zero with
+that order unresolved in the journal, for `--resume` to cancel and reconcile.
 
 Re-quoting only happens at slice boundaries. If the touch moves mid-slice, the
 resting order is left alone until the next boundary — there is no intra-slice
